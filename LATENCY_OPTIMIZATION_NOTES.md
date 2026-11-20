@@ -744,3 +744,36 @@ the next launch simply asked for a sign-in again. Both now verify, and `saveToke
 failing syscall (`fprintf` with the path and `errno`). Under an automation harness that confines
 unsigned binaries to the working directory, this is exactly how the sign-in was lost three times;
 `GTA60_XBOX_DATA` pointed at a writable directory is the workaround.
+
+### 10.5 The console ends the session when you walk away - and then Start Stream cannot connect
+Observed 2026-11-20 after leaving the headset idle for ~20 minutes:
+
+```
+[ 2491119 ms] [WARN ] [xbox        ] Session ended: WarningForBeingIdle
+```
+
+The console terminates the remote-play session itself. `cbs.ended` sets `streamEnded` and the app
+exits, which is correct - there is no video left to forward - but it has a consequence that reads as
+a bug: **the PC stops listening on 7660, so the headset's Start Stream then fails to connect** and the
+console looks like it died. It did not: `--list-consoles` still reports `Power: On` afterwards.
+
+Timeline for calibration: the session ran **41.5 minutes** (2491 s) and the last ~20 had no input, so
+the idle timeout is in the 20-30 minute region for remote play. It is not a network or decoder issue -
+`decLag` was 0 and `pcLat` was flat right up to the final sample.
+
+Not implemented yet, two distinct approaches:
+1. **Keep-alive**: the headset repeats its last gamepad state every ~30 s. Cheap (a timer in
+   `MainActivity`), prevents the warning entirely, but keeps the console and the GPU encoding while
+   nobody is watching - fine for "I'm eating", wrong for "I'll be back tomorrow".
+2. **Reconnect**: on a recoverable `ended` reason, don't exit - re-run the Xbox session setup and let
+   the still-open quest server resume sending. Bigger refactor (the session, decoder and encoder are
+   set up once inline in `runStream`), but correct for both cases, and it would also recover from a
+   console reboot or a Wi-Fi drop.
+
+### 10.6 A spawned background agent inherits the script's stdout (hang)
+`install-autostart.ps1 -StartNow` appeared to hang whenever its output was captured - a redirect to a
+file, a pipe, or an automation harness. The cause was the agent inheriting the parent's redirected
+stdout handle: the long-lived child keeps that handle open, so the redirection never reaches EOF and
+the caller waits for a process that will never exit. Fixed by giving the agent its own
+`build\agent.log` / `build\agent.err.log` via `Start-Process -RedirectStandardOutput/-Error`. Any
+future "start a background helper from a script" needs the same treatment.

@@ -43,7 +43,15 @@ $sc.Save()
 Write-Host "[GTA60] Agent will start at sign-in: $Lnk"
 
 if ($StartNow) {
-    Start-Process -FilePath $Exe -ArgumentList '--agent' -WindowStyle Hidden
+    # Give the agent its own stdout/stderr. Without this it inherits whatever handle this script was
+    # started with, so any caller that captures this script's output (a pipe, a redirect to a file,
+    # an automation harness) never sees EOF and hangs until the agent exits - which for a background
+    # agent is "forever". Observed exactly once, on the first run that redirected the script.
+    $LogDir = Join-Path $Root "build"
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    Start-Process -FilePath $Exe -ArgumentList '--agent' -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $LogDir "agent.log") `
+        -RedirectStandardError (Join-Path $LogDir "agent.err.log")
     Write-Host "[GTA60] Agent started."
 }
 

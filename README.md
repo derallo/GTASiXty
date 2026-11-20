@@ -165,6 +165,7 @@ phase NVENC timings, and `quest=` (PC→headset round trip measured by a per-fra
 | `WinHttpSendRequest failed (12185)` | WPAD/auto-proxy failure; the app now connects directly |
 | **Headset times out connecting, or LAN scan finds nothing** | **Windows Firewall.** Its allow rules are bound to the exe *path*, so a moved or renamed `GTA-Sixty.exe` matches none. The PC still looks healthy — the socket listens and the discovery responder answers a loopback probe. Tell-tale: `ping` from the headset succeeds but a TCP connect to 7660 times out. Fix from an elevated shell: `New-NetFirewallRule -DisplayName 'GTA-Sixty' -Direction Inbound -Profile Any -Program '<full path>\GTA-Sixty.exe' -Action Allow` |
 | Decoder errors or a wrong image after updating | PC and APK must match: `VIDEO_CONFIG` gained a codec byte, so an older APK misreads the parameter sets. Rebuild and reinstall both |
+| Stream dies while unattended, then Start Stream cannot connect | The console ended the remote-play session for being idle (`Session ended: WarningForBeingIdle`); the PC streamer exits with it, so nothing is listening on 7660. The console is still on — just start the streamer again (or press **Wake PC**). See notes 10.5 |
 | Huge lag, everything else looks fine | Decoder buffering — check `decLag` |
 | Blocky/garbled image that persists | Dropped frames broke the H.264 reference chain; the stream recovers on the next IDR |
 | Frame rate below target | Output resolution too high for the per-frame budget; try a lower resolution |
