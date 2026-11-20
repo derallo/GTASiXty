@@ -398,11 +398,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 });
             } catch (Exception e) {
                 if (autoConnectAfter) {
-                    setStatus("LAN scan timed out; trying " + DEFAULT_PC_HOST + "...");
-                    uiHandler.post(() -> {
-                        hostInput.setText(DEFAULT_PC_HOST);
-                        connect(DEFAULT_PC_HOST);
-                    });
+                    // Nothing answered, which normally means no streamer is running on the PC. Ask
+                    // the agent to start one and keep polling; it answers discovery once the Xbox
+                    // session is up. This is the "start it from the headset" path.
+                    setStatus("No streamer running — asking the PC to start one...");
+                    requestPcAppStart();
                 } else {
                     setStatus("LAN discovery timed out — enter PC IP or use USB-C (127.0.0.1)");
                 }
@@ -485,11 +485,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
         } catch (Exception ignored) {}
         try {
-            Socket s = new Socket();
-            s.setTcpNoDelay(true);
-            s.setReceiveBufferSize(128 * 1024);
-            try { s.setTrafficClass(0xB8); } catch (Exception ignored) {}
-            s.connect(new InetSocketAddress(host, DEFAULT_TCP_PORT), 4000);
+            // Nothing needs to be running on the PC when a stream is started: the streamer exits by
+            // itself when the console ends the session, leaving only the tiny agent. A refused
+            // connection is therefore normal - ask the agent to launch the streamer and keep
+            // retrying while it boots (Xbox handshake + encoder init is ~6-8 s).
+            final long connectDeadline = System.currentTimeMillis() + 60_000L;
+            boolean askedAgent = false;
+            Socket s = null;
+            while (streaming.get()) {
+                try {
+                    s = new Socket();
+                    s.setTcpNoDelay(true);
+                    s.setReceiveBufferSize(128 * 1024);
+                    try { s.setTrafficClass(0xB8); } catch (Exception ignored) {}
+                    s.connect(new InetSocketAddress(host, DEFAULT_TCP_PORT), 4000);
+                    break;
+                } catch (IOException ce) {
+                    if (s != null) { try { s.close(); } catch (IOException ignored) {} }
+                    s = null;
+                    if (!askedAgent) {
+                        askedAgent = true;
+                        Log.i(TAG, "no streamer at " + host + "; asking the PC agent to start one");
+                        sendStartRequest();
+                    }
+                    if (System.currentTimeMillis() > connectDeadline) throw ce;
+                    setStatus("Starting the PC streamer...");
+                    Thread.sleep(1500);
+                }
+            }
+            if (s == null) return;
             socket = s;
             synchronized (sendLock) {
                 sockOut = s.getOutputStream();
@@ -1010,20 +1034,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * something already running on it has to start the streamer, so the agent listens on UDP 7662.
      * Also polls discovery, so this works whether the PC was asleep, off, or already streaming.
      */
+    /**
+     * Fire-and-forget: ask the PC agent on UDP 7662 to launch the streamer. The agent is the only
+     * thing expected to be running on the PC when nothing is streaming.
+     */
+    private void sendStartRequest() {
+        new Thread(() -> {
+            try (DatagramSocket ds = new DatagramSocket()) {
+                ds.setBroadcast(true);
+                final byte[] cmd = "GTA60_START".getBytes(StandardCharsets.US_ASCII);
+                for (InetAddress t : discoveryTargets()) {
+                    try { ds.send(new DatagramPacket(cmd, cmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
+                }
+                Log.i(TAG, "sent GTA60_START to the PC agent");
+            } catch (Exception e) {
+                Log.w(TAG, "could not send GTA60_START: " + e.getMessage());
+            }
+        }, "GTA60-StartPc").start();
+    }
+
     private void requestPcAppStart() {
         new Thread(() -> {
             final byte[] startCmd = "GTA60_START".getBytes(StandardCharsets.US_ASCII);
             final byte[] discover = "GTA60_DISCOVER".getBytes(StandardCharsets.US_ASCII);
             final long deadline = System.currentTimeMillis() + 90_000L;
+            // The old loop was gated on streaming.get(), which is false precisely when this needs to
+            // run, so the Wake PC chain never actually broadcast anything. Poll until connected.
+            boolean startSent = false;
             try (DatagramSocket ds = new DatagramSocket()) {
                 ds.setBroadcast(true);
                 ds.setSoTimeout(1200);
-                while (streaming.get() && System.currentTimeMillis() < deadline) {
+                while (!streaming.get() && System.currentTimeMillis() < deadline) {
                     final List<InetAddress> targets = discoveryTargets();
                     for (InetAddress t : targets) {
-                        try { ds.send(new DatagramPacket(startCmd, startCmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
+                        // Send GTA60_START exactly once: the agent needs ~7 s to bring the streamer
+                        // up, and a repeat request in that window makes it launch a second one.
+                        if (!startSent) {
+                            try { ds.send(new DatagramPacket(startCmd, startCmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
+                        }
                         try { ds.send(new DatagramPacket(discover, discover.length, t, DISCOVERY_UDP_PORT)); } catch (Exception ignored) {}
                     }
+                    startSent = true;
                     try {
                         final byte[] buf = new byte[256];
                         final DatagramPacket resp = new DatagramPacket(buf, buf.length);
@@ -1040,7 +1091,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             break;
                         }
                     } catch (Exception ignored) {
-                        // keep retrying until the deadline
+                        // keep polling until the deadline
                     }
                 }
             } catch (Exception e) {

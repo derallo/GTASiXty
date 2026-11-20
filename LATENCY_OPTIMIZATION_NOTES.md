@@ -761,14 +761,17 @@ Timeline for calibration: the session ran **41.5 minutes** (2491 s) and the last
 the idle timeout is in the 20-30 minute region for remote play. It is not a network or decoder issue -
 `decLag` was 0 and `pcLat` was flat right up to the final sample.
 
-Not implemented yet, two distinct approaches:
+Three candidate fixes, and the one that was implemented is (3):
 1. **Keep-alive**: the headset repeats its last gamepad state every ~30 s. Cheap (a timer in
    `MainActivity`), prevents the warning entirely, but keeps the console and the GPU encoding while
    nobody is watching - fine for "I'm eating", wrong for "I'll be back tomorrow".
-2. **Reconnect**: on a recoverable `ended` reason, don't exit - re-run the Xbox session setup and let
-   the still-open quest server resume sending. Bigger refactor (the session, decoder and encoder are
-   set up once inline in `runStream`), but correct for both cases, and it would also recover from a
-   console reboot or a Wi-Fi drop.
+2. **Keep listening + reconnect**: on a recoverable `ended` reason, don't exit - keep the quest
+   server up and re-run the Xbox session when the headset asks. Best behaviour, but it means moving
+   the session, decoder, encoder and quest server lifetimes apart inside `runStream`, which is a
+   ~600-line function. Not worth the regression risk while the agent route already exists.
+3. **Let the headset start the PC side (implemented)**: nothing runs on the PC except the tiny agent
+   (UDP 7662, ~0 % CPU). When the user starts a stream, the app asks the agent, the agent launches
+   the streamer, and the app keeps retrying the TCP connect until it appears. See 10.7.
 
 ### 10.6 A spawned background agent inherits the script's stdout (hang)
 `install-autostart.ps1 -StartNow` appeared to hang whenever its output was captured - a redirect to a
@@ -777,3 +780,36 @@ stdout handle: the long-lived child keeps that handle open, so the redirection n
 the caller waits for a process that will never exit. Fixed by giving the agent its own
 `build\agent.log` / `build\agent.err.log` via `Start-Process -RedirectStandardOutput/-Error`. Any
 future "start a background helper from a script" needs the same treatment.
+
+### 10.7 Restarting the PC from the headset (implemented)
+The design that shipped: **the PC keeps nothing running but the agent.** The user starts a stream on
+the headset; the app asks the agent over UDP 7662; the agent launches the streamer; the app retries the
+TCP connect until it appears. Measured: 7660 comes up **8-14 s** after the request.
+
+Three bugs had to be fixed to make that chain actually work, all found by testing it rather than
+reading it:
+
+1. **`requestPcAppStart()` never broadcast anything.** Its poll loop was gated on
+   `while (streaming.get() ...)`, and `streaming` is false precisely when a start request is needed -
+   so the Wake PC button (and anything else using that path) did nothing at all. Now it loops until
+   connected and sends `GTA60_START` exactly once.
+2. **A refused connection was treated as a fatal error.** `runStreamLoop` connected once and threw;
+   with nothing on the PC by design, every start failed. It now asks the agent on the first refusal
+   and retries for up to 60 s.
+3. **The agent could launch several streamers for one request.** The streamer needs ~14 s to reach
+   `bind(7660)`, and the agent's "is a streamer already running" check can only see it after that, so
+   two start datagrams (or the app retrying) produced two streamers - duplicate Xbox sessions and two
+   processes competing for the encoder and the port. Observed live: one test datagram sent twice
+   launched two streamers. The agent now has a **30 s launch cooldown**; re-tested with two requests
+   200 ms apart, which produced exactly one streamer.
+
+Two smaller things fixed at the same time:
+- Agent-launched streamers wrote **no log at all** (they were spawned with `CREATE_NEW_CONSOLE` and no
+  redirection, so their output went to a console window nobody kept). They now get
+  `build\stream-agent.log`, which is what made the diagnosis above possible.
+- `discoverLanHost` gave up on a first-run timeout; it now falls through to the agent request, so a
+  fresh install with no remembered PC address can also start the PC.
+
+Note the agent launches with the default codec (`--codec h264`, 120 Mbps). A session restarted from
+the headset therefore comes back as H.264 even if it had been started with `--codec hevc`; change the
+`cmd` line in `runAgent()` if that should follow the HEVC path.

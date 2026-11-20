@@ -111,6 +111,10 @@ cannot keep holding the compositor, GPU or decoder (requires `KILL_BACKGROUND_PR
 
 ### Starting the PC remotely
 
+**Nothing needs to be running on the PC except the agent.** Press **Start Stream** (or **Wake PC**) on
+the headset and the app asks the agent, which launches the streamer; the app retries until it appears,
+typically 8-14 s.
+
 **Wake PC** does the whole chain:
 
 1. Sends a Wake-on-LAN magic packet (if the MAC is known).

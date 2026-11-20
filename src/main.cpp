@@ -1525,6 +1525,12 @@ int runAgent() {
     };
 
     char buf[128];
+    // The streamer needs ~14 s to reach the point where it binds TCP 7660 (Xbox handshake, WebRTC,
+    // NVENC init), and the socket check below can only see it after that. Without this cooldown a
+    // burst of start requests - two datagrams, or the headset retrying - launches several streamers
+    // at once: duplicate Xbox sessions and two processes fighting over the encoder and the port.
+    auto lastLaunch = std::chrono::steady_clock::time_point{};
+    constexpr auto kLaunchCooldown = std::chrono::seconds(30);
     while (!g_stopRequested.load(std::memory_order_relaxed)) {
         sockaddr_in from{};
         int fromLen = sizeof(from);
@@ -1536,14 +1542,38 @@ int runAgent() {
             log::info("agent", "start request ignored: streamer already running");
             continue;
         }
+        const auto now = std::chrono::steady_clock::now();
+        if (lastLaunch.time_since_epoch().count() != 0 && now - lastLaunch < kLaunchCooldown) {
+            log::info("agent", "start request ignored: a streamer was launched moments ago");
+            continue;
+        }
         wchar_t exe[MAX_PATH]{};
         if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) continue;
         std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --connect auto --quest-server --bitrate 120";
+
+        // Give the child its own log instead of a console window: an agent-launched streamer used to
+        // write nowhere at all, which made "it did not come back" impossible to diagnose.
+        std::wstring logPath = std::filesystem::path(exe).parent_path().wstring() + L"\\stream-agent.log";
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        HANDLE logFile = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         STARTUPINFOW si{};
         si.cb = sizeof(si);
+        if (logFile != INVALID_HANDLE_VALUE) {
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdOutput = logFile;
+            si.hStdError = logFile;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        }
         PROCESS_INFORMATION pi{};
-        if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
-            log::info("agent", "start request accepted: launching streaming app");
+        const DWORD flags = (logFile != INVALID_HANDLE_VALUE) ? CREATE_NO_WINDOW : CREATE_NEW_CONSOLE;
+        const BOOL spawned = CreateProcessW(exe, cmd.data(), nullptr, nullptr,
+                                            logFile != INVALID_HANDLE_VALUE, flags, nullptr, nullptr, &si, &pi);
+        if (logFile != INVALID_HANDLE_VALUE) CloseHandle(logFile);
+        if (spawned) {
+            lastLaunch = now;
+            log::info("agent", std::format("start request accepted: launching streaming app (log: {})",
+                                           log::narrow(logPath)));
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         } else {
