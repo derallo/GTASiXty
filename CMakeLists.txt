@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(GTASixty VERSION 0.1.0 LANGUAGES C CXX)
+project(GTA-Sixty VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -154,15 +154,15 @@ target_link_libraries(gta60_core PUBLIC
 )
 
 # Main executable
-add_executable(GTASixty src/main.cpp)
-target_link_libraries(GTASixty PRIVATE gta60_core)
-add_custom_command(TARGET GTASixty POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENXR_DLL_PATH}" "$<TARGET_FILE_DIR:GTASixty>"
+add_executable(GTA-Sixty src/main.cpp)
+target_link_libraries(GTA-Sixty PRIVATE gta60_core)
+add_custom_command(TARGET GTA-Sixty POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENXR_DLL_PATH}" "$<TARGET_FILE_DIR:GTA-Sixty>"
 )
 
 # Automated unit & GPU integration tests
-add_executable(GTASixty_tests tests/PipelineAndXboxTests.cpp)
-target_link_libraries(GTASixty_tests PRIVATE gta60_core)
-add_custom_command(TARGET GTASixty_tests POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENXR_DLL_PATH}" "$<TARGET_FILE_DIR:GTASixty_tests>"
+add_executable(GTA-Sixty_tests tests/PipelineAndXboxTests.cpp)
+target_link_libraries(GTA-Sixty_tests PRIVATE gta60_core)
+add_custom_command(TARGET GTA-Sixty_tests POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENXR_DLL_PATH}" "$<TARGET_FILE_DIR:GTA-Sixty_tests>"
 )

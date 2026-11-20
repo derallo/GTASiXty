@@ -94,7 +94,7 @@ bool test1_XboxProtocolAndTeredo() {
         // writes there while still allowing writes next to the binaries, so fall back to the CWD.
         std::filesystem::path dir = std::filesystem::temp_directory_path();
         {
-            const auto probe = dir / "GTASixty_write_probe.tmp";
+            const auto probe = dir / "GTA-Sixty_write_probe.tmp";
             std::ofstream out(probe, std::ios::binary | std::ios::trunc);
             const bool writable = static_cast<bool>(out);
             out.close();
@@ -106,7 +106,7 @@ bool test1_XboxProtocolAndTeredo() {
                             std::filesystem::temp_directory_path().c_str(), dir.c_str());
             }
         }
-        const auto tempFile = dir / "GTASixty_test_tokens.bin";
+        const auto tempFile = dir / "GTA-Sixty_test_tokens.bin";
         std::error_code ec;
         std::filesystem::remove(tempFile, ec);
         xbox::SavedTokens saved{"refresh_abc", "access_xyz", 123456789, "uhs_999"};

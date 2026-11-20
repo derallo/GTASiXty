@@ -44,10 +44,13 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -185,7 +188,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         row1.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("GTASixty");
+        title.setText("GTA-Sixty");
         title.setTextColor(Color.parseColor("#22C55E"));
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
@@ -345,18 +348,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ds.setBroadcast(true);
                 ds.setSoTimeout(1200);
                 final byte[] query = "GTA60_DISCOVER".getBytes(StandardCharsets.US_ASCII);
-                // Android frequently drops 255.255.255.255, so also probe the subnet broadcast
-                // derived from the last known PC address.
-                final java.util.List<InetAddress> probes = new ArrayList<>();
-                probes.add(InetAddress.getByName("255.255.255.255"));
-                final String known = getSharedPreferences("gta60", MODE_PRIVATE).getString("host", "");
-                if (known != null && known.matches("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")) {
-                    final String[] o = known.split("\\.");
-                    probes.add(InetAddress.getByName(o[0] + "." + o[1] + "." + o[2] + ".255"));
-                }
-                for (InetAddress probe : probes) {
-                    ds.send(new DatagramPacket(query, query.length, probe, DISCOVERY_UDP_PORT));
-                }
+                sendDiscoveryQuery(ds, query);
                 final byte[] buf = new byte[256];
                 final DatagramPacket resp = new DatagramPacket(buf, buf.length);
                 ds.receive(resp);
@@ -374,15 +366,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void discoverLanHost(boolean autoConnectAfter) {
-        setStatus("Scanning LAN (UDP 7661) for GTASixty PC...");
+        setStatus("Scanning LAN (UDP 7661) for GTA-Sixty PC...");
         new Thread(() -> {
             try (DatagramSocket ds = new DatagramSocket()) {
                 ds.setBroadcast(true);
                 ds.setSoTimeout(1500);
                 byte[] query = "GTA60_DISCOVER".getBytes(StandardCharsets.US_ASCII);
-                DatagramPacket pkt = new DatagramPacket(
-                        query, query.length, InetAddress.getByName("255.255.255.255"), DISCOVERY_UDP_PORT);
-                ds.send(pkt);
+                sendDiscoveryQuery(ds, query);
 
                 byte[] buf = new byte[256];
                 DatagramPacket resp = new DatagramPacket(buf, buf.length);
@@ -1029,12 +1019,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ds.setBroadcast(true);
                 ds.setSoTimeout(1200);
                 while (streaming.get() && System.currentTimeMillis() < deadline) {
-                    java.util.List<InetAddress> targets;
-                    try {
-                        targets = broadcastTargets();
-                    } catch (Exception e) {
-                        break;
-                    }
+                    final List<InetAddress> targets = discoveryTargets();
                     for (InetAddress t : targets) {
                         try { ds.send(new DatagramPacket(startCmd, startCmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
                         try { ds.send(new DatagramPacket(discover, discover.length, t, DISCOVERY_UDP_PORT)); } catch (Exception ignored) {}
@@ -1064,15 +1049,60 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }, "GTA60-StartPc").start();
     }
 
-    private List<InetAddress> broadcastTargets() throws Exception {
+    /**
+     * Every address worth probing for the PC.
+     *
+     * 255.255.255.255 is frequently dropped by Android or the Wi-Fi driver - and on a first run
+     * there is no remembered host to derive a subnet from, so probing only the global broadcast
+     * means discovery can never succeed on a fresh install. The directed broadcast of each live
+     * interface is the address that actually arrives, so probe those too (plus the /24 of the last
+     * known PC, which still helps when the interface list is unhelpful).
+     */
+    private List<InetAddress> discoveryTargets() {
         final List<InetAddress> targets = new ArrayList<>();
-        targets.add(InetAddress.getByName("255.255.255.255"));
+        try {
+            targets.add(InetAddress.getByName("255.255.255.255"));
+        } catch (Exception ignored) {
+        }
+        try {
+            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (nif == null || !nif.isUp() || nif.isLoopback()) continue;
+                for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                    final InetAddress addr = ia.getAddress();
+                    if (addr == null || addr.getAddress() == null || addr.getAddress().length != 4) continue;
+                    final int prefix = ia.getNetworkPrefixLength();
+                    if (prefix < 1 || prefix > 30) continue;
+                    final byte[] b = addr.getAddress();
+                    final int ip = ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) |
+                            ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+                    final int broadcast = ip | ~(0xFFFFFFFF << (32 - prefix));
+                    final byte[] bb = {(byte) (broadcast >>> 24), (byte) (broadcast >>> 16),
+                            (byte) (broadcast >>> 8), (byte) broadcast};
+                    final InetAddress directed = InetAddress.getByAddress(bb);
+                    if (!targets.contains(directed)) targets.add(directed);
+                }
+            }
+        } catch (Exception ignored) {
+        }
         final String known = getSharedPreferences("gta60", MODE_PRIVATE).getString("host", "");
         if (known != null && known.matches("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")) {
-            final String[] o = known.split("\\.");
-            targets.add(InetAddress.getByName(o[0] + "." + o[1] + "." + o[2] + ".255"));
+            try {
+                final String[] o = known.split("\\.");
+                final InetAddress remembered = InetAddress.getByName(o[0] + "." + o[1] + "." + o[2] + ".255");
+                if (!targets.contains(remembered)) targets.add(remembered);
+            } catch (Exception ignored) {
+            }
         }
         return targets;
+    }
+
+    private void sendDiscoveryQuery(DatagramSocket ds, byte[] query) {
+        for (InetAddress target : discoveryTargets()) {
+            try {
+                ds.send(new DatagramPacket(query, query.length, target, DISCOVERY_UDP_PORT));
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private void sendControlPacket(int type, byte[] payload) {

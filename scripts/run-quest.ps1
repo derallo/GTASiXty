@@ -17,10 +17,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$Exe = Join-Path $Root "build\GTASixty.exe"
+$Exe = Join-Path $Root "build\GTA-Sixty.exe"
 
 if (-not (Test-Path -LiteralPath $Exe)) {
-    Write-Host "[GTASixty] Binary not built yet; running scripts\build.ps1..."
+    Write-Host "[GTA-Sixty] Binary not built yet; running scripts\build.ps1..."
     & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build.ps1")
 }
 
@@ -44,6 +44,6 @@ switch ($Mode) {
     }
 }
 
-Write-Host "[GTASixty] Launching: $Exe $($argsList -join ' ')"
+Write-Host "[GTA-Sixty] Launching: $Exe $($argsList -join ' ')"
 & $Exe @argsList
 exit $LASTEXITCODE

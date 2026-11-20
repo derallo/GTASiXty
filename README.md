@@ -1,4 +1,4 @@
-# GTASixty
+# GTA-Sixty
 
 Play your Xbox Series X|S on a Meta Quest 3 over your LAN, with an optional GPU pass that can
 upscale and/or interpolate frames before they reach the headset.
@@ -39,23 +39,23 @@ Both write into `build\`.
 
 ```powershell
 # D3D12 / NVOFA / NVENC / GT60 protocol tests (the encode round-trip runs once per codec)
-build\GTASixty_tests.exe
+build\GTA-Sixty_tests.exe
 ```
 
 ## Run
 
 ```powershell
 # one-time: sign in to your Microsoft account (device-code flow)
-build\GTASixty.exe --login
+build\GTA-Sixty.exe --login
 
 # confirm the console is visible
-build\GTASixty.exe --list-consoles
+build\GTA-Sixty.exe --list-consoles
 
 # stream to the headset
-build\GTASixty.exe --connect auto --quest-server --bitrate 120
+build\GTA-Sixty.exe --connect auto --quest-server --bitrate 120
 ```
 
-Then open **GTASixty** on the headset and tap **Start Stream**. It finds the PC automatically via
+Then open **GTA-Sixty** on the headset and tap **Start Stream**. It finds the PC automatically via
 a UDP broadcast (`7661`), or you can type the PC's IP.
 
 ### Options
@@ -93,7 +93,8 @@ reinstalled** for HEVC: an older APK does not understand the current `VIDEO_CONF
 
 ## Headset app
 
-Build output is `build\GTASixty-Quest3.apk`.
+Build output is `build\GTA-Sixty-Quest3.apk`. The Android package stays `com.gtasixty.quest` because a
+Java package segment cannot contain the hyphen.
 
 ```powershell
 scripts\install-quest-apk.ps1 -Launch
@@ -123,9 +124,9 @@ scripts\install-autostart.ps1 -StartNow   # run --agent at sign-in and start it 
 scripts\install-autostart.ps1 -Remove     # uninstall
 ```
 
-It installs a Startup-folder shortcut (no admin needed) running `GTASixty.exe --agent`. The
+It installs a Startup-folder shortcut (no admin needed) running `GTA-Sixty.exe --agent`. The
 agent listens on UDP 7662, and on request launches
-`GTASixty.exe --connect auto --quest-server --bitrate 120` unless a streamer is already
+`GTA-Sixty.exe --connect auto --quest-server --bitrate 120` unless a streamer is already
 listening on TCP 7660.
 
 Wake-on-LAN only reaches the sign-in screen, so a fully hands-off wake-and-stream also needs
@@ -162,6 +163,8 @@ phase NVENC timings, and `quest=` (PC→headset round trip measured by a per-fra
 | Symptom | Likely cause |
 |---|---|
 | `WinHttpSendRequest failed (12185)` | WPAD/auto-proxy failure; the app now connects directly |
+| **Headset times out connecting, or LAN scan finds nothing** | **Windows Firewall.** Its allow rules are bound to the exe *path*, so a moved or renamed `GTA-Sixty.exe` matches none. The PC still looks healthy — the socket listens and the discovery responder answers a loopback probe. Tell-tale: `ping` from the headset succeeds but a TCP connect to 7660 times out. Fix from an elevated shell: `New-NetFirewallRule -DisplayName 'GTA-Sixty' -Direction Inbound -Profile Any -Program '<full path>\GTA-Sixty.exe' -Action Allow` |
+| Decoder errors or a wrong image after updating | PC and APK must match: `VIDEO_CONFIG` gained a codec byte, so an older APK misreads the parameter sets. Rebuild and reinstall both |
 | Huge lag, everything else looks fine | Decoder buffering — check `decLag` |
 | Blocky/garbled image that persists | Dropped frames broke the H.264 reference chain; the stream recovers on the next IDR |
 | Frame rate below target | Output resolution too high for the per-frame budget; try a lower resolution |

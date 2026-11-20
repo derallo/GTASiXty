@@ -36,10 +36,10 @@ if (-not $dxcExe) {
     throw "Windows SDK dxc.exe (x64) not found."
 }
 
-Write-Host "[GTASixty] VS: $vsPath"
-Write-Host "[GTASixty] CMake: $cmakeExe"
-Write-Host "[GTASixty] Ninja: $ninjaExe"
-Write-Host "[GTASixty] DXC: $dxcExe"
+Write-Host "[GTA-Sixty] VS: $vsPath"
+Write-Host "[GTA-Sixty] CMake: $cmakeExe"
+Write-Host "[GTA-Sixty] Ninja: $ninjaExe"
+Write-Host "[GTA-Sixty] DXC: $dxcExe"
 
 # 2. Download OpenXR Loader 1.1.65 nupkg
 $openXrDir = Join-Path $ThirdParty "openxr"
@@ -47,7 +47,7 @@ $openXrMarker = Join-Path $openXrDir "include\openxr\openxr.h"
 if (-not (Test-Path -LiteralPath $openXrMarker)) {
     New-Item -ItemType Directory -Force -Path $openXrDir | Out-Null
     $nupkgZip = Join-Path $openXrDir "openxr.zip"
-    Write-Host "[GTASixty] Downloading OpenXR.Loader.1.1.65.nupkg..."
+    Write-Host "[GTA-Sixty] Downloading OpenXR.Loader.1.1.65.nupkg..."
     Invoke-WebRequest -Uri "https://github.com/KhronosGroup/OpenXR-SDK/releases/download/release-1.1.65/OpenXR.Loader.1.1.65.nupkg" -OutFile $nupkgZip -UseBasicParsing
     Expand-Archive -Path $nupkgZip -DestinationPath $openXrDir -Force
     Remove-Item -LiteralPath $nupkgZip -Force -ErrorAction SilentlyContinue
@@ -57,7 +57,7 @@ if (-not (Test-Path -LiteralPath $openXrMarker)) {
 $jsonHeader = Join-Path $ThirdParty "nlohmann\json.hpp"
 if (-not (Test-Path -LiteralPath $jsonHeader)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $jsonHeader -Parent) | Out-Null
-    Write-Host "[GTASixty] Downloading nlohmann/json.hpp v3.11.3..."
+    Write-Host "[GTA-Sixty] Downloading nlohmann/json.hpp v3.11.3..."
     Invoke-WebRequest -Uri "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" -OutFile $jsonHeader -UseBasicParsing
 }
 
@@ -65,7 +65,7 @@ if (-not (Test-Path -LiteralPath $jsonHeader)) {
 $nvencHeader = Join-Path $ThirdParty "ffnvcodec\nvEncodeAPI.h"
 if (-not (Test-Path -LiteralPath $nvencHeader)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $nvencHeader -Parent) | Out-Null
-    Write-Host "[GTASixty] Downloading nvEncodeAPI.h (n13.0.19.0)..."
+    Write-Host "[GTA-Sixty] Downloading nvEncodeAPI.h (n13.0.19.0)..."
     Invoke-WebRequest -Uri "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/n13.0.19.0/include/ffnvcodec/nvEncodeAPI.h" -OutFile $nvencHeader -UseBasicParsing
 }
 
@@ -79,9 +79,9 @@ if ($mbedNeedsBuild) {
     $mbedSrcRoot = Join-Path $ThirdParty "mbedtls-3.6.2"
     $mbedBuild = Join-Path $ThirdParty "mbedtls-build"
     if (-not (Test-Path -LiteralPath (Join-Path $mbedSrcRoot "CMakeLists.txt"))) {
-        Write-Host "[GTASixty] Downloading MbedTLS 3.6.2..."
+        Write-Host "[GTA-Sixty] Downloading MbedTLS 3.6.2..."
         Invoke-WebRequest -Uri "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.2/mbedtls-3.6.2.tar.bz2" -OutFile $mbedSrcZip -UseBasicParsing
-        Write-Host "[GTASixty] Extracting MbedTLS 3.6.2..."
+        Write-Host "[GTA-Sixty] Extracting MbedTLS 3.6.2..."
         & tar -xf $mbedSrcZip -C $ThirdParty
         if ($LASTEXITCODE -ne 0) { throw "Failed to extract MbedTLS 3.6.2" }
         Remove-Item -LiteralPath $mbedSrcZip -Force -ErrorAction SilentlyContinue
@@ -107,7 +107,7 @@ if ($mbedNeedsBuild) {
         'exit /b 0'
     ) | Set-Content -LiteralPath $mbedBatch -Encoding ASCII
 
-    Write-Host "[GTASixty] Building & installing MbedTLS 3.6.2..."
+    Write-Host "[GTA-Sixty] Building & installing MbedTLS 3.6.2..."
     & cmd.exe /c ('"{0}"' -f $mbedBatch)
     if ($LASTEXITCODE -ne 0) { throw "MbedTLS build failed with code $LASTEXITCODE" }
 }
@@ -117,8 +117,8 @@ if ($Clean -and (Test-Path -LiteralPath $BuildDir)) {
 }
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
-# 5. Configure & build GTASixty inside vcvars64 environment
-$buildBatch = Join-Path $BuildDir "build-GTASixty.cmd"
+# 5. Configure & build GTA-Sixty inside vcvars64 environment
+$buildBatch = Join-Path $BuildDir "build-GTA-Sixty.cmd"
 @(
     '@echo off',
     ('call "{0}" >nul 2>&1' -f $vcvars),
@@ -132,10 +132,10 @@ $buildBatch = Join-Path $BuildDir "build-GTASixty.cmd"
     'exit /b 0'
 ) | Set-Content -LiteralPath $buildBatch -Encoding ASCII
 
-Write-Host "[GTASixty] Configuring and building ($Config)..."
+Write-Host "[GTA-Sixty] Configuring and building ($Config)..."
 & cmd.exe /c ('"{0}"' -f $buildBatch)
 if ($LASTEXITCODE -ne 0) {
-    throw "GTASixty build failed with exit code $LASTEXITCODE"
+    throw "GTA-Sixty build failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "[GTASixty] Build succeeded! Binaries in: $BuildDir"
+Write-Host "[GTA-Sixty] Build succeeded! Binaries in: $BuildDir"

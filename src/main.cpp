@@ -105,17 +105,17 @@ struct CliOptions {
 
 void printUsage() {
     std::printf(
-        "GTASixty - Zero-DWM Xbox Series X -> D3D12 (60->30 Dedup + Optical Flow FG + FSR Upscale) -> Quest 3\n\n"
+        "GTA-Sixty - Zero-DWM Xbox Series X -> D3D12 (60->30 Dedup + Optical Flow FG + FSR Upscale) -> Quest 3\n\n"
         "Usage:\n"
-        "  GTASixty.exe --login\n"
-        "  GTASixty.exe --list-consoles\n"
-        "  GTASixty.exe --connect <serverId|auto> [options]\n"
-        "  GTASixty.exe --synthetic-demo [options]\n"
-        "  GTASixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n\n"
+        "  GTA-Sixty.exe --login\n"
+        "  GTA-Sixty.exe --list-consoles\n"
+        "  GTA-Sixty.exe --connect <serverId|auto> [options]\n"
+        "  GTA-Sixty.exe --synthetic-demo [options]\n"
+        "  GTA-Sixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n\n"
         "Options:\n"
         "  --fps <60|90>             Output frame rate (2x or 3x from 30 FPS) [default: 60]\n"
         "  --upscale <1080p|1440p|4k> Target output resolution [default: 1440p]\n"
-        "  --quest-server            Encode via zero-copy D3D12 NVENC & stream to GTASixty Quest 3 APK\n"
+        "  --quest-server            Encode via zero-copy D3D12 NVENC & stream to GTA-Sixty Quest 3 APK\n"
         "  --port <port>             Quest server TCP port [default: 7660]\n"
         "  --bitrate <Mbps>          NVENC ultra-low-latency CBR bitrate [default: 50]\n"
         "  --codec <h264|hevc>       Video codec for the PC->headset stream. HEVC roughly halves the\n"
@@ -273,8 +273,19 @@ int runLogin() {
         std::string detail;
         const auto poll = account.pollSignIn(code, &detail);
         if (poll == xbox::SignInPoll::Done) {
-            std::printf("Sign-in succeeded! Encrypted token saved to %s\n", log::narrow(tokenFile.wstring()).c_str());
-            return 0;
+            // Do not claim success on the strength of the poll alone: if the token could not be
+            // written (read-only profile, denied directory) the sign-in is thrown away and the user
+            // is asked again on the next launch, which looks like the login simply did not work.
+            std::error_code ec;
+            if (std::filesystem::exists(tokenFile, ec)) {
+                std::printf("Sign-in succeeded! Encrypted token saved to %s\n", log::narrow(tokenFile.wstring()).c_str());
+                return 0;
+            }
+            std::fprintf(stderr,
+                         "Sign-in succeeded, but the token could NOT be saved to:\n  %s\n"
+                         "Set GTA60_XBOX_DATA to a writable directory and try again.\n",
+                         log::narrow(tokenFile.wstring()).c_str());
+            return 1;
         }
         if (poll == xbox::SignInPoll::SlowDown) interval += 5;
         else if (poll == xbox::SignInPoll::Expired) {
@@ -292,7 +303,7 @@ int runListConsoles() {
     auto transport = xbox::makeWinHttpTransport(&g_stopRequested);
     xbox::Account account(transport, xbox::dataDirectory() / L"tokens.bin");
     if (!account.signedIn()) {
-        std::fprintf(stderr, "Not signed in. Run: GTASixty.exe --login\n");
+        std::fprintf(stderr, "Not signed in. Run: GTA-Sixty.exe --login\n");
         return 1;
     }
     const auto access = account.streamingAccess();
@@ -532,7 +543,7 @@ int runConnect(const CliOptions& initialOpts) {
     auto transport = xbox::makeWinHttpTransport(&g_stopRequested);
     xbox::Account account(transport, xbox::dataDirectory() / L"tokens.bin");
     if (!account.signedIn()) {
-        std::fprintf(stderr, "Not signed in. Run: GTASixty.exe --login\n");
+        std::fprintf(stderr, "Not signed in. Run: GTA-Sixty.exe --login\n");
         return 1;
     }
 

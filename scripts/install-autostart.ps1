@@ -1,4 +1,4 @@
-# Registers the GTASixty agent to start automatically when you sign in, so the headset's
+# Registers the GTA-Sixty agent to start automatically when you sign in, so the headset's
 # "Wake PC" button can launch a stream on a machine that is powered but not already streaming.
 #
 # Uses the user's Startup folder (no administrator rights required). A scheduled task would also
@@ -13,13 +13,13 @@ param([switch]$Remove, [switch]$StartNow)
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$Exe = Join-Path $Root "build\GTASixty.exe"
+$Exe = Join-Path $Root "build\GTA-Sixty.exe"
 $Startup = [Environment]::GetFolderPath('Startup')
-$Lnk = Join-Path $Startup 'GTASixty Agent.lnk'
+$Lnk = Join-Path $Startup 'GTA-Sixty Agent.lnk'
 
 if ($Remove) {
     if (Test-Path -LiteralPath $Lnk) { Remove-Item -LiteralPath $Lnk -Force }
-    Get-Process GTASixty -ErrorAction SilentlyContinue |
+    Get-Process GTA-Sixty -ErrorAction SilentlyContinue |
         Where-Object { $_.Id -ne 0 } | ForEach-Object {
             # Only stop a bare agent (no stream server bound on 7660 belongs to it).
             try { $_.Kill() } catch {}
@@ -38,7 +38,7 @@ $sc.TargetPath = $Exe
 $sc.Arguments = '--agent'
 $sc.WorkingDirectory = Split-Path $Exe -Parent
 $sc.WindowStyle = 7          # minimized
-$sc.Description = 'GTASixty remote-start agent (UDP 7662)'
+$sc.Description = 'GTA-Sixty remote-start agent (UDP 7662)'
 $sc.Save()
 Write-Host "[GTA60] Agent will start at sign-in: $Lnk"
 
@@ -51,7 +51,7 @@ Write-Host ""
 Write-Host "How the chain works:"
 Write-Host "  headset 'Wake PC' -> magic packet wakes the machine ->"
 Write-Host "  agent (started at sign-in) receives GTA60_START on UDP 7662 ->"
-Write-Host "  launches: GTASixty.exe --connect auto --quest-server --bitrate 120"
+Write-Host "  launches: GTA-Sixty.exe --connect auto --quest-server --bitrate 120"
 Write-Host ""
 Write-Host "Wake-on-LAN only gets the PC to the sign-in screen. For a fully hands-off"
 Write-Host "wake-and-stream, enable automatic sign-in for this account."

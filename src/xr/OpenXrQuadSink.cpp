@@ -101,9 +101,9 @@ OpenXrProbeResult OpenXrQuadSink::probeAndCreateInstance() {
 
     const char* enabledExts[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
     XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
-    std::strcpy(ci.applicationInfo.applicationName, "GTASixty");
+    std::strcpy(ci.applicationInfo.applicationName, "GTA-Sixty");
     ci.applicationInfo.applicationVersion = 1;
-    std::strcpy(ci.applicationInfo.engineName, "GTASixty-D3D12");
+    std::strcpy(ci.applicationInfo.engineName, "GTA-Sixty-D3D12");
     ci.applicationInfo.engineVersion = 1;
     ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     ci.enabledExtensionCount = 1;

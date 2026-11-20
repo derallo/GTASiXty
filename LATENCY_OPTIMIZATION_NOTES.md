@@ -1,4 +1,4 @@
-# GTASixty Latency Analysis & Optimization Notes
+# GTA-Sixty Latency Analysis & Optimization Notes
 
 > Last updated: 2026-11-20
 > Target setup: Xbox Series X (local LAN, wired Ethernet) -> PC (Ampere-class NVIDIA GPU, wired Ethernet) -> Meta Quest 3 (wired / USB-C Ethernet).
@@ -59,7 +59,7 @@ in=59.9 (14.4M 2560x1440) uniq=59.9 out=68.5 fps -> 3840x2160@60
 
 ## 2. Phase 1 Optimizations Implemented & Verified
 
-All 6 unit/GPU integration tests (`build/GTASixty_tests.exe`) pass, `build/GTASixty.exe` and `build/GTASixty-Quest3.apk` are rebuilt, and the upgraded server is live.
+All 6 unit/GPU integration tests (`build/GTA-Sixty_tests.exe`) pass, `build/GTA-Sixty.exe` and `build/GTA-Sixty-Quest3.apk` are rebuilt, and the upgraded server is live.
 
 ### PC Server (`C++`)
 
@@ -75,7 +75,7 @@ All 6 unit/GPU integration tests (`build/GTASixty_tests.exe`) pass, `build/GTASi
 | `src/xbox/StreamApi.cpp`, `src/xbox/WebRtcSession.cpp` | Upgraded private-LAN Teredo-unpacked IPv4 ICE priority (`1` -> `2130706431`) and logged active ICE `local <-> remote` route on connect. |
 | `src/main.cpp` | Added `timeBeginPeriod(1)`, `HIGH_PRIORITY_CLASS`, `THREAD_PRIORITY_ABOVE_NORMAL` on decode/render threads; reduced `videoQueue` cap `32 -> 6` and XInput poll `8ms -> 4ms`; added 4-slot pre-allocated `DecodedNv12Frame` pool + deferred `picRef.commit()` (overlaps reference copy with GPU/NVENC); added **Adaptive Cadence FG Gate** (bypasses FG when input is ~60fps, enters 2x/3x FG only on ~30fps content, plus `--no-fg` CLI switch); wired fast GPU-chained **RCAS-only path** (`[RCAS]`, skips NVOFA + EASU, ~0.45 ms GPU) when 1:1 & no FG so the 14 Mbps Xbox stream stays sharp; added **pre-encoded pacing** in FG mode; added true end-to-end PC latency (`pcLat`) & TCP send (`tcp=avg/max`) telemetry. |
 
-### Quest 3 APK (`Java` — rebuilt at `build/GTASixty-Quest3.apk`, needs USB install when convenient)
+### Quest 3 APK (`Java` — rebuilt at `build/GTA-Sixty-Quest3.apk`, needs USB install when convenient)
 
 | File | Changes |
 |---|---|
@@ -105,7 +105,7 @@ Inspect `build/perf-telemetry.log` first once the Quest 3 connects to the upgrad
    - **Action**: Log `pic.over` / `pic.max8` histogram on consecutive frames when testing a known 30 FPS game. If compressed H.264 duplicates exceed `kBand8=3, tol=28`, tune a dedicated WebRTC/H.264 dedup band (e.g. `band=6..8` and/or `tolerance = total / 4096` (~0.025%) or mean-abs-diff on Y plane only). Keep `Test2` passing.
 
 ### Priority 2: Install Updated Quest APK & Measure Quest-Side Latency
-1. When Quest 3 is connected via USB-C (or wireless ADB on `<quest-ip>`), run `scripts/install-quest-apk.ps1 -Launch` to deploy the already-rebuilt `build/GTASixty-Quest3.apk`.
+1. When Quest 3 is connected via USB-C (or wireless ADB on `<quest-ip>`), run `scripts/install-quest-apk.ps1 -Launch` to deploy the already-rebuilt `build/GTA-Sixty-Quest3.apk`.
 2. Add **RTT / glass-to-glass timestamp echo** between PC and Quest:
    - Have Quest echo back the `timestampMs` of each rendered frame (or periodic 1 Hz ping/pong + `dequeue->render` decode time in `GTA60-Perf` logcat via `adb logcat -s GTA60 GTA60-Perf`) so you can measure **exact Quest MediaCodec decode + SurfaceFlinger queue latency** separately from PC and Xbox latency!
 3. Switch Quest `MainActivity.java` MediaCodec from synchronous polling (`dequeueInputBuffer` / `dequeueOutputBuffer` on two threads) to **Asynchronous `MediaCodec.Callback` mode** on a dedicated high-priority `HandlerThread` (`onInputBufferAvailable` / `onOutputBufferAvailable`) to eliminate polling wakeups and thread handoffs.
@@ -387,7 +387,7 @@ thread handoff / loop overhead    ~0.75
 scripts\build.ps1                                    # PC
 scripts\build-quest-apk.ps1                          # headset
 scripts\install-autostart.ps1 -StartNow              # agent at sign-in (WOL -> start app)
-GTASixty.exe --connect auto --quest-server --bitrate 120 --sharpness 0.12
+GTA-Sixty.exe --connect auto --quest-server --bitrate 120 --sharpness 0.12
 ```
 Defaults already include `--xbox-bitrate 50` (REMB) and `--max-output-height 1440`.
 Recommended headset settings: 2560x1440 output, 80 Mbps, 60 FPS.
@@ -584,7 +584,33 @@ cost. That is a hypothesis until measured on this hardware.
 
 That is **-44% bytes for the same frames and the same encoder settings** on synthetic content -
 in the expected direction, but *not* a substitute for real gameplay measurement, which has more
-motion and texture. On real content:
+motion and texture.
+
+**Measured on the real headset (2026-11-20, 2560x1440 @ 60, P2 ULL, same settings both sides):**
+
+```
+[headset] Received VIDEO_CONFIG 2560x1440 @ 60fps codec=video/hevc csd=94B
+[headset] MediaCodec started (c2.qti.hevc.decoder) 2560x1440 video/hevc csdUnits=3 csd0=28B
+[headset] First video frame rendered (2560x1440)
+```
+
+`c2.qti.hevc.decoder` is Qualcomm's hardware decoder, `csdUnits=3` proves VPS/SPS/PPS were split
+correctly, and the `quest=` present-echo (~6.4 ms) proves it is presenting rather than merely
+parsing. **HEVC works end to end on Quest 3.**
+
+The numbers do not flatter HEVC on the encoder side, though:
+
+| codec | NVENC ms (fence wait in brackets) | headset request |
+|---|---|---|
+| H.264 | 5.70-5.79 (5.38-5.48) | 50 Mbps |
+| HEVC | 6.65-6.69 (6.29-6.37) | 50 Mbps |
+
+At 1440p/P2 **HEVC costs ~0.9 ms more per frame, not less**. "Same quality for fewer bits" is a
+rate-distortion claim, not an encoder-throughput one, and with CBR the telemetry's `out=Mbps` only
+reflects the cap, so it says nothing about efficiency. Whether HEVC looks better at the same 50 Mbps
+is a visual judgement on real gameplay - the one thing still not measured.
+
+On real content:
 
 1. Rebuild + reinstall the APK, then run with `--codec hevc`. Confirm in logcat:
    `adb -s <quest-ip>:5555 logcat -d | Select-String 'GTA60'` -> `MediaCodec started (...) video/hevc
@@ -606,3 +632,54 @@ motion and texture. On real content:
   not being used - correct for latency, and consistent with the H.264 baseline.
 - The headset's bitrate/FPS selectors are unchanged; HEVC does not add a codec toggle to the HUD, so
   the codec is chosen on the PC with `--codec`.
+
+---
+
+## 10. Phase 7 rollout: everything the rename broke (read before renaming again)
+
+Renaming the binary and the Android package cost far more debugging time than the HEVC work did.
+All three failures presented as "the headset cannot reach the PC", and none of them was the PC.
+
+### 10.1 Windows Firewall allows an exe by *path*, so a rename blocks inbound traffic
+The allow rules created earlier were `C:\...\build\gta60frames.exe` (inbound, TCP + UDP, Public).
+After the rename, `GTA-Sixty.exe` matched no rule, so Windows silently dropped **inbound TCP 7660
+and UDP 7661**. Symptoms, in order of how they mislead you:
+
+- `Get-NetTCPConnection -LocalPort 7660` shows the socket **listening** - the PC looks fine.
+- The LAN discovery responder answers a loopback probe correctly (`GTA60_OFFER|...`), so discovery
+  "works" when tested on the PC.
+- From the headset, `ping` to the PC succeeds (ICMP is allowed) while a TCP connect **times out**,
+  which reads like a network/AP-isolation problem.
+
+Fix (needs an elevated shell once):
+
+```powershell
+New-NetFirewallRule -DisplayName 'GTA-Sixty' -Direction Inbound -Profile Any `
+  -Program 'C:\...\build\GTA-Sixty.exe' -Action Allow
+```
+
+Diagnostic that settles it in one line - **ping proves nothing, a TCP connect does**:
+`adb shell 'echo x | toybox nc -w 3 <pc-ip> 7660; echo rc=$?'` -> `rc=0` means the firewall is fine.
+
+### 10.2 Changing the Android package id silently wipes the app's saved settings
+`com.gta60frames.quest` -> `com.gtasixty.quest` is a *different app* to Android, so it gets a fresh
+SharedPreferences store: the saved PC address and the cached Wake-on-LAN MAC are gone. This looks
+exactly like "the app lost the PC IP" and has nothing to do with anything scrubbed for publication.
+The old package also stays installed - uninstall it by hand.
+
+### 10.3 First-run discovery never worked (fixed in Phase 7)
+`discoverLanHost()` only probed `255.255.255.255` until a host had been saved at least once, and
+Android/Wi-Fi drivers drop that packet often (the code's own comment admitted it). Combined with
+10.2 there is no saved host, so **a fresh install could never discover the PC at all**. It now
+derives the directed broadcast of every live interface (`InterfaceAddress.networkPrefixLength`) and
+probes those as well - that is the address that actually arrives. Note this LAN is a **/22**, not the
+/24 you would guess from a `192.168.x.y` address, so **compute the broadcast from the interface's own
+prefix length** rather than assuming `/24` or borrowing the prefix from a remembered host.
+
+### 10.4 Signing in can succeed while the token is thrown away
+`runLogin()` used to print "Encrypted token saved to ..." on the strength of the device-code poll
+alone, and `Account::store()` discarded `saveTokens()`'s result, so a failed write was invisible and
+the next launch simply asked for a sign-in again. Both now verify, and `saveTokens()` names the
+failing syscall (`fprintf` with the path and `errno`). Under an automation harness that confines
+unsigned binaries to the working directory, this is exactly how the sign-in was lost three times;
+`GTA60_XBOX_DATA` pointed at a writable directory is the workaround.

@@ -84,11 +84,11 @@ if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
 $Keystore = Join-Path $AppDir "debug.keystore"
 if (-not (Test-Path -LiteralPath $Keystore)) {
     Write-Host "[Quest APK] Generating debug keystore..."
-    & $Keytool -genkeypair -v -keystore $Keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=GTASixty,O=Android,C=US"
+    & $Keytool -genkeypair -v -keystore $Keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=GTA-Sixty,O=Android,C=US"
     if ($LASTEXITCODE -ne 0) { throw "keytool failed" }
 }
 
-$FinalApk = Join-Path $OutBuild "GTASixty-Quest3.apk"
+$FinalApk = Join-Path $OutBuild "GTA-Sixty-Quest3.apk"
 Write-Host "[Quest APK] Signing $FinalApk..."
 & cmd.exe /c ('"{0}" sign --ks "{1}" --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey --out "{2}" "{3}"' -f $Apksigner, $Keystore, $FinalApk, $AlignedApk)
 if ($LASTEXITCODE -ne 0) { throw "apksigner sign failed" }

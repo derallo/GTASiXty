@@ -38,14 +38,14 @@ public:
         // Talk directly to the Xbox/Microsoft endpoints. AUTO_PROXY first tries WPAD/DHCP proxy
         // discovery, which stalls and then fails with ERROR_WINHTTP_AUTO_PROXY_SERVICE_ERROR
         // (12185) on networks without a proxy, so only use it as a last-resort fallback.
-        session_.h = WinHttpOpen(L"GTASixty/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        session_.h = WinHttpOpen(L"GTA-Sixty/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!session_) {
-            session_.h = WinHttpOpen(L"GTASixty/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            session_.h = WinHttpOpen(L"GTA-Sixty/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         }
         if (!session_) {
-            session_.h = WinHttpOpen(L"GTASixty/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            session_.h = WinHttpOpen(L"GTA-Sixty/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         }
         if (session_) {

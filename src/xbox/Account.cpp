@@ -5,6 +5,7 @@
 #include <wincrypt.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -87,7 +88,7 @@ HttpsRequest xblPost(const char* host, const char* path, const json& body) {
 std::vector<uint8_t> protect(const std::string& plain) {
     DATA_BLOB in{static_cast<DWORD>(plain.size()), reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()))};
     DATA_BLOB out{};
-    if (!CryptProtectData(&in, L"GTASixty Xbox sign-in", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+    if (!CryptProtectData(&in, L"GTA-Sixty Xbox sign-in", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
         return {};
     }
     std::vector<uint8_t> bytes(out.pbData, out.pbData + out.cbData);
@@ -120,7 +121,7 @@ std::filesystem::path dataDirectory() {
     }
     std::filesystem::path result(raw);
     CoTaskMemFree(raw);
-    return result / L"GTASixty" / L"xbox";
+    return result / L"GTA-Sixty" / L"xbox";
 }
 
 std::optional<SavedTokens> loadTokens(const std::filesystem::path& file) {
@@ -146,7 +147,11 @@ std::optional<SavedTokens> loadTokens(const std::filesystem::path& file) {
 
 bool saveTokens(const std::filesystem::path& file, const SavedTokens& tokens) {
     std::error_code ec;
-    std::filesystem::create_directories(file.parent_path(), ec);
+    if (!file.parent_path().empty()) std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) {
+        std::fprintf(stderr, "xbox: cannot create %ls (%s)\n", file.parent_path().c_str(), ec.message().c_str());
+        return false;
+    }
     std::string plain = json{
         {"refresh", tokens.refreshToken},
         {"access", tokens.accessToken},
@@ -155,15 +160,28 @@ bool saveTokens(const std::filesystem::path& file, const SavedTokens& tokens) {
     }.dump();
     const auto bytes = protect(plain);
     SecureZeroMemory(plain.data(), plain.size());
-    if (bytes.empty()) return false;
+    if (bytes.empty()) {
+        std::fprintf(stderr, "xbox: DPAPI could not encrypt the token (err=%lu)\n",
+                     static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
     const auto temp = std::filesystem::path(file).concat(L".tmp");
     {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
+        if (!out) {
+            // Worth naming explicitly: the signed-in state is silently lost otherwise, and the next
+            // launch just asks for a sign-in again with no explanation.
+            std::fprintf(stderr, "xbox: cannot write %ls (errno=%d)\n", temp.c_str(), errno);
+            return false;
+        }
         out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!out) return false;
+        if (!out) {
+            std::fprintf(stderr, "xbox: write to %ls failed (errno=%d)\n", temp.c_str(), errno);
+            return false;
+        }
     }
     std::filesystem::rename(temp, file, ec);
+    if (ec) std::fprintf(stderr, "xbox: cannot rename to %ls (%s)\n", file.c_str(), ec.message().c_str());
     return !ec;
 }
 
@@ -211,7 +229,6 @@ void Account::signOut() {
 void Account::store() {
     if (tokens_) saveTokens(file_, *tokens_);
 }
-
 DeviceCode Account::beginSignIn() {
     const json j = parse(
         http_->send(formPost("login.microsoftonline.com", "/consumers/oauth2/v2.0/devicecode",
