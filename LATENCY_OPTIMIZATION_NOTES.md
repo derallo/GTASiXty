@@ -5,7 +5,9 @@
 >
 > **Start at section 6 (HANDOFF)** if you are picking this up fresh - it has the current numbers,
 > what is already maxed out, what is worth doing next, and the measurement traps that cost hours.
-> **Section 9 (HEVC)** is the newest work; section 7.5 was the request that led to it.
+> **Section 9 (HEVC)** is the newest work, 9.7 is a live stress test, and section 10 lists what the
+> rename broke. Anything marked "corrected" or "measured" was verified on this hardware; earlier
+> guesses that turned out wrong are kept visible rather than silently deleted, so do the same.
 
 ---
 
@@ -434,20 +436,44 @@ infinite GOP, not from the preset alone).
 
 Live result after the change: **pcLat 9.96 -> 8.43 ms**, decode 3.50, still 59-60 fps, decLag 0.
 
-### 7.4 Why the output cannot reach 90 fps from a 60 fps source
-- The console sends **60 fps**; nothing on the PC can invent real new frames.
-- The frame-generation path only supports **integer 2x / 3x from a ~30 fps source**
-  (`fgMult = targetFps >= 90 ? 3 : 2`), and the gate only enables it when smoothed content rate
-  drops below 34 fps. With a 60 fps source `fgActive` is never true, so output stays 60.
-- Reaching 90 from 60 would need **1.5x interpolation** (fractional-frame timing: synthesise frames
-  at t=2/3 and t=4/3 between two reals), which does not exist yet, plus the headset panel actually
-  switching to a 90 Hz mode (it currently reports a 72 Hz render rate; a 60 Hz mode also exists).
-- Even then it would not reduce latency: 30 of every 90 frames would be synthetic, interpolation
-  inherently adds about a frame of cadence delay, and at 1440p the per-frame budget is ~11.1 ms
-  against ~8.4 ms of real work (~76% duty, no slack).
-- **Setting the headset FPS button to 90 today is counter-productive**: it configures NVENC for
-  90 fps while only ~60 arrive, so the encoder spreads its bitrate over frames that are never
-  produced. Keep it at **60**.
+### 7.4 Frame generation is a 2x/3x multiplier - and 90 fps DOES work
+> **Corrected 2026-11-20 after a live A/B.** An earlier version of this section claimed the output
+> "cannot reach 90 fps" and that the headset's 90 fps button was "counter-productive". The first
+> claim was reasoning about a *60 fps source* and was wrong as a general statement: on 30 fps content
+> (the normal case here) the 3x path has always worked. The measurements below replace the guesses.
+
+What the code actually does (verified by reading it, not by trusting this document):
+- `main.cpp` computes `fgMult = round(targetFps / contentFps)`, clamped 1..4, per frame, from the
+  instantaneous interval between *forwarded* frames.
+- `EnhancementPipeline::initialize` allocates `outputSlots_` with
+  `multiplier = targetFps >= 90 ? 3 : 2`, and `processUniqueFrame` clamps the requested multiplier to
+  `outputSlots_.size()`. So the **effective** maximum is 2x at a 60 fps target, 3x at 90.
+
+That clamp is why output fps is content rate x multiplier:
+
+| headset setting | content (uniq) | out fps | NVENC ms | pcLat |
+|---|---|---|---|---|
+| 60 fps @ 50 Mbps | 21.7 | 42.2 | 6.62 | **21.8** |
+| 90 fps @ 50 Mbps | 28.0 | **83.8** | 6.13 | **34.0** |
+| 90 fps @ 80 Mbps | 27.7 | **81.4** | 6.20 | **33.8** |
+| 90 fps @ 120 Mbps | 29.9 | **79.1** | 6.46 | **33.6** |
+| 60 fps @ 120 Mbps | 27.6 | 55.1 | 6.98 | 26.7 |
+
+(Sample counts for those windows: 121, 10, 81, 36 and 239 two-second samples. The 90 fps @ 50 Mbps
+window is short because the setting was changed quickly, so treat its numbers as indicative; the
+90 fps @ 80 and @ 120 windows agree with each other to within 0.2 ms.)
+
+- **90 fps is reachable** from ~30 fps content via 3x interpolation: 79-84 fps measured.
+- It costs **~12 ms** of PC latency (33.8 vs 21.8 ms). That - not impossibility - is the reason to
+  keep the headset at 60. The panel caveat in 8.3 (72 Hz render rate) still applies.
+- With a genuine **60 fps source** nothing engages: the gate needs the *smoothed* content rate below
+  34 fps, so `fgActive` stays false and output stays 60. That part of the old text was correct.
+
+**Known inconsistency (open, not fixed):** `main.cpp`'s own comment says the multiplier is chosen "so
+the OUTPUT lands on targetFps, whatever rate the content happens to be changing at", but the 2-slot
+clamp makes that false below a 90 fps target: a ~15 fps content rate yields 2x = 30 fps, not 60. This
+is visible in 9.7. Fixing it means sizing `outputSlots_` for 4x (about +30 MB of 1440p textures) and
+accepting 4x interpolation artefacts on slow content - a design decision, not a one-line change.
 
 ### 7.5 HEVC (item 4 of the previous handoff) - done in Phase 7
 Implemented as `--codec h264|hevc`, a codec byte in the `VIDEO_CONFIG` packet, and `video/hevc` plus
@@ -503,8 +529,12 @@ But the trade is explicit and large:
 | mode | output fps | pcLat | gpu (NVOFA) |
 |---|---|---|---|
 | passthrough (dedup disabled) | 60 (30 duplicated) | **8.4 ms** | 0.3 ms |
-| frame generation 2x | 60 | ~20 ms (est.) | ~4.6 ms |
-| frame generation 3x | **90** | **28.6 ms** | 4.6 ms |
+| frame generation 2x | content x2 | **~22.9 ms** (measured 2026-11-20, 7.4/9.7) | ~4.7 ms |
+| frame generation 3x | content x3, up to ~84 | **~33.8 ms** (measured 2026-11-20, 7.4) | 4.6 ms |
+
+The "est." is gone: both modes have since been measured live. The 3x figure belongs to a 90 fps
+target, and note that the multiplier is capped by the number of output slots (7.4), so "2x"/"3x" is a
+ceiling, not a promise - slow content lands below the target rate.
 
 This is the fundamental FG tradeoff the project always had: interpolation waits for the next real
 frame, so output frame rate goes up while input-to-photon latency goes up with it.
@@ -515,8 +545,9 @@ unless a 90 Hz mode can be forced.
 
 ### 8.4 Choosing
 - Latency priority: `--dedup-mad 0` (or `--no-fg`), 60 fps passthrough, ~8.4 ms pcLat.
-- Smoothness priority: leave it on; 60 fps (2x) at ~20 ms is usually the best compromise.
-- 90 fps: works, but ~28.6 ms and a 72 Hz panel will not display all of it.
+- Smoothness priority: leave it on; 60 fps (2x) at **~22-23 ms measured** is the usual compromise.
+- 90 fps: works (79-84 fps measured, 7.4) but costs **~34 ms** and a 72 Hz panel will not display all
+  of it.
 
 ---
 
@@ -632,6 +663,36 @@ On real content:
   not being used - correct for latency, and consistent with the H.264 baseline.
 - The headset's bitrate/FPS selectors are unchanged; HEVC does not add a codec toggle to the HUD, so
   the codec is chosen on the PC with `--codec`.
+
+### 9.7 Stress test: fast driving (2026-11-20, HEVC, 1440p60, headset 120 Mbps)
+124 s of active driving in a demanding open-world game, 62 telemetry samples:
+
+| metric | min | avg | max |
+|---|---|---|---|
+| output fps | 29.9 | 54.3 | 60.2 |
+| **pcLat** | **22.07** | 22.9 | **23.51** |
+| uniq (kept content fps) | 14.9 | 27.2 | 30.1 |
+| NVENC | 6.78 | 7.10 | 7.40 |
+| decode | 3.44 | 3.53 | 3.70 |
+| GPU (NVOFA flow) | 4.72 (4.34) | 5.15 (4.68) | 5.44 (4.96) |
+| PC -> headset | 49.2 Mbps | 106.9 | 127.2 |
+| `rtt` | 15 | 17.4 | 21 |
+
+What this proves:
+- **Nothing is dropped under load**: `qDrop` delta 0, `tcpDrop` 0, `qMax` peak 1, over 124 s at up to
+  127 Mbps over Wi-Fi. The only anomaly was a single 13.7 ms TCP send spike, absorbed by the 384 KB
+  send buffer (7.1).
+- **`decLag` stayed 0.00 ms** for every sample - DXVA at 1440p still never buffers.
+- **`pcLat` spread was 1.44 ms.** Fast motion raises the work (NVENC 6.65 -> 7.40 ms, NVOFA flow
+  4.34 -> 4.96 ms) but the budget absorbs it, so it shows up as a slightly higher *fixed* cost rather
+  than as jitter. This is the single most reassuring number in these notes.
+- **Output fps sags with content rate, and that is not frame loss.** `out` is content x multiplier,
+  so `uniq=14.9 -> out=29.9` while `uniq=30 -> out=60`. 19 of 62 samples were below 55 fps purely
+  because the scene stopped changing (or the deduper culled it), not because the pipeline missed a
+  deadline - see the 2-slot clamp in 7.4, which is why a 60 fps target cannot compensate with 4x.
+  Whether that sag is *visible* depends on whether it happens while the camera moves: a static scene
+  at 30 fps is indistinguishable, a mid-corner 30 fps is judder. Operator's verdict on this run:
+  "looked pretty good".
 
 ---
 
