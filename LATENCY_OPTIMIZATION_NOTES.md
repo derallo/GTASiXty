@@ -772,6 +772,15 @@ Three candidate fixes, and the one that was implemented is (3):
 3. **Let the headset start the PC side (implemented)**: nothing runs on the PC except the tiny agent
    (UDP 7662, ~0 % CPU). When the user starts a stream, the app asks the agent, the agent launches
    the streamer, and the app keeps retrying the TCP connect until it appears. See 10.7.
+**Update 2026-11-20: option 1 is now implemented as well.** Option 3 alone still lets the session die,
+and every reconnect re-attaches a client mid-game - which is what dropped a local TV game to the
+dashboard, and what left a virtual pad holding player 1 (section 12). The headset now re-sends the
+current pad state every 20 s while streaming (identical buttons/axes, a no-op for the game) so the
+console never sees an idle player. It is a HUD toggle, **"Hold: On/Off", default ON**, persisted in
+prefs; turn it off when you want the console to sleep. Cost, agreed with the operator explicitly:
+console and decoder stay live while it is on. Alternatives that were offered and rejected:
+pad-release only (cheap, idle timeout remains) and the keep-listening refactor (does not help - the
+console still ends the session, so the game is already gone before the next attach).
 
 ### 10.6 A spawned background agent inherits the script's stdout (hang)
 `install-autostart.ps1 -StartNow` appeared to hang whenever its output was captured - a redirect to a
@@ -927,9 +936,9 @@ answers any connected pad, but a game binds to the pad that holds player 1. So:
   re-assignment and confirm the stale-slot theory.) Power-cycling the console also clears it.
 
 **Candidate fixes, in order of preference** (none implemented yet):
-1. **Release the pad explicitly on exit.** Send a final gamepad frame with every button and axis at
-   rest before closing, so the virtual pad never ends on a held state; and stop only after the send
-   confirms. Today the last frame sent is whatever the user's hands were doing when it died.
+1. **Release the pad explicitly on exit.** *(Implemented 2026-11-20: `closeSocket()` now writes an
+   all-released gamepad frame straight to the socket before closing, bypassing the queued send path so
+   a close cannot drop it.)*
 2. **Never kill the streamer.** `Stop-Process` skips all teardown, including `rtc.close()`; the app has
    a console-Ctrl-C handler (`g_stopRequested`) that closes cleanly. Use it for planned shutdowns -
    several of the "weird" reports this session are side effects of taskkill during testing.

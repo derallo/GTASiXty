@@ -105,6 +105,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Button resBtn;
     private Button fpsBtn;
     private Button bitrateBtn;
+    // "Hold session": re-send the current pad state every ~20 s so the console never decides the
+    // player went idle. That is what stops the stream from dying while you are away, and - more
+    // importantly - what stops a reconnect from attaching a new client mid-game (which drops the
+    // console to the dashboard) or leaving a stale virtual pad holding player 1 (notes 10.5, 12).
+    // Costs power: the console stays awake while it is on, so it is a visible toggle.
+    private boolean keepAlive = true;
+    private volatile long lastGamepadSendMs = 0;
+    private Button holdBtn;
     private TextView statusText;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor();
@@ -160,6 +168,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         resIdx = Math.max(0, Math.min(RES_LABELS.length - 1, prefs.getInt("resIdx", 1)));
         cfgFps = prefs.getInt("cfgFps", 60) == 90 ? 90 : 60;
         bitrateIdx = Math.max(0, Math.min(BITRATE_OPTIONS.length - 1, prefs.getInt("bitrateIdx", 1)));
+        keepAlive = prefs.getBoolean("keepAlive", true);
         if (!prefs.contains("prefs_v3")) {
             bitrateIdx = 1;
             prefs.edit().putBoolean("prefs_v3", true).putInt("bitrateIdx", bitrateIdx).apply();
@@ -269,6 +278,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (streaming.get()) sendClientConfig();
         });
         row2.addView(bitrateBtn);
+
+        holdBtn = makeButton("Hold: " + (keepAlive ? "On" : "Off"), "#1E293B");
+        holdBtn.setOnClickListener(v -> {
+            keepAlive = !keepAlive;
+            holdBtn.setText("Hold: " + (keepAlive ? "On" : "Off"));
+            getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("keepAlive", keepAlive).apply();
+            setStatus(keepAlive
+                    ? "Session held: the console will not idle us out while you are away"
+                    : "Session hold off: the console may end the stream when idle");
+        });
+        row2.addView(holdBtn);
 
         statusText = new TextView(this);
         statusText.setText("Ready — Tap Start Stream (or LAN to auto-find PC)");
@@ -452,6 +472,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void closeSocket() {
+        // Release the virtual pad before dropping the connection. The console keeps whatever state it
+        // last received, and a held button or a displaced pad can cost the physical controller its
+        // player-1 slot ("controller works for the Xbox menu but not in-game", notes section 12).
+        sendNeutralGamepadBlocking();
         Socket s = socket;
         socket = null;
         synchronized (sendLock) {
@@ -459,6 +483,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (s != null) {
             try { s.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    /**
+     * Writes an all-released gamepad frame synchronously, straight to the socket, so it cannot be
+     * dropped by the queued control-packet path racing the close.
+     */
+    private void sendNeutralGamepadBlocking() {
+        padButtons = 0;
+        padLX = 0; padLY = 0; padRX = 0; padRY = 0;
+        padLT = 0; padRT = 0;
+        synchronized (sendLock) {
+            if (sockOut == null) return;
+            final ByteBuffer bb = ByteBuffer.allocate(16 + 16).order(ByteOrder.LITTLE_ENDIAN);
+            bb.putInt(GT60_MAGIC);
+            bb.put((byte) TYPE_CLIENT_GAMEPAD);
+            bb.put((byte) 0);
+            bb.putShort((short) 0);
+            bb.putInt(16);
+            bb.putInt(0);
+            bb.put((byte) 0).put((byte) 0);
+            bb.putShort((short) 0).putShort((short) 0).putShort((short) 0)
+              .putShort((short) 0).putShort((short) 0).putShort((short) 0)
+              .putShort((short) 0);
+            try {
+                sockOut.write(bb.array());
+                sockOut.flush();
+                Log.i(TAG, "released virtual gamepad before disconnect");
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -1191,6 +1245,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         bb.putShort(padRY);
         bb.putShort((short) padLT);
         bb.putShort((short) padRT);
+        lastGamepadSendMs = System.currentTimeMillis();
         sendControlPacket(TYPE_CLIENT_GAMEPAD, bb.array());
     }
 
@@ -1266,6 +1321,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             public void run() {
                 long now = System.currentTimeMillis();
                 double dt = (now - lastStatTimeMs) / 1000.0;
+                // Keep the console from timing the session out. Repeating the *current* pad state is
+                // a no-op for the game (same buttons, same axes), it only proves the player is still
+                // there. See the Hold button and notes 10.5.
+                if (streaming.get() && keepAlive && (now - lastGamepadSendMs) > 20_000L) {
+                    sendGamepadState();
+                }
                 if (streaming.get() && dt >= 0.5 && streamWidth > 0) {
                     long f = statFrames;
                     long r = statRendered;
