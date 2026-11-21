@@ -898,3 +898,47 @@ cmd /c "call ""<VS>\VC\Auxiliary\Build\vcvars64.bat"" > nul 2>&1 && ""<VS>\...\N
 Plain `ninja` can hang at startup under a confined sandbox (it creates a jobserver named pipe), which
 needs the wider sandbox mode. `schtasks` is likewise denied in the sandbox - use a Startup-folder
 shortcut instead (`scripts\install-autostart.ps1`).
+
+---
+
+## 12. Field reports: the controller works for the Xbox menu but not in-game
+
+> Reported 2026-11-20, not yet reproduced or fixed. Written down because the symptom is specific and
+> the likely cause is **our** input injection, not the game.
+
+**Symptom.** Leave the stream alone for a while, come back, and the physical controller still opens
+the Xbox guide / navigates the system UI, but does nothing inside the running game. The controller is
+still paired to the console and shows as connected.
+
+**Why this is probably us.** The headset sends gamepad frames to the PC (`TYPE_CLIENT_GAMEPAD`) and
+the PC forwards them into the Xbox session as a *virtual* controller with pad index 0. The system UI
+answers any connected pad, but a game binds to the pad that holds player 1. So:
+
+1. Our virtual pad is created with index 0 and takes the player-1 slot.
+2. The stream ends (idle timeout, killed streamer, Wi-Fi blip) **without telling the console anything** -
+   there is no "pad gone" message, and on a kill there is not even a clean WebRTC close.
+3. The console can keep the stale virtual pad in the player-1 slot, leaving the physical pad as
+   player 2: it drives the system UI but the game ignores it.
+
+**Evidence to collect next time it happens** (cheap, and it would settle the hypothesis):
+- `adb -s <quest-ip>:5555 logcat -d -s GTA60` for `gamepad`/`feedDecoder` lines around the drop.
+- On the console: does the guide show *two* pads connected, and which one is signed in as the player?
+- Does turning the physical controller off and on again restore in-game control? (That would force a
+  re-assignment and confirm the stale-slot theory.) Power-cycling the console also clears it.
+
+**Candidate fixes, in order of preference** (none implemented yet):
+1. **Release the pad explicitly on exit.** Send a final gamepad frame with every button and axis at
+   rest before closing, so the virtual pad never ends on a held state; and stop only after the send
+   confirms. Today the last frame sent is whatever the user's hands were doing when it died.
+2. **Never kill the streamer.** `Stop-Process` skips all teardown, including `rtc.close()`; the app has
+   a console-Ctrl-C handler (`g_stopRequested`) that closes cleanly. Use it for planned shutdowns -
+   several of the "weird" reports this session are side effects of taskkill during testing.
+3. **Do not use pad index 0** for injected input if the console reserves it for the physical pad;
+   send index 1 and let the game pick its own player. Needs testing, and it must not break the
+   single-player case where only our pad exists.
+4. Keep-alive (section 10.5): if sessions stop ending by themselves, the pad is never orphaned in the
+   first place - this is the mitigation that removes the whole failure mode rather than patching it.
+
+**Do not assume it is a game bug.** The same class of stale-state problem appears in the idle session
+end (10.5) and in the dashboard drop (the session attach itself), and in all three cases the console
+is being left in a state by a client that disappeared without saying goodbye.
