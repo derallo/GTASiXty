@@ -813,3 +813,88 @@ Two smaller things fixed at the same time:
 Note the agent launches with the default codec (`--codec h264`, 120 Mbps). A session restarted from
 the headset therefore comes back as H.264 even if it had been started with `--codec hevc`; change the
 `cmd` line in `runAgent()` if that should follow the HEVC path.
+
+---
+
+## 11. Development environment access (for the next agent)
+
+### 11.1 Current binary / package names (they were renamed in Phase 7)
+| thing | current |
+|---|---|
+| PC executable | `build\GTA-Sixty.exe` |
+| test binary | `build\GTA-Sixty_tests.exe` |
+| APK | `build\GTA-Sixty-Quest3.apk` |
+| Android package | `com.gtasixty.quest` |
+| activity | `com.gtasixty.quest/.MainActivity` |
+
+Stale artefacts from the rename are still lying around in `build/` (`gta60frames.exe`,
+`GTASixty.exe`, `GTASixty-Quest3.apk`, ...). **Do not launch or install those** - the old APK has a
+different package name, so it installs alongside and connects to nothing. Use the `GTA-Sixty` names.
+
+### 11.2 Wireless ADB - it was already enabled, nothing had to be turned on
+The headset already had ADB over TCP active (`getprop service.adb.tcp.port` returns `5555`); only
+`adb connect` was needed. To enable it on a *fresh* headset:
+
+1. Enable **Developer Mode** for the account (Meta Horizon phone app -> headset -> Developer Mode,
+   or the developer dashboard).
+2. Plug the headset in over USB once and confirm `adb devices` lists it.
+3. `adb tcpip 5555`, then unplug.
+4. `adb connect <quest-ip>:5555`.
+
+Some Horizon OS builds instead expose a *Wireless debugging* toggle with a pairing code; then use
+`adb pair <ip>:<port>` once before connecting.
+
+### 11.3 FIND THE IP - it changes, do not hardcode it
+The headset's DHCP address moved from `192.168.68.87` to `192.168.68.73` within one day. Use mDNS:
+
+```powershell
+adb mdns services        # lists "_adb._tcp" entries as <serial> <service> <ip:port>
+adb connect <ip>:5555
+adb -s <ip>:5555 shell getprop ro.product.model     # confirm it prints "Quest 3"
+```
+
+If mDNS is unavailable, scan the LAN for something listening on 5555 and verify the model. Other
+machines on a shared LAN can also expose 5555 - never assume the first hit is the headset.
+
+### 11.4 The gotcha that wastes time every session
+Every shell invocation here starts a **fresh adb server**, so a connection made in one command is
+gone by the next and `adb -s <ip>:5555 ...` fails with `device not found`. Chain connect + work in
+one invocation:
+
+```powershell
+adb connect <quest-ip>:5555 | Out-Null; Start-Sleep -Milliseconds 800
+adb -s <quest-ip>:5555 install -r build\GTA-Sixty-Quest3.apk
+adb -s <quest-ip>:5555 shell am force-stop com.gtasixty.quest
+adb -s <quest-ip>:5555 shell am start -n com.gtasixty.quest/.MainActivity
+adb -s <quest-ip>:5555 logcat -d | Select-String 'GTA60'
+```
+
+Other traps:
+- `adb exec-out screencap -p > file.png` writes a **corrupt** file through PowerShell redirection.
+  Use `screencap -p /sdcard/x.png` on the device, then `adb pull`. Shots are 4128x2208 (both eyes
+  side by side) and 8-20 MB, so downscale before viewing.
+- A stale `emulator-5562 offline` entry may appear in `adb devices`; it is unrelated, ignore it or
+  `adb kill-server`.
+
+### 11.5 Controlling the stream on the PC
+```powershell
+# agent (UDP 7662) so the headset's "Wake PC" can launch the streamer
+Start-Process build\GTA-Sixty.exe -ArgumentList '--agent' -WindowStyle Hidden
+
+# the streamer
+build\GTA-Sixty.exe --connect auto --quest-server --bitrate 120 --sharpness 0.12
+
+# any running instance LOCKS the exe, so stop them all before rebuilding or the link fails LNK1104
+Stop-Process -Name 'GTA-Sixty' -Force
+```
+
+Builds need the MSVC environment in the same shell (`cmake`/`ninja` are not on PATH; they live under
+the Visual Studio BuildTools install):
+
+```powershell
+cmd /c "call ""<VS>\VC\Auxiliary\Build\vcvars64.bat"" > nul 2>&1 && ""<VS>\...\Ninja\ninja.exe"" -C build"
+```
+
+Plain `ninja` can hang at startup under a confined sandbox (it creates a jobserver named pipe), which
+needs the wider sandbox mode. `schtasks` is likewise denied in the sandbox - use a Startup-folder
+shortcut instead (`scripts\install-autostart.ps1`).

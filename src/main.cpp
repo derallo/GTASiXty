@@ -574,28 +574,75 @@ int runConnect(const CliOptions& initialOpts) {
     log::info("xbox", std::format("Connecting to console '{}' ({}) [{}]",
                                   target.name, target.serverId, target.powerState));
 
-    const std::string sessionId = api.play(target.serverId, "en-US");
-    log::info("xbox", std::format("Session provisioned: {}", sessionId));
+    // Provisioning a second session while the console still holds one takes it over and drops it to
+    // the dashboard, which interrupts an in-progress game. So if the session this PC created last
+    // time is still alive, reattach to it. The id is persisted because the streamer is short-lived:
+    // it exits whenever the console ends the session.
+    const auto sessionFile = xbox::dataDirectory() / L"last-session.txt";
+    std::string sessionId;
+    bool sessionReused = false;
+    {
+        std::ifstream in(sessionFile);
+        std::string saved;
+        if (in && std::getline(in, saved) && !saved.empty()) {
+            try {
+                const auto st = api.state(saved);
+                if (!st.state.empty() && st.state != "Failed") {
+                    sessionId = saved;
+                    sessionReused = true;
+                    log::info("xbox", std::format("Reusing live session {} (state={}); not provisioning a new one",
+                                                  saved, st.state));
+                } else {
+                    log::info("xbox", std::format("Saved session {} is gone (state={}); provisioning a new one",
+                                                  saved, st.state));
+                }
+            } catch (const std::exception& e) {
+                log::warn("xbox", std::format("saved session {} is not usable ({}); provisioning a new one",
+                                              saved, e.what()));
+            }
+        }
+        if (sessionId.empty()) {
+            sessionId = api.play(target.serverId, "en-US");
+            log::info("xbox", std::format("Session provisioned: {}", sessionId));
+            std::error_code sec;
+            if (!sessionFile.parent_path().empty()) std::filesystem::create_directories(sessionFile.parent_path(), sec);
+            std::ofstream out(sessionFile, std::ios::trunc);
+            if (out) {
+                out << sessionId;
+            } else {
+                // Not fatal, but it silently costs the reuse above on the next start.
+                std::fprintf(stderr, "xbox: cannot remember the session id in %ls (errno=%d); "
+                                     "the next start will provision a new session\n",
+                             sessionFile.c_str(), errno);
+            }
+        }
+    }
 
     // Attach to the session exactly once. `connect` is what makes the console announce that a
     // remote client started playing, so calling it on every poll iteration (the previous
     // behaviour: connect, sleep, connect, ... until the state flipped) produced the repeated
     // "started playing remotely" notifications.
     bool connectSent = false;
-    for (int attempt = 0; attempt < 60 && !g_stopRequested.load(); ++attempt) {
-        const auto st = api.state(sessionId);
-        if (st.state == "Provisioned") {
-            break;
-        } else if (st.state == "Failed") {
-            log::error("xbox", std::format("Session provisioning failed: {} {}", st.errorCode, st.errorMessage));
-            api.stop(sessionId);
-            return 1;
-        } else if (st.state == "ReadyToConnect" && !connectSent) {
-            api.connect(sessionId, account.transferToken());
-            connectSent = true;
-            log::info("xbox", "Session connected (client attached once)");
+    if (sessionReused) {
+        api.connect(sessionId, account.transferToken());
+        connectSent = true;
+        log::info("xbox", "Reattached to the existing session (console left undisturbed)");
+    } else {
+        for (int attempt = 0; attempt < 60 && !g_stopRequested.load(); ++attempt) {
+            const auto st = api.state(sessionId);
+            if (st.state == "Provisioned") {
+                break;
+            } else if (st.state == "Failed") {
+                log::error("xbox", std::format("Session provisioning failed: {} {}", st.errorCode, st.errorMessage));
+                api.stop(sessionId);
+                return 1;
+            } else if (st.state == "ReadyToConnect" && !connectSent) {
+                api.connect(sessionId, account.transferToken());
+                connectSent = true;
+                log::info("xbox", "Session connected (client attached once)");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     if (g_stopRequested.load()) {
         api.stop(sessionId);
