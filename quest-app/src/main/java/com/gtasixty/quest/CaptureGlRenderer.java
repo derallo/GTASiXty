@@ -131,7 +131,8 @@ final class CaptureGlRenderer {
 
     private int uniqueCount = 0;
     private int consecDups = 0;
-    private boolean flowValid = false;
+    private int dupGateFrames = 0;
+    private boolean realFramePending = false;
     private final float[] stMatrix = new float[16];
     private final int[] eglDim = new int[2];
 
@@ -230,7 +231,8 @@ final class CaptureGlRenderer {
                     resetHistoryRequested = false;
                     uniqueCount = 0;
                     consecDups = 0;
-                    flowValid = false;
+                    dupGateFrames = 0;
+                    realFramePending = false;
                 }
                 availableFrames--;
                 isDup = dupQueue.pollFirst();
@@ -450,7 +452,7 @@ final class CaptureGlRenderer {
             return;
         }
 
-        // FG60 or FG60+SR
+        // FG60 or FG60+SR (strict monotonic presentation: Mid(U0, U1) on unique arrival, U1 on duplicate slot)
         final boolean superRes = (mode == MODE_FG60_SR);
         boolean generated = false;
         int displayTex = texCurr;
@@ -489,7 +491,9 @@ final class CaptureGlRenderer {
             uniqueCount++;
             consecDups = 0;
 
-            if (uniqueCount >= 2) {
+            if (dupGateFrames > 0 && uniqueCount >= 2) {
+                dupGateFrames--;
+
                 // Coarse optical flow (80x45)
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboFlowCoarse);
                 GLES30.glViewport(0, 0, FLOW_LO_W, FLOW_LO_H);
@@ -532,15 +536,7 @@ final class CaptureGlRenderer {
                 GLES30.glUniform1i(uSmoothPrevFlow, 2);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
-                tmpT = texFlowPrev; texFlowPrev = texFlowSmooth; texFlowSmooth = tmpT;
-                tmpF = fboFlowPrev; fboFlowPrev = fboFlowSmooth; fboFlowSmooth = tmpF;
-                flowValid = true;
-            }
-            displayTex = texCurr;
-        } else {
-            // Duplicate HDMI frame: synthesize midpoint warp on first duplicate if optical flow is ready
-            consecDups++;
-            if (flowValid && consecDups == 1) {
+                // Midpoint warp Mid(U0, U1) -> fboMid (t = 0.5)
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboMid);
                 GLES30.glViewport(0, 0, width, height);
                 GLES30.glUseProgram(progWarp);
@@ -551,15 +547,27 @@ final class CaptureGlRenderer {
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texCurr);
                 GLES30.glUniform1i(uWarpCurr, 1);
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE2);
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowPrev);
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowSmooth);
                 GLES30.glUniform1i(uWarpFlow, 2);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
+                tmpT = texFlowPrev; texFlowPrev = texFlowSmooth; texFlowSmooth = tmpT;
+                tmpF = fboFlowPrev; fboFlowPrev = fboFlowSmooth; fboFlowSmooth = tmpF;
+
                 displayTex = texMid;
+                realFramePending = true;
                 generated = true;
             } else {
+                if (dupGateFrames > 0) dupGateFrames--;
                 displayTex = texCurr;
+                realFramePending = false;
             }
+        } else {
+            // Duplicate HDMI frame: present the pending real frame U1 (t = 1.0) or hold U1 cleanly
+            dupGateFrames = 12;
+            consecDups++;
+            displayTex = texCurr;
+            realFramePending = false;
         }
 
         renderRcasToScreen(displayTex, surfW, surfH, superRes, look);
