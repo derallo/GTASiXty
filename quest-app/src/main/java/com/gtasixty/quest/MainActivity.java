@@ -71,6 +71,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // Empty means "nothing configured yet" - the app then scans the LAN instead of dialling a
     // hardcoded address.
     private static final String DEFAULT_PC_HOST = "";
+    private static final String DEFAULT_CAPTURE_HOST = "192.168.68.90";
 
     private static final int GT60_MAGIC = 0x30365447; // "GT60" LE
     private static final int TYPE_VIDEO_CONFIG = 0x01;
@@ -128,6 +129,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // and does not forward the headset pad (that pad stays paired to the console).
     private volatile boolean captureMode = false;
     private volatile boolean captureUpdateCheckedThisBoot = false;
+    private volatile boolean autoCaptureStart = false;
     private final BroadcastReceiver stopStreamReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -198,6 +200,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         directMode = prefs.getBoolean("directMode", false);
         captureMode = prefs.getBoolean("captureMode", false);
         if (captureMode) directMode = false;
+        if (!prefs.contains("prefs_v4")) {
+            captureMode = true;
+            directMode = false;
+            prefs.edit()
+                    .putBoolean("prefs_v4", true)
+                    .putBoolean("captureMode", true)
+                    .putBoolean("directMode", false)
+                    .putString("captureHost", DEFAULT_CAPTURE_HOST)
+                    .apply();
+        }
         if (!prefs.contains("prefs_v2")) {
             savedHost = DEFAULT_PC_HOST;
             prefs.edit().putBoolean("prefs_v2", true).putString("host", savedHost).apply();
@@ -242,7 +254,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         row1.addView(title);
 
         hostInput = new EditText(this);
-        hostInput.setText(savedHost);
+        hostInput.setText(captureMode ? prefs.getString("captureHost", DEFAULT_CAPTURE_HOST) : savedHost);
         hostInput.setHint("PC IP (auto if blank)");
         hostInput.setTextColor(Color.WHITE);
         hostInput.setHintTextColor(Color.GRAY);
@@ -396,6 +408,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final boolean wantCapture = launchIntent.getBooleanExtra("capture", false) || captureMode;
         final boolean wantDirect = !wantCapture && (launchIntent.getBooleanExtra("direct", false) || directMode);
         final boolean autoDirectStart = launchIntent.getBooleanExtra("directStart", false);
+        autoCaptureStart = launchIntent.getBooleanExtra("captureStart", false);
         final int enhanceExtra = launchIntent.getIntExtra("enhance", -1);
         if (enhanceExtra >= 0 && direct != null) {
             direct.setEnhanceMode(enhanceExtra);
@@ -618,6 +631,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         captureMode = false;
         persistTransportMode();
         modeBtn.setText("Mode: PC");
+        hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         setStatus("PC mode: press Start Stream");
@@ -642,9 +656,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         captureMode = true;
         persistTransportMode();
         modeBtn.setText("Mode: Capture");
+        hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("captureHost", DEFAULT_CAPTURE_HOST));
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
-        setStatus("Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays paired to the Xbox.");
+        setStatus("Capture mode: ready (mintbook-g11). Controller stays paired to the Xbox.");
         if (!captureUpdateCheckedThisBoot) {
             captureUpdateCheckedThisBoot = true;
             requestCaptureUpdateAsync(false);
@@ -657,6 +672,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         captureMode = false;
         persistTransportMode();
         modeBtn.setText("Mode: PC");
+        hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         setStatus("PC mode: press Start Stream");
@@ -768,7 +784,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Log.w(TAG, "connect(" + host + ") ignored: a stream is already running");
             return;
         }
-        getSharedPreferences("gta60", MODE_PRIVATE).edit().putString("host", host).apply();
+        getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                .putString(captureMode ? "captureHost" : "host", host)
+                .apply();
 
         final String targetHost = host;
         firstFrameRendered = false;
@@ -1836,7 +1854,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (!autoStartTriggered) {
             autoStartTriggered = true;
             if (captureMode) {
-                Log.i(TAG, "Surface created in Capture mode; waiting for Start Stream");
+                if (autoCaptureStart) {
+                    Log.i(TAG, "Surface created in Capture mode; auto-starting Capture stream");
+                    uiHandler.post(this::startStreamClicked);
+                } else {
+                    Log.i(TAG, "Surface created in Capture mode; waiting for Start Stream");
+                }
             } else if (!directMode) {
                 Log.i(TAG, "Surface created in PC mode; waiting for user to tap Start Stream");
             }
