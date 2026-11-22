@@ -1,6 +1,6 @@
 {
-  "versionCode": 2,
-  "versionName": "1.1",
+  "versionCode": 5,
+  "versionName": "1.4",
   "apkUrl": "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/GTA-Sixty-Quest3.apk",
-  "notes": "Direct mode virtual-pad release for Xbox-paired controllers, wake-from-sleep black-screen fix, EASU SuperRes + quarter-texel FG upgrades, ? help dialogs, and 3-hour GitHub APK updater."
+  "notes": "Capture mode default (192.168.68.90), on-Quest GPU EASU SuperRes + RCAS + optical-flow FG60 for Capture mode, monotonic FG60 frame ordering, HDMI audio auto-reopen, GTA60_UPDATE trigger, and cleaner mode-specific HUD."
 }
