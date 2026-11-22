@@ -342,8 +342,11 @@ void Gt60Server::setVideoConfig(uint32_t width, uint32_t height, uint32_t fps, c
     }
 }
 
-void Gt60Server::sendVideoAccessUnit(const uint8_t* data, size_t size, uint32_t timestampMs, bool isIdr) {
-    p_->enqueue(kTypeVideoAu, isIdr ? kFlagIdr : 0, 0, timestampMs, data, size);
+void Gt60Server::sendVideoAccessUnit(const uint8_t* data, size_t size, uint32_t timestampMs,
+                                     bool isIdr, bool isDuplicate) {
+    const uint8_t flags = static_cast<uint8_t>((isIdr ? kFlagIdr : 0) |
+                                               (isDuplicate ? kFlagDuplicate : 0));
+    p_->enqueue(kTypeVideoAu, flags, 0, timestampMs, data, size);
 }
 
 void Gt60Server::sendAudioPcm(const int16_t* interleavedStereo, size_t frameCount, uint32_t timestampMs) {

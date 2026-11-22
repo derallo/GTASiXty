@@ -15,7 +15,7 @@ namespace gta60::sink {
 //   uint8_t  type  (0x01=VideoConfig, 0x02=VideoAccessUnit, 0x03=PCM48kStereo,
 //                   0x81=Client Request IDR, 0x82=Client GamepadFrame, 0x83=Client StreamConfig,
 //                   0x84=Client Rendered echo)
-//   uint8_t  flags (bit0=IDR, bit1=GeneratedFrame)
+//   uint8_t  flags (bit0=IDR, bit1=GeneratedFrame, bit2=Duplicate [experimental, linux-capture])
 //   uint16_t meta  (VideoConfig only: stream fps)
 //   uint32_t payloadSize
 //   uint32_t timestampMs
@@ -37,6 +37,7 @@ public:
 
     static constexpr uint8_t kFlagIdr = 0x01;
     static constexpr uint8_t kFlagGenerated = 0x02;
+    static constexpr uint8_t kFlagDuplicate = 0x04; // experimental: captured frame matched previous frame
 
     // width + height + codec byte, ahead of the parameter-set blob.
     static constexpr size_t kVideoConfigHeaderBytes = 9;

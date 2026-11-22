@@ -30,6 +30,8 @@ public:
     static constexpr uint8_t kTypeClientRendered = 0x84;
 
     static constexpr uint8_t kFlagIdr = 0x01;
+    static constexpr uint8_t kFlagGenerated = 0x02;
+    static constexpr uint8_t kFlagDuplicate = 0x04; // experimental: captured frame matched previous frame
 
     struct Callbacks {
         std::function<void()> onClientConnected;
@@ -47,7 +49,8 @@ public:
     void stop();
 
     void setVideoConfig(uint32_t width, uint32_t height, uint32_t fps, const std::vector<uint8_t>& csd);
-    void sendVideoAccessUnit(const uint8_t* data, size_t size, uint32_t timestampMs, bool isIdr);
+    void sendVideoAccessUnit(const uint8_t* data, size_t size, uint32_t timestampMs,
+                             bool isIdr, bool isDuplicate = false);
     void sendAudioPcm(const int16_t* interleavedStereo, size_t frameCount, uint32_t timestampMs);
 
     bool hasClient() const;
