@@ -107,9 +107,9 @@ bool V4l2Capture::open(const std::string& device, uint32_t width, uint32_t heigh
         p_->fps = fps;
     }
 
-    // Request a minimal 3-buffer MMAP queue to keep capture latency low.
+    // Request a minimal 2-buffer MMAP queue to keep capture latency low (driver bumps up if needed).
     v4l2_requestbuffers req{};
-    req.count = 3;
+    req.count = 2;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(p_->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {

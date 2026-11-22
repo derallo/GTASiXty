@@ -23,6 +23,7 @@ struct VaapiEncoder::Impl {
     AVBufferRef* hwFramesCtx = nullptr;
     AVCodecContext* codecCtx = nullptr;
     AVFrame* swFrame = nullptr;
+    AVFrame* wrapFrame = nullptr;
     AVFrame* hwFrame = nullptr;
     AVPacket* pkt = nullptr;
     SwsContext* yuyvToNv12 = nullptr;
@@ -30,7 +31,7 @@ struct VaapiEncoder::Impl {
     std::vector<uint8_t> csdBytes;
     std::atomic<bool> forceIdr{true};
 
-    bool encodeSwFrame(int64_t pts, const EncodedCallback& cb) {
+    bool encodeFrame(AVFrame* srcFrame, int64_t pts, const EncodedCallback& cb) {
         if (!hwFrame) {
             hwFrame = av_frame_alloc();
         } else {
@@ -39,7 +40,7 @@ struct VaapiEncoder::Impl {
         if (av_hwframe_get_buffer(hwFramesCtx, hwFrame, 0) < 0) {
             return false;
         }
-        if (av_hwframe_transfer_data(hwFrame, swFrame, 0) < 0) {
+        if (av_hwframe_transfer_data(hwFrame, srcFrame, 0) < 0) {
             return false;
         }
         hwFrame->pts = pts;
@@ -181,6 +182,12 @@ bool VaapiEncoder::init(uint32_t width, uint32_t height, uint32_t fps,
         return false;
     }
 
+    p_->wrapFrame = av_frame_alloc();
+    if (!p_->wrapFrame) {
+        shutdown();
+        return false;
+    }
+
     p_->pkt = av_packet_alloc();
     p_->forceIdr.store(true);
     return true;
@@ -192,6 +199,11 @@ void VaapiEncoder::shutdown() {
         p_->yuyvToNv12 = nullptr;
     }
     if (p_->pkt) av_packet_free(&p_->pkt);
+    if (p_->wrapFrame) {
+        p_->wrapFrame->data[0] = nullptr;
+        p_->wrapFrame->data[1] = nullptr;
+        av_frame_free(&p_->wrapFrame);
+    }
     if (p_->swFrame) av_frame_free(&p_->swFrame);
     if (p_->hwFrame) av_frame_free(&p_->hwFrame);
     if (p_->codecCtx) avcodec_free_context(&p_->codecCtx);
@@ -211,18 +223,17 @@ void VaapiEncoder::requestIdr() {
 bool VaapiEncoder::encodeNv12(const uint8_t* yPlane, int yStride,
                               const uint8_t* uvPlane, int uvStride,
                               int64_t pts, const EncodedCallback& cb) {
-    if (!p_->codecCtx || !p_->swFrame) return false;
-    if (av_frame_make_writable(p_->swFrame) < 0) return false;
+    if (!p_->codecCtx || !p_->wrapFrame) return false;
 
-    for (uint32_t y = 0; y < p_->height; ++y) {
-        std::memcpy(p_->swFrame->data[0] + y * p_->swFrame->linesize[0],
-                    yPlane + y * yStride, p_->width);
-    }
-    for (uint32_t y = 0; y < p_->height / 2; ++y) {
-        std::memcpy(p_->swFrame->data[1] + y * p_->swFrame->linesize[1],
-                    uvPlane + y * uvStride, p_->width);
-    }
-    return p_->encodeSwFrame(pts, cb);
+    AVFrame* src = p_->wrapFrame;
+    src->format = AV_PIX_FMT_NV12;
+    src->width = static_cast<int>(p_->width);
+    src->height = static_cast<int>(p_->height);
+    src->data[0] = const_cast<uint8_t*>(yPlane);
+    src->linesize[0] = yStride;
+    src->data[1] = const_cast<uint8_t*>(uvPlane);
+    src->linesize[1] = uvStride;
+    return p_->encodeFrame(src, pts, cb);
 }
 
 bool VaapiEncoder::encodeYuyv(const uint8_t* yuyv, int yuyvStride,
@@ -242,7 +253,7 @@ bool VaapiEncoder::encodeYuyv(const uint8_t* yuyv, int yuyvStride,
     int srcStride[1] = {yuyvStride};
     sws_scale(p_->yuyvToNv12, srcSlice, srcStride, 0, static_cast<int>(p_->height),
               p_->swFrame->data, p_->swFrame->linesize);
-    return p_->encodeSwFrame(pts, cb);
+    return p_->encodeFrame(p_->swFrame, pts, cb);
 }
 
 } // namespace gta60_linux

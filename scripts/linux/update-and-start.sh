@@ -9,9 +9,11 @@ BAK="$BUILD_DIR/gta60-capture.bak"
 
 cd "$REPO_DIR"
 
-SELFTEST_ARGS=()
+chmod +x "$REPO_DIR/scripts/linux/run-capture.sh" 2>/dev/null || true
+
+SELFTEST_ARGS=(--bitrate 80)
 if [[ -e /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 ]]; then
-    SELFTEST_ARGS=(--device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --width 2560 --height 1440 --fps 60)
+    SELFTEST_ARGS=(--device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --width 2560 --height 1440 --fps 60 --bitrate 80)
 fi
 
 OLD_HEAD="$(git rev-parse HEAD 2>/dev/null || echo none)"

@@ -3,9 +3,8 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 USER_NAME="${SUDO_USER:-$USER}"
-CAPTURE_ARGS="${GTA60_CAPTURE_ARGS:---device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --audio hw:CARD=S,DEV=0 --width 2560 --height 1440 --fps 60 --codec hevc --bitrate 50}"
 
-chmod +x "$REPO_DIR/scripts/linux/update-and-start.sh" "$REPO_DIR/scripts/linux/udp-updater.py"
+chmod +x "$REPO_DIR/scripts/linux/update-and-start.sh" "$REPO_DIR/scripts/linux/udp-updater.py" "$REPO_DIR/scripts/linux/run-capture.sh"
 
 sudo tee /etc/systemd/system/gta60-capture.service >/dev/null <<EOF
 [Unit]
@@ -20,7 +19,7 @@ Group=video
 SupplementaryGroups=audio render
 WorkingDirectory=$REPO_DIR
 ExecStartPre=$REPO_DIR/scripts/linux/update-and-start.sh
-ExecStart=$REPO_DIR/linux-capture/build/gta60-capture $CAPTURE_ARGS
+ExecStart=$REPO_DIR/scripts/linux/run-capture.sh
 Restart=always
 RestartSec=5
 
