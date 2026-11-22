@@ -94,6 +94,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final int FLAG_IDR = 0x01;
     private static final int FLAG_GENERATED = 0x02;
+    private static final int FLAG_DUPLICATE = 0x04;
+
+    private static final String[] ENHANCE_LABELS = {"Off", "RCAS", "SuperRes", "FG60", "FG60+SR"};
+    private static final String[] LOOK_LABELS = {"Normal", "Vivid", "Night"};
 
     private static final int DEFAULT_TCP_PORT = 7660;
     private static final int DISCOVERY_UDP_PORT = 7661;
@@ -108,10 +112,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private SurfaceView surfaceView;
     private LinearLayout hudBar;
     private EditText hostInput;
+    private Button usbBtn;
     private Button startBtn;
+    private Button wakeBtn;
     private Button resBtn;
     private Button fpsBtn;
     private Button bitrateBtn;
+    private Button enhanceBtn;
+    private Button lookBtn;
+    private Button captureHzBtn;
     // "Hold session": re-send the current pad state every ~20 s so the console never decides the
     // player went idle. That is what stops the stream from dying while you are away, and - more
     // importantly - what stops a reconnect from attaching a new client mid-game (which drops the
@@ -154,6 +163,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private MediaCodec codec;
     private final Object codecLock = new Object();
+    private volatile CaptureGlRenderer captureGl;
+    private static final int DUP_RING_SIZE = 64;
+    private final long[] dupPtsRing = new long[DUP_RING_SIZE];
+    private final boolean[] dupValRing = new boolean[DUP_RING_SIZE];
+    private int dupRingWrite = 0;
     private AudioTrack audioTrack;
     private volatile boolean firstFrameRendered = false;
 
@@ -161,6 +175,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int resIdx = 1; // default 1440p
     private int cfgFps = 60;
     private int bitrateIdx = 1; // default 50 Mbps
+    private int captureEnhanceMode = CaptureGlRenderer.MODE_FG60_SR;
+    private int captureLookMode = CaptureGlRenderer.LOOK_NORMAL;
+    private int captureRefreshHz = 120;
 
     // Telemetry counters
     private volatile int streamWidth = 0;
@@ -222,6 +239,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             bitrateIdx = 1;
             prefs.edit().putBoolean("prefs_v3", true).putInt("bitrateIdx", bitrateIdx).apply();
         }
+        captureEnhanceMode = Math.max(0, Math.min(ENHANCE_LABELS.length - 1,
+                prefs.getInt("captureEnhanceMode", CaptureGlRenderer.MODE_FG60_SR)));
+        captureLookMode = Math.max(0, Math.min(LOOK_LABELS.length - 1,
+                prefs.getInt("captureLookMode", CaptureGlRenderer.LOOK_NORMAL)));
+        captureRefreshHz = prefs.getInt("captureRefreshHz", 120) == 90 ? 90 : 120;
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.parseColor("#0B0E14"));
@@ -270,7 +292,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         lanBtn.setOnClickListener(v -> discoverLanHost(false));
         row1.addView(lanBtn);
 
-        Button usbBtn = makeButton("USB-C", "#334155");
+        usbBtn = makeButton("USB-C", "#334155");
         usbBtn.setOnClickListener(v -> hostInput.setText("127.0.0.1"));
         row1.addView(usbBtn);
 
@@ -293,7 +315,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         adbBtn.setOnClickListener(v -> openWirelessAdbHelper());
         row1.addView(adbBtn);
 
-        Button wakeBtn = makeButton("Wake PC", "#7C3AED");
+        wakeBtn = makeButton(captureMode ? "Check Update" : "Wake PC", "#7C3AED");
         wakeBtn.setOnClickListener(v -> wakePc());
         row1.addView(wakeBtn);
 
@@ -373,6 +395,46 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
         row2.addView(holdBtn);
 
+        enhanceBtn = makeButton("GPU: " + ENHANCE_LABELS[captureEnhanceMode], "#0284C7");
+        enhanceBtn.setOnClickListener(v -> {
+            captureEnhanceMode = (captureEnhanceMode + 1) % ENHANCE_LABELS.length;
+            enhanceBtn.setText("GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureEnhanceMode", captureEnhanceMode).apply();
+            CaptureGlRenderer gl = captureGl;
+            if (gl != null) gl.setEnhanceMode(captureEnhanceMode);
+            if (streamWidth > 0 && streamHeight > 0) {
+                boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR);
+                surfaceView.getHolder().setFixedSize(sr ? 3200 : streamWidth, sr ? 1800 : streamHeight);
+            }
+            setStatus("Capture GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+        });
+        row2.addView(enhanceBtn);
+
+        lookBtn = makeButton("Look: " + LOOK_LABELS[captureLookMode], "#0F766E");
+        lookBtn.setOnClickListener(v -> {
+            captureLookMode = (captureLookMode + 1) % LOOK_LABELS.length;
+            lookBtn.setText("Look: " + LOOK_LABELS[captureLookMode]);
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureLookMode", captureLookMode).apply();
+            CaptureGlRenderer gl = captureGl;
+            if (gl != null) gl.setLookMode(captureLookMode);
+            setStatus("Capture Look: " + LOOK_LABELS[captureLookMode]);
+        });
+        row2.addView(lookBtn);
+
+        captureHzBtn = makeButton(captureRefreshHz + " Hz", "#1E293B");
+        captureHzBtn.setOnClickListener(v -> {
+            captureRefreshHz = (captureRefreshHz == 120) ? 90 : 120;
+            captureHzBtn.setText(captureRefreshHz + " Hz");
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureRefreshHz", captureRefreshHz).apply();
+            applyDisplayRefreshRate(captureRefreshHz);
+            setStatus("Display refresh: " + captureRefreshHz + " Hz");
+        });
+        row2.addView(captureHzBtn);
+
         statusText = new TextView(this);
         statusText.setText(captureMode
                 ? "Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays on the Xbox."
@@ -395,7 +457,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updater = new AppUpdater(this);
 
         setContentView(root);
-        applyDisplayRefreshRate(120);
+        updateHudForMode();
         scheduleTelemetryTick();
         learnPcMac();
         updater.startPeriodicChecks();
@@ -625,6 +687,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         direct.show();
     }
 
+    private void updateHudForMode() {
+        final int pcVis = captureMode ? View.GONE : View.VISIBLE;
+        final int capVis = captureMode ? View.VISIBLE : View.GONE;
+        if (usbBtn != null) usbBtn.setVisibility(pcVis);
+        if (resBtn != null) resBtn.setVisibility(pcVis);
+        if (fpsBtn != null) fpsBtn.setVisibility(pcVis);
+        if (bitrateBtn != null) bitrateBtn.setVisibility(pcVis);
+        if (holdBtn != null) holdBtn.setVisibility(pcVis);
+        if (enhanceBtn != null) enhanceBtn.setVisibility(capVis);
+        if (lookBtn != null) lookBtn.setVisibility(capVis);
+        if (captureHzBtn != null) captureHzBtn.setVisibility(capVis);
+        if (wakeBtn != null) wakeBtn.setText(captureMode ? "Check Update" : "Wake PC");
+        applyDisplayRefreshRate(captureMode ? captureRefreshHz : 120);
+    }
+
     void exitDirectMode() {
         if (direct != null) direct.hide();
         directMode = false;
@@ -632,6 +709,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         persistTransportMode();
         modeBtn.setText("Mode: PC");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
+        updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         setStatus("PC mode: press Start Stream");
@@ -657,6 +735,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         persistTransportMode();
         modeBtn.setText("Mode: Capture");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("captureHost", DEFAULT_CAPTURE_HOST));
+        updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         setStatus("Capture mode: ready (mintbook-g11). Controller stays paired to the Xbox.");
@@ -673,6 +752,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         persistTransportMode();
         modeBtn.setText("Mode: PC");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
+        updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         setStatus("PC mode: press Start Stream");
@@ -970,7 +1050,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             w, h, targetFps, mime, csd.length));
                     setupDecoder(w, h, csd, mime);
                 } else if (type == TYPE_VIDEO_AU && size > 0) {
-                    feedDecoder(payload, size, tsMs * 1000L, (flags & FLAG_IDR) != 0);
+                    final long ptsUs = tsMs * 1000L;
+                    if (captureGl != null) {
+                        recordDuplicateFlag(ptsUs, (flags & FLAG_DUPLICATE) != 0);
+                    }
+                    feedDecoder(payload, size, ptsUs, (flags & FLAG_IDR) != 0);
                     statFrames++;
                     if ((flags & FLAG_GENERATED) != 0) statGenFrames++;
                     statBytes += size;
@@ -1057,6 +1141,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return fmt;
     }
 
+    private synchronized void clearDuplicateFlags() {
+        Arrays.fill(dupPtsRing, Long.MIN_VALUE);
+        dupRingWrite = 0;
+    }
+
+    private synchronized void recordDuplicateFlag(long ptsUs, boolean isDup) {
+        dupPtsRing[dupRingWrite] = ptsUs;
+        dupValRing[dupRingWrite] = isDup;
+        dupRingWrite = (dupRingWrite + 1) % DUP_RING_SIZE;
+    }
+
+    private synchronized boolean consumeDuplicateFlag(long ptsUs) {
+        for (int i = 0; i < DUP_RING_SIZE; i++) {
+            if (dupPtsRing[i] == ptsUs) {
+                dupPtsRing[i] = Long.MIN_VALUE;
+                return dupValRing[i];
+            }
+        }
+        return false;
+    }
+
     private void setupDecoder(int width, int height, byte[] spsPps, String mime) {
         releaseCodec();
         Surface surf = awaitActiveSurface();
@@ -1067,6 +1172,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         try {
+            Surface decodeSurf = surf;
+            final boolean useSuperRes = captureMode && (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR);
+            final int outW = useSuperRes ? 3200 : width;
+            final int outH = useSuperRes ? 1800 : height;
+
+            if (captureMode) {
+                clearDuplicateFlags();
+                CaptureGlRenderer gl = new CaptureGlRenderer(
+                        surf, width, height, captureEnhanceMode, captureLookMode,
+                        generated -> {
+                            if (generated) statGenFrames++;
+                        });
+                Surface glSurf = gl.getDecoderSurface();
+                if (glSurf == null || !glSurf.isValid()) {
+                    gl.release();
+                    Log.e(TAG, "CaptureGlRenderer failed to initialize decoder Surface");
+                    setStatus("GPU pipeline init failed");
+                    return;
+                }
+                captureGl = gl;
+                decodeSurf = glSurf;
+            }
+
             final List<byte[]> csd = splitNalUnits(spsPps);
             MediaCodec mc = MediaCodec.createDecoderByType(mime);
             MediaFormat fmt = buildDecoderFormat(mime, width, height, csd);
@@ -1074,10 +1203,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             try {
                 fmt.setInteger("vendor.qti-ext-dec-low-latency.enable", 1);
                 fmt.setInteger("vendor.qti-ext-dec-picture-order.enable", 1);
-                mc.configure(fmt, surf, null, 0);
+                mc.configure(fmt, decodeSurf, null, 0);
             } catch (Exception vendorEx) {
                 // The vendor extensions are Qualcomm-specific; retry without them.
-                mc.configure(buildDecoderFormat(mime, width, height, csd), surf, null, 0);
+                mc.configure(buildDecoderFormat(mime, width, height, csd), decodeSurf, null, 0);
             }
 
             mc.start();
@@ -1102,14 +1231,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             decodeOutThread.start();
 
             uiHandler.post(() -> {
-                surfaceView.getHolder().setFixedSize(width, height);
+                surfaceView.getHolder().setFixedSize(outW, outH);
                 adjustSurfaceAspect(width, height);
                 applySurfaceFrameRate(targetFps);
             });
-            Log.i(TAG, String.format("MediaCodec started (%s) %dx%d %s csdUnits=%d csd0=%dB",
-                    mc.getName(), width, height, mime, csd.size(), csd.isEmpty() ? 0 : csd.get(0).length));
-            setStatus(String.format("Streaming %dx%d @ %d fps %s (%s)", width, height, targetFps, mime,
-                    mc.getName()));
+            Log.i(TAG, String.format("MediaCodec started (%s) %dx%d %s csdUnits=%d csd0=%dB out=%dx%d",
+                    mc.getName(), width, height, mime, csd.size(), csd.isEmpty() ? 0 : csd.get(0).length,
+                    outW, outH));
+            setStatus(captureMode
+                    ? String.format("Capture %dx%d @ %d fps %s (%s)",
+                            width, height, targetFps, mime, ENHANCE_LABELS[captureEnhanceMode])
+                    : String.format("Streaming %dx%d @ %d fps %s (%s)", width, height, targetFps, mime,
+                            mc.getName()));
         } catch (Exception e) {
             Log.e(TAG, "Decoder init failed", e);
             setStatus("Decoder init failed: " + e.getMessage());
@@ -1226,7 +1359,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     statRendered++;
                     final long presentedPtsUs = info.presentationTimeUs;
-                    mc.releaseOutputBuffer(outIdx, System.nanoTime()); // immediate SurfaceFlinger present
+                    final CaptureGlRenderer gl = captureGl;
+                    if (gl != null) {
+                        gl.onDecodedFrame(consumeDuplicateFlag(presentedPtsUs));
+                        mc.releaseOutputBuffer(outIdx, true);
+                    } else {
+                        mc.releaseOutputBuffer(outIdx, System.nanoTime()); // immediate SurfaceFlinger present
+                    }
                     reportRenderedFrame(presentedPtsUs);
                 } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     Log.i(TAG, "MediaCodec output format changed: " + mc.getOutputFormat());
@@ -1258,6 +1397,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mc != null) {
             try { mc.stop(); } catch (Exception ignored) {}
             try { mc.release(); } catch (Exception ignored) {}
+        }
+        CaptureGlRenderer gl = captureGl;
+        captureGl = null;
+        if (gl != null) {
+            gl.release();
         }
     }
 
