@@ -52,7 +52,7 @@ bool AlsaCapture::start(const std::string& device, AudioCallback cb) {
             }
 
             err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                                     2, 48000, 1, 50000);
+                                     2, 48000, 1, 80000);
             if (err < 0) {
                 if (!loggedErr) {
                     std::fprintf(stderr, "[alsa] set_params failed on '%s': %s (retrying)\n",
@@ -63,6 +63,13 @@ bool AlsaCapture::start(const std::string& device, AudioCallback cb) {
                 snd_pcm_close(pcm);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
+            }
+
+            snd_pcm_sw_params_t* sw = nullptr;
+            snd_pcm_sw_params_alloca(&sw);
+            if (snd_pcm_sw_params_current(pcm, sw) == 0) {
+                snd_pcm_sw_params_set_start_threshold(pcm, sw, 1);
+                snd_pcm_sw_params(pcm, sw);
             }
 
             loggedErr = false;
