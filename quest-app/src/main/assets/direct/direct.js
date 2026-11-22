@@ -62,7 +62,11 @@
   var hudVisible = false;
   var enhanceMode = MODE_FG60_SR;
   var lookMode = LOOK_NORMAL;
-  var rcasSharpness = 0.22;
+  // 0.10 on real frames. Generated frames use half of this. SuperRes is capped here too:
+  // a ~22 Mbps 1440p source turns a harder RCAS into sharpened DCT blocks.
+  var rcasSharpness = 0.10;
+  var displayHz = 120;
+  var superResBypassLogged = false;
   var lastRumbleZero = true;
 
   // Virtual-pad lifecycle. Pad 0 stays announced for the whole session: the console treats a
@@ -128,6 +132,8 @@
   var fboFlowFine = null;
   var texFlowSmooth = null;
   var fboFlowSmooth = null;
+  var texFlowPrev = null;
+  var fboFlowPrev = null;
   var texMid = null;
   var fboMid = null;
   var diffPixels = new Uint8Array(DIFF_W * DIFF_H * 4);
@@ -147,6 +153,12 @@
   var pboVerifiedConsecDupes = 0;
   var pboVerifiedHasHistory = 0;
   var consecUniqueRun = 0;
+  // Predict U,D,U,D only after that pattern has been verified. A mismatch drops trust and
+  // skips the next warps instead of showing a midpoint built from the wrong pair.
+  var pboCadenceTrusted = false;
+  var pboVerifiedPattern = 0;
+  var pboVerifiedCount = 0;
+  var fgHoldWarps = 0;
 
   var prevUniqueSlot = 0;
   var currUniqueSlot = 1;
@@ -158,6 +170,7 @@
   var pendingRealFrame = false;
   var realFramePresented = false;
   var realFrameTimerId = 0;
+  var realFrameRafId = 0;
 
   // Telemetry counters
   var statUniqueFrames = 0;
@@ -496,9 +509,22 @@
   }
 
   // Pure-JS duplicate cadence classifier (also exposed for unit testing via _classifyDupe).
+  // Quiet frames may repeat (a 30 fps hold is often two dupes, not one). The relative-drop
+  // path still stops at two in a row. maxBlock is looser than the old 9-tap reduce because
+  // the 8x8 grid sees more encoder noise; native 60 fps mads stay in the mid-teens.
   function classifyDupeCadence(mad, maxBlock, prevMad, curConsecDupes, curHasHistory) {
-    if (curHasHistory < 1 || curConsecDupes >= 1) return false;
-    return (mad < 1.9 && maxBlock <= 9) || (prevMad >= 3.5 && mad < prevMad * 0.38);
+    if (curHasHistory < 1) return false;
+    if (mad < 1.6 && maxBlock <= 28) return true;
+    if (curConsecDupes < 2 && prevMad >= 3.5 && mad < prevMad * 0.38 && maxBlock <= 28) return true;
+    return false;
+  }
+
+  function noteVerifiedDupe(isDupe) {
+    pboVerifiedPattern = ((pboVerifiedPattern << 1) | (isDupe ? 1 : 0)) & 0xF;
+    if (pboVerifiedCount < 4) pboVerifiedCount++;
+    // 0101 and 1010 are the two phases of unique/dupe alternation. A continuing
+    // run flips between them, so both have to count or trust drops every frame.
+    pboCadenceTrusted = pboVerifiedCount >= 4 && (pboVerifiedPattern === 0x5 || pboVerifiedPattern === 0xA);
   }
 
   function analyzeDiffPixels(bytes) {
@@ -561,24 +587,26 @@
     + '  fragColor = vec4(y, 0.0, 0.0, 1.0);\n'
     + '}\n';
 
-  // Pass 2 (4x4): Regional abs-diff summary from 320x180 scratch buffer.
+  // Pass 2 (4x4): 8x8 grid across each cell of the 320x180 diff. 16*64 = 1024 taps.
   var FRAG_DIFF = '#version 300 es\n'
     + 'precision mediump float;\n'
     + 'in vec2 vUv;\n'
     + 'uniform sampler2D uLumaScratchTex;\n'
     + 'out vec4 fragColor;\n'
     + 'void main() {\n'
-    + '  vec2 stepUv = vec2(1.0 / 320.0, 1.0 / 180.0);\n'
+    + '  vec2 cell = vec2(80.0 / 320.0, 45.0 / 180.0);\n'
+    + '  vec2 origin = vUv - cell * 0.5;\n'
     + '  float sum = 0.0;\n'
     + '  float mx = 0.0;\n'
-    + '  for (int dy = -1; dy <= 1; dy++) {\n'
-    + '    for (int dx = -1; dx <= 1; dx++) {\n'
-    + '      float d = texture(uLumaScratchTex, vUv + vec2(float(dx) * 16.0, float(dy) * 10.0) * stepUv).g;\n'
+    + '  for (int y = 0; y < 8; y++) {\n'
+    + '    for (int x = 0; x < 8; x++) {\n'
+    + '      vec2 uv = origin + vec2((float(x) + 0.5) / 8.0, (float(y) + 0.5) / 8.0) * cell;\n'
+    + '      float d = texture(uLumaScratchTex, uv).g;\n'
     + '      sum += d;\n'
     + '      mx = max(mx, d);\n'
     + '    }\n'
     + '  }\n'
-    + '  fragColor = vec4(sum * (1.0 / 9.0), mx, 0.0, 1.0);\n'
+    + '  fragColor = vec4(sum * (1.0 / 64.0), mx, 0.0, 1.0);\n'
     + '}\n';
 
   // Pass 3a (80x45): Level-0 Wide Coarse Optical Flow (+-160 px horiz / +-96 px vert at 1440p).
@@ -702,12 +730,14 @@
     + '  fragColor = vec4(enc.x, enc.y, clamp(bestSad * 4.0, 0.0, 1.0), conf);\n'
     + '}\n';
 
-  // Pass 3c (320x180): 3x3 Bilateral Edge-Preserving Flow Smoothing & Outlier Rejection.
+  // Pass 3c (320x180): 3x3 bilateral smooth, then 35% toward the previous field when the
+  // vectors agree. A disagreeing vector keeps the new sample so a cut does not smear.
   var FRAG_FLOW_SMOOTH = '#version 300 es\n'
     + 'precision mediump float;\n'
     + 'in vec2 vUv;\n'
     + 'uniform sampler2D uRawFlowTex;\n'
     + 'uniform sampler2D uCurrLuma;\n'
+    + 'uniform sampler2D uPrevFlowTex;\n'
     + 'out vec4 fragColor;\n'
     + 'const vec2 STEP = vec2(1.0 / 320.0, 1.0 / 180.0);\n'
     + 'const float MAX_UV = 0.08;\n'
@@ -736,8 +766,12 @@
     + '    }\n'
     + '  }\n'
     + '  vec2 avgVec = sumVec / max(sumW, 1e-4);\n'
+    + '  vec2 prevVec = dec(texture(uPrevFlowTex, vUv).rg);\n'
+    + '  float disagree = clamp(length(avgVec - prevVec) / MAX_UV, 0.0, 1.0);\n'
+    + '  float wPrev = (1.0 - disagree) * 0.35;\n'
+    + '  vec2 blended = mix(avgVec, prevVec, wPrev);\n'
     + '  float avgConf = (sumConf / max(sumW, 1e-4)) * clamp(1.0 - maxDiff * 1.4, 0.0, 1.0);\n'
-    + '  vec2 enc = clamp((avgVec / MAX_UV) * 0.5 + (128.0 / 255.0), 0.0, 1.0);\n'
+    + '  vec2 enc = clamp((blended / MAX_UV) * 0.5 + (128.0 / 255.0), 0.0, 1.0);\n'
     + '  fragColor = vec4(enc.x, enc.y, cFlow.b, avgConf);\n'
     + '}\n';
 
@@ -770,6 +804,10 @@
     + '  }\n'
     + '  vec4 f = texture(uFlowTex, vUv);\n'
     + '  vec2 v = decodeFlow(f.rg);\n'
+    + '  if (length(v) < 0.002 && es < 0.03) {\n'
+    + '    fragColor = vec4(c1, 1.0);\n'
+    + '    return;\n'
+    + '  }\n'
     + '  vec2 p0 = clamp(vUv + 0.5 * v, vec2(0.001), vec2(0.999));\n'
     + '  vec2 p1 = clamp(vUv - 0.5 * v, vec2(0.001), vec2(0.999));\n'
     + '  vec3 w0 = texture(uPrevTex, p0).rgb;\n'
@@ -906,6 +944,10 @@
     pboVerifiedConsecDupes = 0;
     pboVerifiedHasHistory = 0;
     consecUniqueRun = 0;
+    pboCadenceTrusted = false;
+    pboVerifiedPattern = 0;
+    pboVerifiedCount = 0;
+    fgHoldWarps = 0;
     pboWriteIdx = 0;
     for (var i = 0; i < 2; i++) {
       pboValid[i] = false;
@@ -968,6 +1010,7 @@
         progFlowSmooth = { prog: linkProgram(VERT_FBO, FRAG_FLOW_SMOOTH) };
         progFlowSmooth.uRawFlowTex = gl.getUniformLocation(progFlowSmooth.prog, 'uRawFlowTex');
         progFlowSmooth.uCurrLuma = gl.getUniformLocation(progFlowSmooth.prog, 'uCurrLuma');
+        progFlowSmooth.uPrevFlowTex = gl.getUniformLocation(progFlowSmooth.prog, 'uPrevFlowTex');
 
         progWarp = { prog: linkProgram(VERT_FBO, FRAG_WARP) };
         progWarp.uPrevTex = gl.getUniformLocation(progWarp.prog, 'uPrevTex');
@@ -1009,6 +1052,9 @@
         fboFlowFine = createFbo(texFlowFine);
         texFlowSmooth = createTex2D(FLOW_HI_W, FLOW_HI_H);
         fboFlowSmooth = createFbo(texFlowSmooth);
+        texFlowPrev = createTex2D(FLOW_HI_W, FLOW_HI_H);
+        fboFlowPrev = createFbo(texFlowPrev);
+        clearFlowHistory();
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
         pboSupported = (typeof gl.PIXEL_PACK_BUFFER !== 'undefined' &&
@@ -1024,7 +1070,7 @@
           gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         }
         resetPboState();
-        B.log('WebGL2 Adreno GPU pipeline v3 initialized (80x45->320x180 pyramid, PBO=' + pboSupported + ')');
+        B.log('WebGL2 Adreno GPU pipeline v4 initialized (8x8 diff, flow blend, PBO=' + pboSupported + ')');
       } catch (e) {
         glFailed = true;
         gl = null;
@@ -1049,7 +1095,7 @@
       resetPboState();
       B.log('WebGL2 video ring + fboMid allocated: 4x ' + w + 'x' + h);
     }
-    var useSr = (enhanceMode === MODE_SUPERRES || enhanceMode === MODE_FG60_SR);
+    var useSr = superResActive();
     var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
     var domW = (canvas && canvas.clientWidth) ? Math.round(canvas.clientWidth * dpr) : 0;
     var domH = (canvas && canvas.clientHeight) ? Math.round(canvas.clientHeight * dpr) : 0;
@@ -1076,11 +1122,77 @@
     }
   }
 
+  function superResWanted() {
+    return enhanceMode === MODE_SUPERRES || enhanceMode === MODE_FG60_SR;
+  }
+
+  // 1440p already fills the panel 1:1. Inventing a 3200x1800 image from a ~22 Mbps source
+  // does not add detail. The mode label stays FG60+SR; only the pass is skipped.
+  function superResActive() {
+    if (!superResWanted()) return false;
+    if (glH >= 1400) {
+      if (!superResBypassLogged) {
+        superResBypassLogged = true;
+        B.log('SuperRes bypassed: source ' + glW + 'x' + glH + ' already fills the panel');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // 128/255 decodes as zero flow, so the first blend does not drag toward stale motion.
+  function clearFlowHistory() {
+    if (!gl || !fboFlowSmooth || !fboFlowPrev) return;
+    gl.clearColor(128.0 / 255.0, 128.0 / 255.0, 0.0, 0.0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboFlowSmooth);
+    gl.viewport(0, 0, FLOW_HI_W, FLOW_HI_H);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboFlowPrev);
+    gl.viewport(0, 0, FLOW_HI_W, FLOW_HI_H);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  }
+
   function cancelPendingRealFrame() {
     pendingRealFrame = false;
     if (realFrameTimerId) {
       clearTimeout(realFrameTimerId);
       realFrameTimerId = 0;
+    }
+    if (realFrameRafId && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(realFrameRafId);
+      realFrameRafId = 0;
+    }
+  }
+
+  // Hold the warp for two display vsyncs (16.7 ms at 120 Hz, 22.2 ms at 90 Hz), then show
+  // the real frame. requestAnimationFrame lands on a vsync; the timestamp keeps a 60 Hz
+  // WebView callback from stretching the hold to 33 ms.
+  function scheduleRealFrame() {
+    var holdMs = displayHz === 90 ? (2000 / 90) : (2000 / 120);
+    var startAt = nowMs();
+    function presentNow() {
+      realFrameRafId = 0;
+      realFrameTimerId = 0;
+      if (!pendingRealFrame || realFramePresented || !pc) return;
+      pendingRealFrame = false;
+      realFramePresented = true;
+      renderRcasToCanvas(texRing[currUniqueSlot], false);
+    }
+    function step() {
+      realFrameRafId = 0;
+      if (!pendingRealFrame || realFramePresented || !pc) return;
+      if (nowMs() - startAt < holdMs - 3) {
+        realFrameRafId = requestAnimationFrame(step);
+        return;
+      }
+      presentNow();
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      realFrameRafId = requestAnimationFrame(step);
+    } else {
+      realFrameTimerId = setTimeout(presentNow, holdMs);
     }
   }
 
@@ -1093,8 +1205,9 @@
     gl.bindTexture(gl.TEXTURE_2D, srcTex);
     gl.uniform1i(progRcas.uInputTex, 0);
     gl.uniform2f(progRcas.uTexelSize, 1.0 / glW, 1.0 / glH);
-    var useSr = (enhanceMode === MODE_SUPERRES || enhanceMode === MODE_FG60_SR);
-    var sharp = useSr ? 0.18 : rcasSharpness;
+    var useSr = superResActive();
+    var sharp = useSr ? Math.min(rcasSharpness, 0.10) : rcasSharpness;
+    if (isGenerated) sharp *= 0.5;
     gl.uniform1f(progRcas.uSharpness, sharp);
     gl.uniform1f(progRcas.uSuperRes, useSr ? 1.0 : 0.0);
     gl.uniform1f(progRcas.uLookMode, lookMode * 1.0);
@@ -1152,14 +1265,24 @@
           pboVerifiedHasHistory = Math.min(2, pboVerifiedHasHistory + 1);
           statPboReads++;
           if (pboUsedForPrediction[readIdx] && actualPrevDupe !== pboPredictedDupe[readIdx]) {
+            pboCadenceTrusted = false;
+            pboVerifiedPattern = 0;
+            pboVerifiedCount = 0;
             pboSyncFrames = 2;
+            fgHoldWarps = 2;
             consecUniqueRun = 0;
+          } else {
+            noteVerifiedDupe(actualPrevDupe);
           }
         } else {
           pboMissedPolls++;
           if (pboMissedPolls > 3) {
             pboMissedPolls = 0;
+            pboCadenceTrusted = false;
+            pboVerifiedPattern = 0;
+            pboVerifiedCount = 0;
             pboSyncFrames = 2;
+            fgHoldWarps = 2;
           }
         }
       }
@@ -1194,9 +1317,10 @@
     gl.uniform1i(progDiff.uLumaScratchTex, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-    // 5. Determine whether this frame is a duplicate (async PBO phase-lock or sync resync).
+    // 5. Duplicate decision. Predict only after a verified unique/dupe/unique/dupe run.
+    // Anything else (including native 60 and a still hold) reads the 4x4 summary in sync.
     var isDupe = false;
-    if (!pboSupported || pboSyncFrames > 0) {
+    if (!pboSupported || pboSyncFrames > 0 || !pboCadenceTrusted) {
       gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
       gl.readPixels(0, 0, DIFF_W, DIFF_H, gl.RGBA, gl.UNSIGNED_BYTE, diffPixels);
       var syncStats = analyzeDiffPixels(diffPixels);
@@ -1204,17 +1328,20 @@
       isDupe = classifyDupeCadence(syncStats.mad, syncStats.maxBlock, prevFrameMad, consecDupes, hasUniqueHistory);
       prevFrameMad = syncStats.mad;
       pboVerifiedPrevMad = syncStats.mad;
-      pboVerifiedConsecDupes = isDupe ? 1 : 0;
+      pboVerifiedConsecDupes = isDupe ? (pboVerifiedConsecDupes + 1) : 0;
       pboVerifiedHasHistory = Math.min(2, pboVerifiedHasHistory + 1);
+      noteVerifiedDupe(isDupe);
       if (isDupe) consecUniqueRun = 0;
       else consecUniqueRun++;
       if (pboSupported && pboSyncFrames > 0) {
         pboSyncFrames--;
         if (pboSyncFrames === 0) {
-          pboExpectedDupe = !isDupe && (fgActiveGate || consecUniqueRun < 2);
+          pboExpectedDupe = !isDupe;
           pboValid[0] = false;
           pboValid[1] = false;
         }
+      } else if (pboCadenceTrusted) {
+        pboExpectedDupe = !isDupe;
       }
     } else {
       isDupe = pboExpectedDupe;
@@ -1233,7 +1360,7 @@
       pboUsedForPrediction[pboWriteIdx] = true;
       pboValid[pboWriteIdx] = true;
       pboWriteIdx = 1 - pboWriteIdx;
-      pboExpectedDupe = !isDupe && (fgActiveGate || consecUniqueRun < 2);
+      pboExpectedDupe = !isDupe;
     }
 
     if (isDupe) {
@@ -1270,7 +1397,9 @@
 
       hasUniqueHistory = Math.min(2, hasUniqueHistory + 1);
 
-      var wantFlow = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR) && fgActiveGate && hasUniqueHistory >= 2;
+      var holdWarp = fgHoldWarps > 0;
+      if (holdWarp) fgHoldWarps--;
+      var wantFlow = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR) && fgActiveGate && hasUniqueHistory >= 2 && !holdWarp;
       if (wantFlow) {
         // Pass 3a: Level-0 Coarse Optical Flow (80x45)
         gl.bindFramebuffer(gl.FRAMEBUFFER, fboFlowCoarse);
@@ -1309,6 +1438,9 @@
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, texLumaHi[currLumaIdx]);
         gl.uniform1i(progFlowSmooth.uCurrLuma, 1);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, texFlowPrev);
+        gl.uniform1i(progFlowSmooth.uPrevFlowTex, 2);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         // Pass 4a: Render smooth-weighted midpoint warp into fboMid (2560x1440)
@@ -1329,14 +1461,15 @@
         // Pass 4b: Run true 1-pixel AMD FidelityFX RCAS (+ optional SuperRes) on fboMid -> Canvas
         renderRcasToCanvas(texMid, true);
 
+        var swapFlowTex = texFlowSmooth;
+        var swapFlowFbo = fboFlowSmooth;
+        texFlowSmooth = texFlowPrev;
+        fboFlowSmooth = fboFlowPrev;
+        texFlowPrev = swapFlowTex;
+        fboFlowPrev = swapFlowFbo;
+
         pendingRealFrame = true;
-        realFrameTimerId = setTimeout(function () {
-          realFrameTimerId = 0;
-          if (!pendingRealFrame || realFramePresented || !pc) return;
-          pendingRealFrame = false;
-          realFramePresented = true;
-          renderRcasToCanvas(texRing[currUniqueSlot], false);
-        }, 17);
+        scheduleRealFrame();
       } else {
         realFramePresented = true;
         renderRcasToCanvas(texRing[currUniqueSlot], false);
@@ -1700,6 +1833,9 @@
     if (cfg && typeof cfg.look === 'number') {
       lookMode = Math.max(0, Math.min(2, cfg.look | 0));
     }
+    if (cfg && typeof cfg.displayHz === 'number') {
+      displayHz = (cfg.displayHz | 0) === 90 ? 90 : 120;
+    }
     if (errBox) { errBox.style.display = 'none'; errBox.textContent = ''; }
     video = document.getElementById('v');
     canvas = document.getElementById('c');
@@ -1830,11 +1966,19 @@
       var inbound = null;
       var audioIn = null;
       var rttMs = 0;
+      // Chromium's receive-side estimate. There is no JS API to force REMB; this is the clamp
+      // to compare against the console's own rate. A still or menu scene drops Mbps on purpose.
+      var bweBps = -1;
       stats.forEach(function (r) {
         if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.mediaType === 'video')) inbound = r;
         if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) audioIn = r;
-        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null) {
-          rttMs = r.currentRoundTripTime * 1000;
+        if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) {
+          if (typeof r.availableIncomingBitrate === 'number' && (r.nominated || bweBps < 0)) {
+            bweBps = r.availableIncomingBitrate;
+          }
+          if (r.state === 'succeeded' && r.currentRoundTripTime != null) {
+            rttMs = r.currentRoundTripTime * 1000;
+          }
         }
       });
       if (!inbound) return;
@@ -1907,13 +2051,15 @@
       if (isFgMode && !fgActiveGate) {
         modeTag += '-1x';
       }
+      var bweTxt = bweBps >= 0 ? (bweBps / 1e6).toFixed(1) : '?';
 
       B.log('perf: ' + res + ' ' + fps.toFixed(1) + 'fps uniq=' + uniqFps.toFixed(1)
         + 'fps out=' + outFps.toFixed(1) + 'fps(fg=' + fgFps.toFixed(1)
         + ',dup=' + Math.round(dupRatio * 100) + '%,mad=' + lastMad.toFixed(1)
         + ',pbo=' + pboActive + ',gpu=' + gpuMs.toFixed(2) + 'ms,mode=' + modeTag
         + ',look=' + (LOOK_NAMES[lookMode] || 'Normal') + ') '
-        + mbps.toFixed(1) + 'Mbps dec=' + decMs.toFixed(2)
+        + mbps.toFixed(1) + 'Mbps bwe=' + bweTxt
+        + ' dec=' + decMs.toFixed(2)
         + 'ms jb=' + jb.toFixed(1) + 'ms(target=' + jbTarget.toFixed(1) + ',min=' + jbMin.toFixed(1)
         + ') rtt=' + rttMs.toFixed(1) + 'ms lost=' + lost + ' drop=' + dropped + ' aud=' + audPkts + '/' + audSamples);
 
@@ -1923,7 +2069,8 @@
           + 'ms  jb ' + jb.toFixed(1) + 'ms  rtt ' + rttMs.toFixed(1) + 'ms';
       }
       B.onState('stats:' + outFps.toFixed(1) + ':' + mbps.toFixed(1) + ':' + jb.toFixed(1)
-        + ':' + res + ':' + rttMs.toFixed(1) + ':' + uniqFps.toFixed(0) + ':' + modeTag + ':' + gpuMs.toFixed(1));
+        + ':' + res + ':' + rttMs.toFixed(1) + ':' + uniqFps.toFixed(0) + ':' + modeTag + ':' + gpuMs.toFixed(1)
+        + ':' + bweTxt);
     }).catch(function () {});
   }
 
@@ -1953,7 +2100,9 @@
     cancelPendingRealFrame();
     hasUniqueHistory = 0;
     consecDupes = 0;
+    superResBypassLogged = false;
     resetPboState();
+    if (gl) clearFlowHistory();
     syncEnhanceDom();
     if (gl && glW > 0 && glH > 0) {
       ensureGl(glW, glH);
@@ -1966,6 +2115,11 @@
     lookMode = Math.max(0, Math.min(2, mode | 0));
     B.log('look mode set to ' + LOOK_NAMES[lookMode] + ' (' + lookMode + ')');
     return LOOK_NAMES[lookMode];
+  }
+
+  function setDisplayHz(hz) {
+    displayHz = (hz | 0) === 90 ? 90 : 120;
+    return displayHz;
   }
 
   function setHudVisible(vis) {
@@ -2128,6 +2282,7 @@
     releasePad: releasePad,
     setEnhance: setEnhance,
     setLook: setLook,
+    setDisplayHz: setDisplayHz,
     setHudVisible: setHudVisible,
     onResume: onResume,
     stop: stopInternal,

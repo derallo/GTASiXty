@@ -61,10 +61,14 @@ build\GTA-Sixty.exe --list-consoles
 
 # stream to the headset
 build\GTA-Sixty.exe --connect auto --quest-server --bitrate 120
+
+# HDMI capture card on this PC, encoded here and sent to the Quest (no Xbox remote play)
+build\GTA-Sixty.exe --capture --bitrate 50
 ```
 
 Then open **GTA-Sixty** on the headset and tap **Start Stream**. It finds the PC automatically via
-a UDP broadcast (`7661`), or you can type the PC's IP.
+a UDP broadcast (`7661`), or you can type the PC's IP. For a capture card, tap **Mode** until it says
+**Capture**, then **Start Stream**. Capture leaves the Xbox controller paired to the console.
 
 ### Options
 
@@ -79,6 +83,8 @@ a UDP broadcast (`7661`), or you can type the PC's IP.
 | `--xbox-bitrate <Mbps>` | LAN bandwidth advertised to the console via REMB. Default **50**; the console caps itself near 24 Mbps, so advertising more changes nothing. `0` sends no REMB at all, which drops the source to ~15 Mbps |
 | `--sharpness <0..2>` | RCAS sharpening amount. Lower values amplify the source's quantization noise less (default 0.25) |
 | `--agent` | Listen on UDP 7662 so the headset can launch a stream remotely |
+| `--capture` | Capture-card mode. Grabs the HDMI capture device, encodes with NVENC, serves the Quest on TCP 7660. Does not sign in to Xbox or open remote play. Stays running when the headset disconnects. |
+| `--capture-device <text>` | Friendly-name substring of the card. Default is the first video capture device. |
 | `--upscale <1080p\|1440p\|4k>` | Initial output resolution (the headset can override it live) |
 | `--fps <60\|90>` | Output frame rate |
 | `--no-fg` | Disable frame generation entirely (lowest latency) |

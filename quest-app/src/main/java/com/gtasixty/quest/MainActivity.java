@@ -124,6 +124,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private DirectController direct;
     private AppUpdater updater;
     private boolean directMode = false;
+    // HDMI capture on the PC. Mutually exclusive with directMode. Does not launch the Xbox streamer
+    // and does not forward the headset pad (that pad stays paired to the console).
+    private volatile boolean captureMode = false;
+    private volatile boolean captureUpdateCheckedThisBoot = false;
     private final BroadcastReceiver stopStreamReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -192,6 +196,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // must not auto-start a PC stream and steal the console's single session (the 2026-11-21
         // "exclusive operation" collision).
         directMode = prefs.getBoolean("directMode", false);
+        captureMode = prefs.getBoolean("captureMode", false);
+        if (captureMode) directMode = false;
         if (!prefs.contains("prefs_v2")) {
             savedHost = DEFAULT_PC_HOST;
             prefs.edit().putBoolean("prefs_v2", true).putString("host", savedHost).apply();
@@ -279,9 +285,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         wakeBtn.setOnClickListener(v -> wakePc());
         row1.addView(wakeBtn);
 
-        modeBtn = makeButton("Mode: PC", "#0F766E");
+        modeBtn = makeButton(captureMode ? "Mode: Capture" : (directMode ? "Mode: Direct" : "Mode: PC"), "#0F766E");
         modeBtn.setOnClickListener(v -> {
-            if (directMode) exitDirectMode();
+            // PC -> Direct -> Capture -> PC. Direct's own HUD continues the cycle, because this bar
+            // is hidden while Direct is showing.
+            if (captureMode) exitCaptureMode();
+            else if (directMode) enterCaptureMode();
             else enterDirectMode();
         });
         row1.addView(modeBtn);
@@ -307,6 +316,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             resIdx = (resIdx + 1) % RES_LABELS.length;
             resBtn.setText("Res: " + RES_LABELS[resIdx]);
             saveStreamPrefs();
+            if (captureMode) {
+                setStatus("Capture size follows the card. Res does not resize the HDMI picture.");
+                return;
+            }
             if (streaming.get()) sendClientConfig();
         });
         row2.addView(resBtn);
@@ -316,6 +329,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             cfgFps = (cfgFps == 60) ? 90 : 60;
             fpsBtn.setText(cfgFps + " FPS");
             saveStreamPrefs();
+            if (captureMode) {
+                setStatus("Capture frame rate follows the card.");
+                return;
+            }
             if (streaming.get()) sendClientConfig();
         });
         row2.addView(fpsBtn);
@@ -334,14 +351,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             keepAlive = !keepAlive;
             holdBtn.setText("Hold: " + (keepAlive ? "On" : "Off"));
             getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("keepAlive", keepAlive).apply();
-            setStatus(keepAlive
-                    ? "Session held: the console will not idle us out while you are away"
-                    : "Session hold off: the console may end the stream when idle");
+            if (captureMode) {
+                setStatus("Capture does not hold an Xbox session. The controller stays paired to the console.");
+            } else {
+                setStatus(keepAlive
+                        ? "Session held: the console will not idle us out while you are away"
+                        : "Session hold off: the console may end the stream when idle");
+            }
         });
         row2.addView(holdBtn);
 
         statusText = new TextView(this);
-        statusText.setText("Ready — Tap Start Stream (or LAN to auto-find PC)");
+        statusText.setText(captureMode
+                ? "Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays on the Xbox."
+                : "Ready — Tap Start Stream (or LAN to auto-find PC)");
         statusText.setTextColor(Color.parseColor("#CBD5E1"));
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         statusText.setPadding(dp(8), 0, 0, 0);
@@ -370,7 +393,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         //   --ei enhance <0..4>     select Direct GPU mode (0=Off, 1=RCAS, 2=SuperRes, 3=FG60, 4=FG60+SR)
         //   --ei look <0..2>        select Direct color look (0=Normal, 1=Vivid, 2=Night)
         final Intent launchIntent = getIntent() != null ? getIntent() : new Intent();
-        final boolean wantDirect = launchIntent.getBooleanExtra("direct", false) || directMode;
+        final boolean wantCapture = launchIntent.getBooleanExtra("capture", false) || captureMode;
+        final boolean wantDirect = !wantCapture && (launchIntent.getBooleanExtra("direct", false) || directMode);
         final boolean autoDirectStart = launchIntent.getBooleanExtra("directStart", false);
         final int enhanceExtra = launchIntent.getIntExtra("enhance", -1);
         if (enhanceExtra >= 0 && direct != null) {
@@ -381,7 +405,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             direct.setLookMode(lookExtra);
         }
         if (launchIntent.getBooleanExtra("debugEcho", false)) startUdpEcho();
-        if (wantDirect) {
+        if (wantCapture) {
+            uiHandler.post(this::enterCaptureMode);
+        } else if (wantDirect) {
             uiHandler.post(() -> {
                 enterDirectMode();
                 if (autoDirectStart && direct != null) {
@@ -474,7 +500,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 + "• Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
                 + "• Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
                 + "• Wake PC: Sends a Wake-on-LAN packet to wake your PC.\n\n"
-                + "• Mode: PC / Direct: Switches to Direct Mode, which connects straight to your Xbox via your Microsoft account (no PC or Xbox IP needed).\n\n"
+                + "• Mode: cycles PC, then Direct, then Capture.\n"
+                + "  - PC: Xbox remote play through this PC (frame generation and upscaling).\n"
+                + "  - Direct: the headset connects straight to the Xbox. No PC stream.\n"
+                + "  - Capture: the PC's HDMI capture card. On the PC run GTA-Sixty.exe --capture. "
+                + "The picture size follows the card. The Xbox controller stays paired to the console. "
+                + "This mode does not start remote play.\n\n"
                 + "• Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).\n\n"
                 + "• Res / FPS / Mbps: Sets the PC stream resolution, target framerate (60/90), and bitrate.\n\n"
                 + "• Hold: Keeps the Xbox session alive while you step away so the console does not idle you out.";
@@ -569,8 +600,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void enterDirectMode() {
         if (streaming.get()) disconnect();
+        // A cold start that restored directMode never had a headset TCP client, but a PC streamer
+        // can still be holding the console's only session. Tell it to drop that before play().
+        releasePcSessionAsync();
         directMode = true;
-        getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("directMode", true).apply();
+        captureMode = false;
+        persistTransportMode();
         modeBtn.setText("Mode: Direct");
         hudBar.setVisibility(View.GONE);
         surfaceView.setVisibility(View.GONE);
@@ -580,7 +615,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     void exitDirectMode() {
         if (direct != null) direct.hide();
         directMode = false;
-        getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("directMode", false).apply();
+        captureMode = false;
+        persistTransportMode();
+        modeBtn.setText("Mode: PC");
+        surfaceView.setVisibility(View.VISIBLE);
+        hudBar.setVisibility(View.VISIBLE);
+        setStatus("PC mode: press Start Stream");
+    }
+
+    private void persistTransportMode() {
+        getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                .putBoolean("directMode", directMode)
+                .putBoolean("captureMode", captureMode)
+                .apply();
+    }
+
+    /**
+     * Capture plays the PC's HDMI capture stream. Hiding Direct stops an xhome session if one is up.
+     * Do not broadcast GTA60_STOP here: that packet is how Direct releases a PC streamer, and it would
+     * also kill a capture process that is already serving the card.
+     */
+    void enterCaptureMode() {
+        if (streaming.get()) disconnect();
+        if (direct != null) direct.hide();
+        directMode = false;
+        captureMode = true;
+        persistTransportMode();
+        modeBtn.setText("Mode: Capture");
+        surfaceView.setVisibility(View.VISIBLE);
+        hudBar.setVisibility(View.VISIBLE);
+        setStatus("Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays paired to the Xbox.");
+        if (!captureUpdateCheckedThisBoot) {
+            captureUpdateCheckedThisBoot = true;
+            requestCaptureUpdateAsync(false);
+        }
+    }
+
+    private void exitCaptureMode() {
+        if (streaming.get()) disconnect();
+        directMode = false;
+        captureMode = false;
+        persistTransportMode();
         modeBtn.setText("Mode: PC");
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
@@ -596,6 +671,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // In Direct mode the PC transport is out of the picture. The SurfaceView can be recreated
         // when the panel resizes, and its auto-start must not quietly take the console's session.
         if (directMode) return;
+        // Capture is allowed to connect. It must not ask the agent to launch the Xbox streamer.
         String h = hostInput.getText().toString().trim();
         if (h.isEmpty()) {
             discoverLanHost(true);
@@ -663,7 +739,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                 });
             } catch (Exception e) {
-                if (autoConnectAfter) {
+                if (autoConnectAfter && captureMode) {
+                    setStatus("No capture stream found. On the PC run GTA-Sixty.exe --capture");
+                } else if (autoConnectAfter) {
                     // Nothing answered, which normally means no streamer is running on the PC. Ask
                     // the agent to start one and keep polling; it answers discovery once the Xbox
                     // session is up. This is the "start it from the headset" path.
@@ -730,7 +808,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Release the virtual pad before dropping the connection. The console keeps whatever state it
         // last received, and a held button or a displaced pad can cost the physical controller its
         // player-1 slot ("controller works for the Xbox menu but not in-game", notes section 12).
-        sendNeutralGamepadBlocking();
+        // Capture mode never forwards the pad; a neutral packet would still be a gamepad message.
+        if (!captureMode) sendNeutralGamepadBlocking();
         Socket s = socket;
         socket = null;
         synchronized (sendLock) {
@@ -814,11 +893,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     s = null;
                     if (!askedAgent) {
                         askedAgent = true;
-                        Log.i(TAG, "no streamer at " + host + "; asking the PC agent to start one");
-                        sendStartRequest();
+                        if (captureMode) {
+                            Log.i(TAG, "no capture stream at " + host + "; not sending GTA60_START");
+                        } else {
+                            Log.i(TAG, "no streamer at " + host + "; asking the PC agent to start one");
+                            sendStartRequest();
+                        }
                     }
                     if (System.currentTimeMillis() > connectDeadline) throw ce;
-                    setStatus("Starting the PC streamer...");
+                    setStatus(captureMode ? "Waiting for the capture PC..." : "Starting the PC streamer...");
                     Thread.sleep(1500);
                 }
             }
@@ -828,7 +911,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 sockOut = s.getOutputStream();
             }
 
-            setStatus("Connected to " + host + " — requesting " + RES_LABELS[resIdx] + " " + cfgFps + " FPS...");
+            setStatus(captureMode
+                    ? "Connected to capture at " + host + " — size follows the card"
+                    : "Connected to " + host + " — requesting " + RES_LABELS[resIdx] + " " + cfgFps + " FPS...");
             sendClientConfig();
             sendControlPacket(TYPE_CLIENT_IDR, null);
 
@@ -1220,6 +1305,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * remembered, because a powered-off machine cannot answer discovery.
      */
     private void wakePc() {
+        if (captureMode) {
+            requestCaptureUpdateAsync(true);
+            return;
+        }
         // Ask the PC agent to launch the streaming app regardless of MAC state: the machine may
         // already be awake and simply not running the app.
         requestPcAppStart();
@@ -1362,6 +1451,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }, "GTA60-StartPc").start();
     }
 
+    /**
+     * Broadcast GTA60_UPDATE on UDP 7662 to ask the Ubuntu capture updater to check git and
+     * restart gta60-capture.service only if a newer commit is available.
+     */
+    private void requestCaptureUpdateAsync(boolean userTriggered) {
+        if (userTriggered) setStatus("Checking capture PC for updates...");
+        new Thread(() -> {
+            try (DatagramSocket ds = new DatagramSocket()) {
+                ds.setBroadcast(true);
+                ds.setSoTimeout(1500);
+                final byte[] cmd = "GTA60_UPDATE".getBytes(StandardCharsets.US_ASCII);
+                for (InetAddress t : discoveryTargets()) {
+                    try { ds.send(new DatagramPacket(cmd, cmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
+                }
+                byte[] buf = new byte[128];
+                DatagramPacket resp = new DatagramPacket(buf, buf.length);
+                ds.receive(resp);
+                String reply = new String(resp.getData(), 0, resp.getLength(), StandardCharsets.US_ASCII).trim();
+                Log.i(TAG, "capture updater reply: " + reply);
+                if ("GTA60_UPDATING".equals(reply)) {
+                    setStatus("Capture PC is updating & self-testing...");
+                } else if (userTriggered) {
+                    if ("GTA60_UPTODATE".equals(reply) || "GTA60_COOLDOWN".equals(reply)) {
+                        setStatus("Capture PC is already up to date.");
+                    } else {
+                        setStatus("Capture PC updater replied: " + reply);
+                    }
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "no capture updater reply: " + e.getMessage());
+                if (userTriggered) {
+                    setStatus("No capture PC updater replied on UDP " + START_UDP_PORT);
+                }
+            }
+        }, "GTA60-CaptureUpdate").start();
+    }
+
     private void requestPcAppStart() {
         new Thread(() -> {
             final byte[] startCmd = "GTA60_START".getBytes(StandardCharsets.US_ASCII);
@@ -1465,6 +1591,79 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    /**
+     * Ask the PC streamer to release the console. Closing this headset's TCP socket is not enough:
+     * the streamer keeps the xhome session alive with a 30 s keepalive. Broadcast GTA60_STOP to the
+     * streamer (7661) and the agent (7662, which forwards to 127.0.0.1:7661).
+     */
+    private void releasePcSessionAsync() {
+        new Thread(this::releasePcSessionBlocking, "GTA60-StopPc").start();
+    }
+
+    /** Blocks until the PC streamer is gone, or until one probe shows it was never up. */
+    void releasePcSessionBlocking() {
+        final byte[] stop = "GTA60_STOP".getBytes(StandardCharsets.US_ASCII);
+        final byte[] discover = "GTA60_DISCOVER".getBytes(StandardCharsets.US_ASCII);
+        try (DatagramSocket ds = new DatagramSocket()) {
+            ds.setBroadcast(true);
+            ds.setSoTimeout(700);
+            sendStopBroadcast(ds, stop);
+            if (!probeOffer(ds, discover)) {
+                Log.i(TAG, "GTA60_STOP: no PC streamer answered");
+                return;
+            }
+            Log.i(TAG, "GTA60_STOP: PC streamer is up; waiting for it to release the console");
+            final long deadline = System.currentTimeMillis() + 8000L;
+            int silences = 0;
+            while (silences < 2 && System.currentTimeMillis() < deadline) {
+                sendStopBroadcast(ds, stop);
+                if (probeOffer(ds, discover)) silences = 0;
+                else silences++;
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "GTA60_STOP: done (silent probes=" + silences + ")");
+        } catch (Exception e) {
+            Log.w(TAG, "GTA60_STOP failed: " + e.getMessage());
+        }
+    }
+
+    private void sendStopBroadcast(DatagramSocket ds, byte[] stop) {
+        for (InetAddress target : discoveryTargets()) {
+            try {
+                ds.send(new DatagramPacket(stop, stop.length, target, DISCOVERY_UDP_PORT));
+            } catch (Exception ignored) {
+            }
+            try {
+                ds.send(new DatagramPacket(stop, stop.length, target, START_UDP_PORT));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** True if any GTA60_OFFER arrives before the socket times out. */
+    private boolean probeOffer(DatagramSocket ds, byte[] discover) {
+        sendDiscoveryQuery(ds, discover);
+        final long until = System.currentTimeMillis() + 700L;
+        while (System.currentTimeMillis() < until) {
+            final int remain = (int) Math.max(50L, until - System.currentTimeMillis());
+            try {
+                ds.setSoTimeout(remain);
+                final byte[] buf = new byte[256];
+                final DatagramPacket resp = new DatagramPacket(buf, buf.length);
+                ds.receive(resp);
+                final String msg = new String(resp.getData(), 0, resp.getLength(), StandardCharsets.US_ASCII);
+                if (msg.startsWith("GTA60_OFFER")) return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
     private void sendControlPacket(int type, byte[] payload) {
         final int len = payload == null ? 0 : payload.length;
         final ByteBuffer bb = ByteBuffer.allocate(16 + len).order(ByteOrder.LITTLE_ENDIAN);
@@ -1489,6 +1688,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void sendGamepadState() {
+        if (captureMode) return;
         if (directMode) {
             // Direct mode: the pad goes to the console through the WebView's input data channel.
             if (direct != null) direct.pad(padButtons, padLX, padLY, padRX, padRY, padLT, padRT);
@@ -1597,7 +1797,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 // Keep the console from timing the session out. Repeating the *current* pad state is
                 // a no-op for the game (same buttons, same axes), it only proves the player is still
                 // there. See the Hold button and notes 10.5.
-                if (streaming.get() && keepAlive && (now - lastGamepadSendMs) > 20_000L) {
+                if (streaming.get() && keepAlive && !captureMode && (now - lastGamepadSendMs) > 20_000L) {
                     sendGamepadState();
                 }
                 if (streaming.get() && dt >= 0.5 && streamWidth > 0) {
@@ -1635,7 +1835,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (!autoStartTriggered) {
             autoStartTriggered = true;
-            if (!directMode) {
+            if (captureMode) {
+                Log.i(TAG, "Surface created in Capture mode; waiting for Start Stream");
+            } else if (!directMode) {
                 Log.i(TAG, "Surface created in PC mode; waiting for user to tap Start Stream");
             }
         }

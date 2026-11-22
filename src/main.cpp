@@ -1,4 +1,5 @@
 #include "gta60/Log.h"
+#include "gta60/media/MfCaptureSource.h"
 #include "gta60/media/MfH264Decoder.h"
 #include "gta60/media/OpusWasapiAudio.h"
 #include "gta60/media/SyntheticGameSource.h"
@@ -57,7 +58,7 @@ BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
 }
 
 struct CliOptions {
-    enum class Mode { Help, Login, ListConsoles, StopSession, Connect, SyntheticDemo, Agent };
+    enum class Mode { Help, Login, ListConsoles, StopSession, Connect, SyntheticDemo, Agent, Capture };
     Mode mode = Mode::Help;
     std::string serverId = "auto";
     // --stop-session: terminate a session by id. The console allows one streaming session at a time,
@@ -109,6 +110,8 @@ struct CliOptions {
     // quantization noise rises during fast motion (0.5 was too tight there and made the FG gate
     // flap). 0 disables the test and restores the old strict behaviour.
     float dedupMad = 1.0f;
+    // Substring of the capture device's friendly name. Empty picks the first video capture device.
+    std::string captureDevice;
 };
 
 void printUsage() {
@@ -120,7 +123,9 @@ void printUsage() {
         "  GTA-Sixty.exe --stop-session <id>   (release a stuck/exclusive console session)\n"
         "  GTA-Sixty.exe --connect <serverId|auto> [options]\n"
         "  GTA-Sixty.exe --synthetic-demo [options]\n"
-        "  GTA-Sixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n\n"
+        "  GTA-Sixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n"
+        "  GTA-Sixty.exe --capture [--capture-device <name>] [--bitrate <Mbps>] [--codec h264|hevc]\n"
+        "                            HDMI capture card -> NVENC -> Quest. Does not open Xbox remote play.\n\n"
         "Options:\n"
         "  --fps <60|90>             Output frame rate (2x or 3x from 30 FPS) [default: 60]\n"
         "  --upscale <1080p|1440p|4k> Target output resolution [default: 1440p]\n"
@@ -144,7 +149,9 @@ void printUsage() {
         "  --no-nvofa                Force D3D12 compute optical flow instead of NVOFA\n"
         "  --no-fg                   Disable optical-flow frame generation (lowest latency passthrough)\n"
         "  --run-seconds <N>         Stop cleanly after N seconds of streaming (0 = until Ctrl+C) [default: 0]\n"
-        "  --frames <N>              Frame count for --synthetic-demo (0 = run until Ctrl+C) [default: 180]\n");
+        "  --frames <N>              Frame count for --synthetic-demo (0 = run until Ctrl+C) [default: 180]\n"
+        "  --capture                 Capture-card mode: Media Foundation -> NVENC -> Quest TCP 7660\n"
+        "  --capture-device <text>   Friendly-name substring of the capture card (default: first device)\n");
 }
 
 bool parseArgs(int argc, char** argv, CliOptions& opts) {
@@ -172,6 +179,11 @@ bool parseArgs(int argc, char** argv, CliOptions& opts) {
             opts.mode = CliOptions::Mode::SyntheticDemo;
         } else if (a == "--agent") {
             opts.mode = CliOptions::Mode::Agent;
+        } else if (a == "--capture") {
+            opts.mode = CliOptions::Mode::Capture;
+            opts.questServer = true;
+        } else if (a == "--capture-device") {
+            if (!nextVal(opts.captureDevice)) return false;
         } else if (a == "--fps") {
             std::string v;
             if (!nextVal(v)) return false;
@@ -555,6 +567,162 @@ int runSyntheticDemo(const CliOptions& opts) {
     return 0;
 }
 
+// HDMI capture card -> NVENC -> the existing Quest GT60 client.
+// This process never opens an xhome session, so it does not take the console's remote-play slot.
+// It also stays up when the headset disconnects: nothing on the console needs to be released.
+int runCapture(const CliOptions& opts) {
+    media::MfCaptureSource cap;
+    if (!cap.open(log::widen(opts.captureDevice))) return 1;
+
+    const uint32_t capW = cap.format().width;
+    const uint32_t capH = cap.format().height;
+    uint32_t fps = cap.format().fps == 0 ? 60 : cap.format().fps;
+    uint32_t bitrate = opts.bitrateMbps;
+    const std::string deviceName = log::narrow(cap.format().deviceName);
+    log::info("capture", std::format("{} {}x{} @ {} fps {} -> NVENC {} Mbps {}. Controller stays on the Xbox.",
+                                     deviceName, capW, capH, fps, cap.format().subtype, bitrate,
+                                     media::videoCodecName(opts.codec)));
+
+    pipeline::D3D12Context d3d;
+    if (!d3d.initialize()) {
+        log::error("capture", "D3D12Context initialization failed");
+        return 1;
+    }
+
+    sink::NvencD3D12Encoder nvenc;
+    if (!nvenc.initialize(d3d, sink::NvencConfig{capW, capH, fps, bitrate, opts.nvencPreset, opts.codec})) {
+        log::error("capture", "NvencD3D12Encoder initialization failed");
+        return 1;
+    }
+
+    std::mutex cfgMtx;
+    std::optional<sink::QuestStreamServer::ClientStreamConfig> pendingConfig;
+    sink::QuestStreamServer questServer;
+    questServer.setMaxVideoBacklog(3);
+    questServer.setSendBufferBytes(384 * 1024);
+
+    sink::QuestStreamServer::Callbacks qcb;
+    qcb.onClientConnected = [&]() {
+        nvenc.requestIdr();
+        log::info("capture", "Quest connected");
+    };
+    qcb.onIdrRequested = [&]() { nvenc.requestIdr(); };
+    qcb.onConfigRequested = [&](const sink::QuestStreamServer::ClientStreamConfig& cfg) {
+        std::lock_guard lock(cfgMtx);
+        pendingConfig = cfg;
+    };
+    qcb.onStopRequested = [&]() {
+        log::info("capture", "GTA60_STOP");
+        g_stopRequested.store(true);
+    };
+    if (!questServer.start(opts.questPort, capW, capH, fps, nvenc.spsPps(), opts.codec, std::move(qcb))) {
+        log::error("capture", "Quest stream server failed to start");
+        return 1;
+    }
+
+    const auto origin = std::chrono::steady_clock::now();
+    const auto deadline = opts.runSeconds > 0 ? origin + std::chrono::seconds(opts.runSeconds)
+                                               : std::chrono::steady_clock::time_point::max();
+    auto lastLog = origin;
+    uint64_t encoded = 0;
+    uint64_t dropped = 0;
+    int encodeFails = 0;
+    bool loggedSizeIgnore = false;
+    bool clientSeen = false;
+
+    while (!g_stopRequested.load() && std::chrono::steady_clock::now() < deadline) {
+        std::optional<sink::QuestStreamServer::ClientStreamConfig> req;
+        {
+            std::lock_guard lock(cfgMtx);
+            req = pendingConfig;
+            pendingConfig.reset();
+        }
+        if (req) {
+            const auto& c = *req;
+            if (c.width != capW || c.height != capH || c.fps != fps) {
+                if (!loggedSizeIgnore) {
+                    loggedSizeIgnore = true;
+                    log::info("capture", std::format(
+                        "Quest asked for {}x{} @ {} fps; capture stays at the card's {}x{} @ {}",
+                        c.width, c.height, c.fps, capW, capH, fps));
+                }
+            }
+            if (c.bitrateMbps >= 10 && c.bitrateMbps <= 200) {
+                uint32_t mbps = c.bitrateMbps;
+                if (opts.maxBitrateMbps > 0 && mbps > opts.maxBitrateMbps) mbps = opts.maxBitrateMbps;
+                if (mbps != bitrate) {
+                    log::info("capture", std::format("capture bitrate {} -> {} Mbps", bitrate, mbps));
+                    bitrate = mbps;
+                    if (!nvenc.initialize(d3d, sink::NvencConfig{capW, capH, fps, bitrate, opts.nvencPreset, opts.codec})) {
+                        log::error("capture", "NVENC bitrate change failed");
+                        return 1;
+                    }
+                    questServer.setVideoConfig(capW, capH, fps, nvenc.spsPps());
+                    nvenc.requestIdr();
+                }
+            }
+        }
+
+        media::CaptureRead sample;
+        if (!cap.read(sample)) {
+            log::error("capture", "capture read failed");
+            return 1;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const uint32_t tsMs = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - origin).count());
+
+        if (sample.audio && questServer.hasClient() && !sample.pcm.empty()) {
+            questServer.sendAudioPcm(sample.pcm.data(), sample.pcm.size() / 2, tsMs);
+        }
+        if (sample.video && questServer.hasClient()) {
+            if (!clientSeen) {
+                clientSeen = true;
+            }
+            if (questServer.sendBacklogFrames() > 1) {
+                ++dropped;
+            } else if (!nvenc.encodeNv12Frame(sample.frame, tsMs, false,
+                                              [&](const uint8_t* data, size_t size, uint32_t ts, bool idr, bool gen) {
+                                                  questServer.sendVideoAccessUnit(data, size, ts, idr, gen);
+                                              })) {
+                ++encodeFails;
+                if (encodeFails == 1 || encodeFails % 30 == 0) {
+                    log::warn("capture", std::format("NVENC encode failed ({} in a row)", encodeFails));
+                }
+                if (encodeFails >= 60) {
+                    log::error("capture", "NVENC encode kept failing");
+                    return 1;
+                }
+            } else {
+                encodeFails = 0;
+                ++encoded;
+            }
+        } else if (sample.video && clientSeen && !questServer.hasClient()) {
+            clientSeen = false;
+            log::info("capture", "Quest disconnected; staying up");
+        }
+
+        if (now - lastLog >= std::chrono::seconds(2)) {
+            const auto enc = nvenc.consumeTimings();
+            const auto st = questServer.consumeStats();
+            log::info("capture", std::format(
+                "encoded {} dropped {} backlog {} enc {:.2f} ms send {:.2f} ms client {}",
+                encoded, dropped, questServer.sendBacklogFrames(), enc.picMs + enc.waitMs, st.tcpSendAvgMs,
+                questServer.hasClient() ? 1 : 0));
+            lastLog = now;
+            encoded = 0;
+            dropped = 0;
+        }
+    }
+
+    log::info("capture", "capture stopped");
+    questServer.stop();
+    nvenc.shutdown();
+    cap.close();
+    d3d.shutdown();
+    return 0;
+}
+
 class StreamApiSignaling final : public xbox::Signaling {
 public:
     StreamApiSignaling(xbox::StreamApi& api, std::string sessionId)
@@ -907,6 +1075,11 @@ int runConnect(const CliOptions& initialOpts) {
                 pendingConfig = cfg;
             }
             mailboxCv.notify_one();
+        };
+        qcb.onStopRequested = [&]() {
+            log::info("app", "GTA60_STOP: releasing pad and Xbox session");
+            g_stopRequested.store(true);
+            mailboxCv.notify_all();
         };
         if (!questServer.start(opts.questPort, opts.outWidth, opts.outHeight, opts.targetFps, nvenc.spsPps(), opts.codec, std::move(qcb))) {
             nvenc.shutdown();
@@ -1336,7 +1509,27 @@ int runConnect(const CliOptions& initialOpts) {
                                  ? streamOrigin + std::chrono::seconds(opts.runSeconds)
                                  : std::chrono::steady_clock::time_point::max();
 
+    // Release the console if the headset drops after it has connected. Do not exit just because
+    // nobody has connected yet: the agent launches this process, and the Quest connects seconds later.
+    bool questClientEverSeen = false;
+    std::chrono::steady_clock::time_point questClientGoneSince{};
+
     while (!g_stopRequested.load() && !streamEnded.load() && std::chrono::steady_clock::now() < runDeadline) {
+        if (opts.questServer) {
+            if (questServer.hasClient()) {
+                questClientEverSeen = true;
+                questClientGoneSince = {};
+            } else if (questClientEverSeen) {
+                const auto nowGone = std::chrono::steady_clock::now();
+                if (questClientGoneSince.time_since_epoch().count() == 0) {
+                    questClientGoneSince = nowGone;
+                } else if (nowGone - questClientGoneSince >= std::chrono::seconds(8)) {
+                    log::info("app", "Quest client gone for 8 s after connecting; releasing the Xbox session");
+                    g_stopRequested.store(true);
+                    break;
+                }
+            }
+        }
         if (activeModeTag != previousModeTag) {
             if (previousModeTag) perfModeFlips.fetch_add(1, std::memory_order_relaxed);
             previousModeTag = activeModeTag;
@@ -1618,6 +1811,12 @@ int runConnect(const CliOptions& initialOpts) {
     pipe.shutdown();
     d3d.shutdown();
     decoder.shutdown();
+    // Neutral pad before close. The console keeps the last pad state, and killing the process
+    // skips this flush, which is what sticks the session until a reboot.
+    try {
+        rtc.sendGamepad({});
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    } catch (...) {}
     rtc.close();
     audio.stop();
     try {
@@ -1648,7 +1847,7 @@ int runAgent() {
     }
     DWORD timeoutMs = 1000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
-    log::info("agent", "listening on UDP 7662 for GTA60_START (headset can launch the streamer)");
+    log::info("agent", "listening on UDP 7662 for GTA60_START / GTA60_STOP");
 
     const auto streamerRunning = []() {
         const SOCKET t = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1675,6 +1874,19 @@ int runAgent() {
         const int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n <= 0) continue;
         buf[n] = '\0';
+        if (std::strncmp(buf, "GTA60_STOP", 10) == 0) {
+            log::info("agent", "GTA60_STOP: forwarding to the streamer on UDP 7661");
+            const SOCKET fwd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (fwd != INVALID_SOCKET) {
+                sockaddr_in dest{};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(7661);
+                dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                sendto(fwd, "GTA60_STOP", 10, 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+                closesocket(fwd);
+            }
+            continue;
+        }
         if (std::strncmp(buf, "GTA60_START", 11) != 0) continue;
         if (streamerRunning()) {
             log::info("agent", "start request ignored: streamer already running");
@@ -1756,6 +1968,9 @@ int main(int argc, char** argv) {
             break;
         case CliOptions::Mode::Agent:
             rc = runAgent();
+            break;
+        case CliOptions::Mode::Capture:
+            rc = runCapture(opts);
             break;
         case CliOptions::Mode::Help:
             printUsage();

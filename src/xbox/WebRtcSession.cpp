@@ -132,9 +132,11 @@ bool WebRtcSession::start(Signaling& signaling, std::string* error, std::chrono:
     audio_ = pc_->addTrack(audio);
 
     rtc::Description::Video video("1", rtc::Description::Direction::RecvOnly);
-    video.addH264Codec(102, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d002a;x-google-min-bitrate=15000;x-google-start-bitrate=20000;x-google-max-bitrate=25000"));
-    video.addH264Codec(104, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a;x-google-min-bitrate=15000;x-google-start-bitrate=20000;x-google-max-bitrate=25000"));
-    video.addH264Codec(106, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42002a;x-google-min-bitrate=15000;x-google-start-bitrate=20000;x-google-max-bitrate=25000"));
+    // x-google-* are kbps. 80000 lifts the old 25 Mbps offer cap that bounded the REMB sweep.
+    // H.264 level stays 4.2 (4d002a / 42e02a / 42002a); a level change is a separate experiment.
+    video.addH264Codec(102, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d002a;x-google-min-bitrate=20000;x-google-start-bitrate=50000;x-google-max-bitrate=80000"));
+    video.addH264Codec(104, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a;x-google-min-bitrate=20000;x-google-start-bitrate=50000;x-google-max-bitrate=80000"));
+    video.addH264Codec(106, std::string("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42002a;x-google-min-bitrate=20000;x-google-start-bitrate=50000;x-google-max-bitrate=80000"));
     video_ = pc_->addTrack(video);
 
     auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::LongStartSequence);

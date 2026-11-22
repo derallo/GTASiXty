@@ -367,6 +367,9 @@ bool QuestStreamServer::start(uint16_t tcpPort,
                                                           media::videoCodecName(p_->codec), p_->macAddress);
                     sendto(p_->udpSock, reply.data(), static_cast<int>(reply.size()), 0,
                            reinterpret_cast<sockaddr*>(&from), fromLen);
+                } else if (std::strncmp(buf, "GTA60_STOP", 10) == 0) {
+                    log::info("quest-srv", "GTA60_STOP received; releasing the Xbox session");
+                    if (p_->cbs.onStopRequested) p_->cbs.onStopRequested();
                 }
             }
         });

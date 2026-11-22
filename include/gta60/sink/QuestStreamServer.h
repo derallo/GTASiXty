@@ -54,6 +54,8 @@ public:
         std::function<void()> onIdrRequested;
         std::function<void(const xbox::GamepadFrame&)> onGamepad;
         std::function<void(const ClientStreamConfig&)> onConfigRequested;
+        // Headset entered Direct mode (or the agent forwarded that). Drop the Xbox session.
+        std::function<void()> onStopRequested;
     };
 
     QuestStreamServer();

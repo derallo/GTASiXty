@@ -368,6 +368,13 @@ final class DirectController {
         refreshLocalPad("start");
         setStatus("Provisioning a console session...");
         io.execute(() -> {
+            if (activity instanceof MainActivity) {
+                ((MainActivity) activity).releasePcSessionBlocking();
+            }
+            if (stopped) {
+                busy.set(false);
+                return;
+            }
             String id = "";
             try {
                 XboxDirect.Console console = selected;
@@ -694,6 +701,10 @@ final class DirectController {
 
         row.addView(button("Hide HUD", "#475569", v -> toggleHud()));
 
+        row.addView(button("Capture", "#0F766E", v -> activity.runOnUiThread(() -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).enterCaptureMode();
+        })));
+
         row.addView(button("PC mode", "#334155", v -> activity.runOnUiThread(() -> {
             if (activity instanceof MainActivity) ((MainActivity) activity).exitDirectMode();
         })));
@@ -737,6 +748,7 @@ final class DirectController {
                 + "• 120 Hz / 90 Hz: Display refresh rate. 120 Hz divides both 60 fps (2:2) and 30 fps (4:4) evenly with zero judder.\n\n"
                 + "• Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
                 + "• Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
+                + "• Capture: HDMI capture card on the PC. Run GTA-Sixty.exe --capture there. The Xbox controller stays paired to the console.\n\n"
                 + "• PC mode: Switches back to the PC relay streamer (which uses your PC's IP).\n\n"
                 + "• Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).";
 
@@ -938,7 +950,8 @@ final class DirectController {
         return "GTA60Direct.start({localIp:" + JSONObject.quote(ip)
                 + ",enhance:" + enhanceMode
                 + ",look:" + lookMode
-                + ",padPresent:" + localPadPresent + "})";
+                + ",padPresent:" + localPadPresent
+                + ",displayHz:" + refreshHz + "})";
     }
 
     private int dp(int v) {
@@ -1051,7 +1064,8 @@ final class DirectController {
                     final String uniq = p.length >= 7 ? (" (uniq " + p[6] + "->" + p[1] + " fps") : (" " + p[1] + " fps");
                     final String mode = p.length >= 8 ? (" [" + p[7] + "]") : "";
                     final String gpu = p.length >= 9 ? (" gpu " + p[8] + "ms)") : (p.length >= 7 ? ")" : "");
-                    final String text = "Direct:" + res + uniq + mode + gpu + ", " + p[2] + " Mbps, jb " + p[3] + " ms" + rtt;
+                    final String bwe = p.length >= 10 ? (", bwe " + p[9] + " Mbps") : "";
+                    final String text = "Direct:" + res + uniq + mode + gpu + ", " + p[2] + " Mbps" + bwe + ", jb " + p[3] + " ms" + rtt;
                     Log.i(TAG, text);
                     // Only repaint the Android status TextView when the top HUD bar is visible.
                     runOnUi(() -> {

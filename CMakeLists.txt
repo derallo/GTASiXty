@@ -111,6 +111,7 @@ add_library(gta60_core STATIC
   src/xbox/StreamApi.cpp
   src/xbox/WebRtcSession.cpp
   src/media/MfH264Decoder.cpp
+  src/media/MfCaptureSource.cpp
   src/media/OpusWasapiAudio.cpp
   src/media/SyntheticGameSource.cpp
   src/nvof/NvOfSession.cpp
@@ -147,6 +148,7 @@ target_link_libraries(gta60_core PUBLIC
   mfplat
   mfuuid
   mf
+  mfreadwrite
   iphlpapi
   wmcodecdspuuid
   xinput

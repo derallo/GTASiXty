@@ -179,7 +179,8 @@ vm.runInContext(code, sandbox, { filename: 'direct.js' });
       !/end-of-candidates/.test(exchangePayload.sdp) &&
       /o=rtc 65029611 0 IN IP4 127\.0\.0\.1/.test(exchangePayload.sdp) &&
       /a=ice-options:ice2,trickle/.test(exchangePayload.sdp) &&
-      /profile-level-id=4d002a/.test(exchangePayload.sdp),
+      /profile-level-id=4d002a/.test(exchangePayload.sdp) &&
+      /x-google-max-bitrate=500000/.test(exchangePayload.sdp),
       exchangePayload.sdp);
     check('two local candidates forwarded', exchangePayload.candidates.length === 2,
       String(exchangePayload.candidates.length));
@@ -341,6 +342,24 @@ vm.runInContext(code, sandbox, { filename: 'direct.js' });
   check('cadence classifier phase-locks noisy 30fps and passes native 60fps',
     res30.join(',') === '0,1,0,1,0,1' && res60.join(',') === '0,0,0,0',
     `30=${res30.join(',')} 60=${res60.join(',')}`);
+
+  const triple = [20.0, 1.2, 1.0, 18.0];
+  const resTriple = [];
+  prevM = 10.0; cDup = 0; hist = 0;
+  for (const m of triple) {
+    const isD = api._classifyDupe(m, 8, prevM, cDup, hist);
+    resTriple.push(isD ? 1 : 0);
+    cDup = isD ? cDup + 1 : 0;
+    prevM = m;
+    hist = Math.min(2, hist + 1);
+  }
+  check('cadence classifier allows a triple hold',
+    resTriple.join(',') === '0,1,1,0',
+    resTriple.join(','));
+  check('low mean with a hot block is not a duplicate',
+    api._classifyDupe(1.0, 40, 10.0, 0, 1) === false);
+  check('setDisplayHz keeps 120 and 90',
+    api.setDisplayHz(120) === 120 && api.setDisplayHz(90) === 90 && api.setDisplayHz(72) === 120);
 
   // WarningForBeingIdle should keep the session alive instead of calling onError.
   sandbox.__error = null;
