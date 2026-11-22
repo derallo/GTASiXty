@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 USER_NAME="${SUDO_USER:-$USER}"
-CAPTURE_ARGS="${GTA60_CAPTURE_ARGS:---codec hevc --bitrate 50}"
+CAPTURE_ARGS="${GTA60_CAPTURE_ARGS:---device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --audio hw:CARD=S,DEV=0 --width 2560 --height 1440 --fps 60 --codec hevc --bitrate 50}"
 
 chmod +x "$REPO_DIR/scripts/linux/update-and-start.sh" "$REPO_DIR/scripts/linux/udp-updater.py"
 

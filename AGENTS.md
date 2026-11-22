@@ -17,18 +17,19 @@ Streams Xbox gameplay to Meta Quest 3 at up to 1440p60/120fps over LAN using the
    - In **Capture** mode: connects to TCP 7660, decodes H.264/HEVC, plays 48 kHz PCM, never sends `GTA60_START` or gamepad frames, and can broadcast `GTA60_UPDATE` on UDP 7662 to trigger an update check on the Ubuntu capture box.
    - Build/install: `scripts\build-quest-apk.ps1`, `scripts\install-quest-apk.ps1`.
 
-3. **Ubuntu Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
-   - Standalone CMake C++20 app for the dedicated Ubuntu capture PC (no Windows/D3D12/WebRTC deps).
+3. **Linux Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
+   - Standalone CMake C++20 app for the dedicated Linux Mint / Ubuntu capture PC (no Windows/D3D12/WebRTC deps).
    - Grabs uncompressed UVC frames via V4L2 (2–3 buffer queue) + UAC audio via ALSA, encodes with VA-API (`hevc_vaapi` / `h264_vaapi`) via FFmpeg `libavcodec`, and serves GT60 on TCP 7660 / UDP 7661.
 
-## Ubuntu Capture Box (`capture-box`)
-- **SSH alias**: `ssh capture-box` (`littledemon@192.168.68.76`, configured in `~/.ssh/config`).
-- **Hardware**: AMD Ryzen 5 PRO 7530U with Radeon Graphics (Barcelo), Ubuntu 24.04.3 LTS.
-- **Encoder**: VA-API 1.20.0 on `/dev/dri/renderD128` (`H264` & `HEVC` `VAEntrypointEncSlice`).
+## Linux Capture Box (`capture-box`)
+- **SSH alias**: `ssh capture-box` (`derek@192.168.68.90` wired Ethernet, configured in `~/.ssh/config`).
+- **Hardware**: Intel Core Ultra 5 135U (`mintbook-g11`), Linux Mint 22.3, Elgato 4K S on USB 3.0 (`5000M`).
+- **Encoder**: Intel `iHD` VA-API 1.20.0 (driver 24.1.0) on `/dev/dri/renderD128` (`H264` & `HEVC` `VAEntrypointEncSlice`).
+- **Capture devices**: Video `/dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0` (uncompressed `NV12` `2560x1440@60`), Audio `hw:CARD=S,DEV=0` (48 kHz stereo `S16_LE`).
 - **Remote deploy & test**:
   ```powershell
-  ssh capture-box "cd ~/GTASiXty && git pull --ff-only && cmake -B linux-capture/build -S linux-capture && cmake --build linux-capture/build -j && ./linux-capture/build/gta60-capture --selftest"
+  ssh capture-box "cd ~/GTASiXty && git pull --ff-only && cmake -B linux-capture/build -S linux-capture && cmake --build linux-capture/build -j && ./linux-capture/build/gta60-capture --selftest --device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --width 2560 --height 1440 --fps 60"
   ```
-- **Services on Ubuntu**:
+- **Services on Linux (`mintbook-g11`)**:
   - `gta60-capture.service`: runs `scripts/linux/update-and-start.sh` (auto-pulls, rebuilds, runs `--selftest` with `.bak` rollback, then runs `gta60-capture`).
   - `gta60-updater.service`: listens on UDP `7662` for `GTA60_UPDATE` from Quest and restarts `gta60-capture.service` only if a new commit is available.

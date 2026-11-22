@@ -9,6 +9,11 @@ BAK="$BUILD_DIR/gta60-capture.bak"
 
 cd "$REPO_DIR"
 
+SELFTEST_ARGS=()
+if [[ -e /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 ]]; then
+    SELFTEST_ARGS=(--device /dev/v4l/by-id/usb-Elgato_Elgato_4K_S_AB2MB60110CB51-video-index0 --width 2560 --height 1440 --fps 60)
+fi
+
 OLD_HEAD="$(git rev-parse HEAD 2>/dev/null || echo none)"
 if git pull --ff-only 2>&1; then
     NEW_HEAD="$(git rev-parse HEAD 2>/dev/null || echo none)"
@@ -23,7 +28,7 @@ if [[ ! -x "$BIN" || "$OLD_HEAD" != "$NEW_HEAD" ]]; then
         cp -f "$BIN" "$BAK"
     fi
 
-    if cmake -B "$BUILD_DIR" -S "$SRC_DIR" && cmake --build "$BUILD_DIR" -j"$(nproc)" && "$BIN" --selftest; then
+    if cmake -B "$BUILD_DIR" -S "$SRC_DIR" && cmake --build "$BUILD_DIR" -j"$(nproc)" && "$BIN" --selftest "${SELFTEST_ARGS[@]}"; then
         echo "[gta60-update] build and selftest passed"
     else
         echo "[gta60-update] build or selftest FAILED!" >&2
@@ -35,5 +40,5 @@ if [[ ! -x "$BIN" || "$OLD_HEAD" != "$NEW_HEAD" ]]; then
         fi
     fi
 else
-    "$BIN" --selftest
+    "$BIN" --selftest "${SELFTEST_ARGS[@]}"
 fi
