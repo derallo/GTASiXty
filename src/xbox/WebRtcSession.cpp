@@ -217,6 +217,11 @@ bool WebRtcSession::start(Signaling& signaling, std::string* error, std::chrono:
     const auto local = pc_->localDescription();
     if (!local) return fail("no local description");
     const std::string offer = withoutCandidates(std::string(*local));
+    // Debug aid: dump the exact offer the console accepts, so a different client (the headset's
+    // WebView) can be diffed against it when its SDP exchange is rejected.
+    if (GetEnvironmentVariableA("GTA60_DUMP_SDP", nullptr, 0) > 0) {
+        log::info("xbox", "offer SDP:\n" + offer);
+    }
     std::vector<IceCandidate> candidates;
     for (const auto& c : local->candidates()) {
         std::string text = c.candidate();

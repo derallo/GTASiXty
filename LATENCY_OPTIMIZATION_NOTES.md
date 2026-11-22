@@ -1,13 +1,15 @@
 # GTA-Sixty Latency Analysis & Optimization Notes
 
-> Last updated: 2026-11-20
+> Last updated: 2026-11-21
 > Target setup: Xbox Series X (local LAN, wired Ethernet) -> PC (Ampere-class NVIDIA GPU, wired Ethernet) -> Meta Quest 3 (wired / USB-C Ethernet).
 >
 > **Start at section 6 (HANDOFF)** if you are picking this up fresh - it has the current numbers,
 > what is already maxed out, what is worth doing next, and the measurement traps that cost hours.
 > **Section 9 (HEVC)** is the newest work, 9.7 is a live stress test, and section 10 lists what the
-> rename broke. Anything marked "corrected" or "measured" was verified on this hardware; earlier
-> guesses that turned out wrong are kept visible rather than silently deleted, so do the same.
+> rename broke. **Section 13** is the 2026-11-21 work: the console display-mode benchmark and the
+> new direct-to-console transport. Anything marked "corrected" or "measured" was verified on this
+> hardware; earlier guesses that turned out wrong are kept visible rather than silently deleted, so
+> do the same.
 
 ---
 
@@ -951,3 +953,227 @@ answers any connected pad, but a game binds to the pad that holds player 1. So:
 **Do not assume it is a game bug.** The same class of stale-state problem appears in the idle session
 end (10.5) and in the dashboard drop (the session attach itself), and in all three cases the console
 is being left in a state by a client that disappeared without saying goodbye.
+
+**Update 2026-11-21 (direct mode).** A new report narrowed the symptom to direct mode after the
+**console had been to sleep and the game was resumed**: the pad worked in the Xbox guide/menus but
+not inside the running game, and closing the game was not acceptable. Two mechanisms fit that shape:
+
+1. **The virtual pad can hold player 1.** The console can keep the headset's virtual pad (index 0,
+   idle) on player 1 while a controller that reconnected to the console itself becomes player 2:
+   system UI answers any pad, a game binds player 1.
+2. **Quick Resume restores the old pad binding.** The game was suspended with the previous session's
+   virtual pad; the new session's pad is a different device instance, so the game keeps waiting for
+   the old one even though the guide works.
+
+**Negative result that shapes the fix: never remove pad 0.** Two builds tried the obvious remedy -
+skip the handshake announcement when no headset pad is attached (the other agent's first pass) and
+release pad 0 after announcing it (the first pass in this session). Both were kicked by the console
+with **`KickForNoClientConnection` ~57 s after `direct: streaming`, every session, reproducibly**
+(`build/controller-test.log`, 2026-11-21 19:49-20:55). The pad reports are the console's client
+liveness signal as well as input, so they must keep flowing at all times.
+
+Implemented in `DirectController.java` + `direct.js`:
+
+- **Pad 0 lives for the whole session.** The 20 s anti-idle keep-alive always sends the current
+  (neutral) pad report, even with no controller attached. `InputManager`'s `SOURCE_GAMEPAD` presence
+  only drives a `gamepadChanged add/remove/add` re-announce when a controller (re)appears (Bluetooth
+  reconnect after sleep), giving a resumed game a fresh pad-arrival event.
+- **`Fix pad` HUD button.** Replays that same add/remove/add plus a neutral report on demand.
+- **Clean teardown.** `Stop`/error/`PC mode`/app exit send the neutral release, wait 350 ms, then
+  close the peer connection and the console session (same reasoning as the PC path's
+  `sendNeutralGamepadBlocking()`); a `disconnected` peer that does not recover in 20 s is treated as
+  a console sleep/network drop and the session is released.
+- **Restart UX.** A small always-visible **Controls** chip brings the auto-hidden Direct bar back
+  (the operator had to switch to PC mode to reach Stop/Start), a 35 s watchdog fails a start that
+  never produces media instead of sitting on "Starting WebRTC", and the provisioned session id is
+  persisted so `play` releases an orphaned session instead of colliding with it.
+
+Verification hooks: `adb logcat -s GTA60 GTA60Direct` shows `local gamepad present/absent`,
+`no gamepad on the headset; pad 0 stays announced`, `gamepad connected on the headset; pad 0
+re-announced`, `pad re-synced`, and `released virtual pad before stopping`. Still open: whether a
+Quick-Resumed game accepts the re-announced pad depends on the title; the `Fix pad` button is the
+deliberate escape hatch for the cases where it does not.
+
+
+---
+
+## 13. 2026-11-21: display-mode change and direct-to-console mode
+
+### 13.1 What the operator changed, and what it can physically affect
+
+The console was switched to **VRR off** and **"allow low latency mode" (ALLM) off** under
+Settings > General > TV & display options > Video modes, so the TV keeps its motion-smoothing
+picture mode. The question was whether that hurts the Quest app.
+
+The answer follows from where the capture happens, and it is worth writing down because the
+temptation to "benchmark the TV setting" misses the point:
+
+- **xhome captures the console's own composited output**, one stage before the HDMI transmitter.
+  Microsoft's GDK documentation describes the streaming capture as copying *presented* frames from
+  the GPU; the TV is entirely downstream. TV motion interpolation is done by the TV processor after
+  it receives a finished signal, so it cannot feed back into the capture.
+- **ALLM is HDMI sink signaling only** - a flag telling the display to enter its low-latency picture
+  mode. It does not change console output, cadence, or capture. There is no path from ALLM to the
+  Quest stream.
+- **VRR does change presentation timing.** Off, the console presents on a fixed refresh grid: 30 fps
+  content is scanned/captured twice, and 40-59 fps content gets an uneven mix of one- and two-vsync
+  holds. The RTP rate stays ~60 fps; what changes is the *content* rate (`uniq`) and the duplicate
+  run pattern. That is the only channel through which this setting can reach the headset.
+- **Hedge:** the console may force VRR/ALLM off *during remote play anyway*. The Feb-2025 Xbox
+  Insider 2504 notes fix "video settings being disabled unexpectedly after a remote play session,
+  such as 4K 120Hz, variable refresh rate, and auto low-latency mode", which implies those settings
+  are reconfigured for the session. If so, the dashboard toggle is a no-op for the capture and the
+  measured A/B will show it.
+
+Expected outcome, stated before measuring: `dec`, `nvenc`, `pcLat` and `quest=` unchanged (the PC
+does the same work per frame); `uniq`/`dup`/`runs` possibly changed; mode mix possibly changed. If
+`uniq` lands in the 34-46 fps dead band (7.4), the gate neither generates nor is cleanly bypassed
+and output stays at the content rate - that is the one real judder exposure.
+
+If the game itself falls back to 30 fps when VRR is disabled, that is not a small effect on this
+pipeline: 9.7's 30 fps stress test is the shape of it - `uniq ~27`, FG engaged, `pcLat ~23 ms`,
+NVENC ~7 ms per output frame, output still 60. The PC then does roughly twice the work per second.
+That is a *content-rate* effect (the console is sending 30 unique fps), not the display setting
+itself; a game that keeps 60 unique fps shows no change at all.
+
+### 13.2 Instrumentation added
+
+`src/main.cpp`:
+
+| change | why |
+|---|---|
+| `--run-seconds <n>` | Clean self-stop for a capture. Killing the streamer skips `rtc.close()`/`api.stop()`, which is what leaves a stale virtual pad on the console (section 12). |
+| `dup=<pct>%` | Share of decoded frames dropped as repeats in the window (dedup + luma-MAD path). |
+| `runs=<1>/<2>/<3+>` | Duplicate-run histogram: kept frames that followed exactly 1, 2 or 3+ dropped frames. On a 60 Hz source, run=1 is 30 fps content, 2 is 20 fps, mixed 1/2 is 40-50 fps. |
+| `flips=<n>` | Output-mode changes in the window. Every flip costs a pipeline reset and a latency spike, so this is the jitter cost of a cadence change. |
+
+Scripts (all no-dependency PowerShell 5.1):
+
+- `scripts\bench.ps1` - start a capture (`--run-seconds`), parse the telemetry slice, write
+  CSV + JSON + Markdown. `-Headless` for source-only; `-FromLog <file>` analyses an existing log;
+  `-ConnectedOnly` keeps only samples where a headset was receiving.
+- `scripts\bench-compare.ps1` - A/B table, deltas and a verdict (cadence moved vs PC path invariant).
+- `scripts\bench-selftest.ps1` - synthesises 60 fps-unique and 30 fps-duplicated logs and asserts the
+  parser/comparison; run it after any telemetry-format change. It cannot prove anything about the
+  console, only that the measurement pipeline is not lying.
+
+Telemetry lines written before this build have no `dup=`/`runs=`/`flips=`; the parser marks them
+`n/a` and refuses to compare cadence across the boundary.
+
+### 13.3 Running the A/B
+
+```powershell
+# old settings, console free (this takes the console away from the TV):
+scripts\bench.ps1 -Label vrr-on-llm-on -Headless -Seconds 90
+# change VRR + ALLM, let the console settle:
+scripts\bench.ps1 -Label vrr-off-llm-off -Headless -Seconds 90
+scripts\bench-compare.ps1 -A build\bench\<stamp>-vrr-on-llm-on.json `
+                          -B build\bench\<stamp>-vrr-off-llm-off.json
+```
+
+With a headset attached, drop `-Headless` and add the APK's Start Stream; the parser separates
+source metrics from the connected samples automatically. Do not run this while someone is playing
+on the console - `play` takes the single session and drops the local game to the dashboard.
+
+Decision rule: a duplicate-ratio change of >=5 points (or content ratio >=5 points) means the
+setting reaches the pipeline; then look at the dead-band share and `flips` before blaming the PC.
+A flat duplicate ratio means the change is TV-only for this app, which is the most likely result
+given the Remote Play reconfiguration note above.
+
+#### Measured, 2026-11-21 06:46-06:52 (VRR off, ALLM off, headless)
+
+Four captures: 90 s at REMB 50 plus 60 s each at REMB 0 / 18 / 80. Full write-up in
+`BENCHMARK_2026-11-21.md`; the numbers that matter:
+
+| metric | VRR on, 30 fps content (2026-11-20 window) | VRR off, 30 fps content (today) |
+|---|---|---|
+| `in` | 59.89 | 60.28 |
+| `uniq` | 29.47 | 29.55 (REMB 0), 29.86 (18), 26.44 (50, scene pauses) |
+| RTT | 17.14 ms | 17.04-17.21 ms |
+| decode | 3.36 ms | 3.49-3.55 ms |
+| source bitrate @ REMB 50 | 23.4 Mbps | 24.20 Mbps |
+
+REMB sweep (today): **0 -> 14.13**, **18 -> 16.67**, **50 -> 24.20**, **80 -> 23.19 Mbps**, p95
+within 1.5 Mbps of each mean, RTT flat at 17.0-17.2 ms. The console still caps near 24 Mbps; the
+"18" the operator remembered is the advertised cap, not a console ceiling.
+
+Verdict: **no measurable effect on the Quest path for this content**. A 30 fps game is already
+delivered as ~60 RTP frames with every other frame duplicated, whether VRR is on or off, so the
+frame-generation gate sees the same ~30 fps content rate and the same `pcLat ~23 ms` it had before
+(9.7). The change is TV-only - and the TV is downstream of the capture. The remaining unknown is a
+title whose *render mode* changes when VRR disappears (a 40 fps mode becoming 30, for example); that
+would show up as a `uniq` step and is worth watching for in the next live session.
+
+Caveat: no headset was connected, so today's captures do not include `pcLat`/`quest=`; the PC-side
+claim rests on the source cadence being unchanged plus the previously measured 30 fps FG numbers.
+
+### 13.4 Direct mode (headset -> console, no PC)
+
+Implemented as **Mode: Direct** in the APK. Design and caveats are in `DIRECT_MODE.md`; the short
+version:
+
+- `XboxDirect.java` ports the PC auth/REST path (device code, XBL/XSTS, gssv login, transfer token,
+  `play`/`connect`/`sdp`/`ice`/`keepalive`), using the same client id, scopes, device info and JSON
+  bodies that the PC build has been using successfully.
+- `assets/direct/direct.js` runs the peer connection in the system WebView: audio sendrecv m-line,
+  video recvonly m-line, the four data channels, the handshake, and the binary gamepad reports.
+- The one non-obvious transport fix: Chromium advertises host candidates as `<uuid>.local`, which
+  the console cannot resolve, so the offer's candidates are stripped and rewritten to the headset's
+  real LAN address (same port/priority) before `/ice`.
+- Verified: both builds, the APK asset paths, the JS protocol test (`tests/direct-js-test.js`), the
+  Microsoft device-code endpoint with the exact client id/scope, and - on the headset itself - the
+  APK installing/launching cleanly with `js: page ready; webrtc=true; h264=true` from Chromium
+  156.0.0.38.16 in the system WebView (2026-11-21).
+- **Working end-to-end on the Quest 3 (`2560x1440 @ 60.0 fps`, `18.0-22.4 Mbps`, `dec ~5.6 ms`,
+  `jb ~8.9-12.1 ms`, `rtt = 1.0 ms`, 48 kHz stereo Opus audio)**:
+  - The earlier `/sdp` failure had two causes: (1) `direct.js` was not calling `conformOffer()` or
+    `raiseH264Level()` and lacked `bundlePolicy: 'max-bundle'`, while `XboxDirect.java` had diverged
+    from `StreamApi.cpp`'s headers and `/sdp` configuration; (2) `XboxDirect.pollExchange()` threw
+    `exchange failed: null null` on every HTTP 200 success response because `errorDetails` is always
+    present as `{"code":null,"message":null}` and `JSONObject.optString("code", "")` returns `"null"`.
+  - Borrowed from Better xCloud (`com.redphx.betterxc`): separated `<video>` and `<audio>` elements
+    with decoupled RTCP `CNAME` in `conformAnswer()` (dropping the video jitter buffer from 32.4 ms
+    down to **8.9-12.1 ms** and fixing `NetEq` buffer flushes), added `b=AS:50000` + `x-google-*-bitrate`
+    remote description hints + `requestVideoFrameCallback` presentation feedback reports (raising
+    bitrate from 14.8 Mbps to **18.0-22.4 Mbps**), added `/configuration` `serverDetails` host
+    candidate synthesis (`appendConfigServerCandidates`), and handled `WarningForBeingIdle` with
+    `clientKeepAlive`.
+- Two unrelated bugs found while testing and fixed:
+  - **PC/direct session race**: the panel auto-started PC mode on surface creation, the agent
+    launched a streamer that provisioned the console's only session, and direct mode then got 409
+    "exclusive operation". The last mode is now persisted, PC auto-start is suppressed in direct
+    mode, `play` retries on 409 for 60 s, and `--stop-session <id>` releases an orphaned session.
+  - **Stuck console**: after that collision both transports failed with
+    `ServerStartStreamingV2CommandSent` until the console was restarted; the PC and direct paths now
+    say so explicitly instead of surfacing the raw agent error.
+
+### 13.5 State for the next agent
+
+- `build\GTA-Sixty.exe` and `build\GTA-Sixty-Quest3.apk` are rebuilt and installed on the Quest 3.
+- The display-mode question is **answered for the current content**: four live captures on
+  2026-11-21 (VRR/ALLM off, headless) show the same source cadence, RTT and decode as the VRR-on
+  30 fps-content window, and the same ~24 Mbps REMB ceiling. See 13.3.1 and
+  `BENCHMARK_2026-11-21.md`. What remains is a title whose render mode itself depends on VRR.
+- **Direct mode is live and verified on Quest 3**:
+  - `dec ~5.1-5.6 ms` + `jb ~7.6-8.4 ms` + `rtt 1.0 ms` (~14-15 ms total Quest receive-to-decode path
+    at `2560x1440 @ 60.0 fps`, `18-27.4 Mbps`, with zero PC hop).
+  - **120 Hz Display Refresh Rate Fix (`modeId 90`, `vsync_period = 8333333 ns`)**: Live driving capture
+    (`build/direct-drive-live.log` + `SurfaceFlinger --latency`) showed Horizon OS running 2D panels at
+    **72.0 Hz (`modeId 137`, `13.889 ms` vsync)**, causing 4:1 pulldown judder (`13.89 ms` x4, then
+    `27.78 ms` double-hold 12 times/sec) on 60 FPS streams and `2.4` vsyncs/frame judder on 30 FPS
+    games. `MainActivity.applyDisplayRefreshRate(120)` + `scripts/install-quest-apk.ps1` now switch the
+    headset to **120.0 Hz**, dividing both 60 FPS (`2:2` vsyncs) and 30 FPS (`4:4` vsyncs) evenly.
+  - **On-Quest Adreno 740 WebGL2 GPU Pipeline v3 (`direct.js` + `DirectController.java`)**:
+    Uses the Adreno 740 GPU for on-headset duplicate detection (`uniq` FPS), AMD FidelityFX RCAS,
+    SuperRes detail reconstruction, and **2-level `80x45 -> 320x180` Coarse-to-Fine Optical Flow +
+    Bidirectional/Occlusion Consistency Frame Generation** with async `PIXEL_PACK_BUFFER` (PBO) +
+    `fenceSync` duplicate detection (`classifyDupeCadence`), reducing `FG60+SR` GPU time from
+    `~2.95 ms` to **`1.16 ms`** (`100%` PBO hit rate) at `1:1` **`2560x1440`** panel sizing
+    (`2048dp x 1152dp`, `debug.oculus.gpuLevel 4` / `cpuLevel 4`). Unified **`Enhance`** button
+    cycles `Off`, `RCAS`, `SuperRes`, `FG 60`, `FG60+SR`; **`Look`** button cycles `Normal`, `Vivid`,
+    `Night`; Direct HUD auto-hides (`5 s` / `8 s`); Xbox `ReportVibration` (`type 128`) forwards to
+    paired gamepad vibrators. Verified across all 5 modes via `scripts/bench-direct.ps1`
+    (`build/bench/20261121-114004-v3-verified.md`, `0/0` drop/lost) and `node tests/direct-js-test.js`
+    (33/33 checks PASS).
+  - See `DIRECT_MODE.md` for full architecture, 5-mode benchmark table, and telemetry details.
+

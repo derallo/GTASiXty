@@ -28,12 +28,22 @@ if (-not $Serial) {
 }
 Write-Host "[Quest Install] Target device: $Serial"
 
+$runningPid = ((& adb -s $Serial shell "pidof com.gtasixty.quest" 2>$null) -join "").Trim()
+if ($runningPid) {
+    Write-Host "[Quest Install] Stopping any active stream cleanly before upgrade..."
+    & adb -s $Serial shell "am broadcast -a com.gtasixty.quest.STOP_STREAM -p com.gtasixty.quest" | Out-Null
+    Start-Sleep -Milliseconds 1500
+}
+
 Write-Host "[Quest Install] Installing $Apk..."
 & adb -s $Serial install -r -g $Apk
 if ($LASTEXITCODE -ne 0) { throw "adb install failed" }
 
 Write-Host "[Quest Install] Setting up USB-C tunnel (adb reverse tcp:$Port tcp:$Port)..."
 & adb -s $Serial reverse ("tcp:{0}" -f $Port) ("tcp:{0}" -f $Port)
+
+Write-Host "[Quest Install] Configuring 120 Hz display & performance clocks (GPU/CPU level 4)..."
+& adb -s $Serial shell "cmd display set-user-preferred-display-mode 4128 2208 120.00001 0; setprop debug.oculus.refreshRate 120; setprop debug.oculus.gpuLevel 4; setprop debug.oculus.cpuLevel 4" 2>$null
 
 if ($Launch) {
     Write-Host "[Quest Install] Launching GTA-Sixty on Quest 3..."

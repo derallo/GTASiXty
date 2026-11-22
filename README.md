@@ -14,6 +14,14 @@ The PC sits in the middle so it can do work the console can't: remove duplicated
 optical-flow frame interpolation, and upscale/sharpene with EASU/RCAS before re-encoding for the
 headset. It also keeps you off the cloud relay, since the console and PC talk directly over the LAN.
 
+**Direct mode** skips the PC entirely: the headset signs in to the account itself and receives the
+console's WebRTC stream, with no decode/upscale/re-encode hop. It trades the PC's frame generation
+and sharpening for one less encode and one less network hop - see [DIRECT_MODE.md](DIRECT_MODE.md).
+
+```
+Xbox Series X  --WebRTC(ICE/SRTP over the LAN)-->  Quest 3 APK (Direct mode)
+```
+
 ## Requirements
 
 - **Windows 10/11 x64** (developed against the Windows 10/11 SDK)
@@ -75,6 +83,7 @@ a UDP broadcast (`7661`), or you can type the PC's IP.
 | `--fps <60\|90>` | Output frame rate |
 | `--no-fg` | Disable frame generation entirely (lowest latency) |
 | `--headless` | Run the D3D12 pipeline with no headset attached |
+| `--run-seconds <n>` | Stop cleanly after n seconds (builds the benchmark captures; `0` = until Ctrl+C) |
 
 ### Codec: H.264 vs HEVC
 
@@ -104,6 +113,12 @@ Wireless ADB works too: `adb connect <quest-ip>:5555`.
 
 Buttons: **Start Stream**, **Refresh** (force an IDR), **Hide HUD**, **Wake PC**, and the
 resolution / frame-rate / bitrate selectors.
+
+**Mode: PC / Direct** switches transports. Direct mode signs in to the Microsoft account on the
+headset, lists your consoles, and streams straight from the console (in the same app, behind the
+same controller input). It is new and marked experimental: check [DIRECT_MODE.md](DIRECT_MODE.md)
+for what is verified and the on-device test ladder. Your first direct session needs a phone or PC
+for the one-time device-code sign-in; the PC does not have to be running.
 
 Starting a stream also clears background processes of other user-installed apps, so a leftover app
 cannot keep holding the compositor, GPU or decoder (requires `KILL_BACKGROUND_PROCESSES` +
@@ -146,6 +161,52 @@ This will only work if your BIOS/network adapter allows wake from the relevant p
 (the adapter must have *Wake on Magic Packet* enabled, and BIOS-level deep power-off must not be
 blocking it).
 
+## Benchmarking a console display-mode change
+
+Remote play captures the console's own composited output. The TV is strictly downstream, so a TV
+picture setting cannot change the streamed frames - but a console *display* setting can, through one
+path: presentation cadence. With VRR off the console presents on a fixed 60 Hz grid, so 30 fps
+content is repeated twice and 40-59 fps content gets uneven holds. The RTP rate stays ~60 fps; the
+**content rate** (`uniq`) changes, and that is what the frame-generation gate and the perceived
+smoothness depend on. ALLM ("allow low latency mode") is only a signal telling the TV to switch
+picture modes and has no path into the capture at all. There is also a real chance the console
+already forces VRR/ALLM off during remote play (Xbox Insider 2504 fixed those settings being left
+changed after a session), which would make the dashboard toggle irrelevant to this pipeline.
+
+Measure it instead of guessing:
+
+```powershell
+# 1. console on the old settings, nobody playing on the TV:
+scripts\bench.ps1 -Label vrr-on-llm-on -Headless -Seconds 90
+
+# 2. change the two settings in Settings > General > TV & display options > Video modes,
+#    let the console settle, then:
+scripts\bench.ps1 -Label vrr-off-llm-off -Headless -Seconds 90
+
+# 3. compare:
+scripts\bench-compare.ps1 -A build\bench\<stamp>-vrr-on-llm-on.json `
+                          -B build\bench\<stamp>-vrr-off-llm-off.json
+```
+
+`-Headless` measures the console -> PC source without a headset (cadence, duplicate ratio, RTT,
+decode cost). Without it, a connected headset adds `pcLat`, output fps, NVENC and the `quest=`
+echo. The capture stops via `--run-seconds`, which tears the session down cleanly instead of
+leaving a stale virtual pad on the console.
+
+The telemetry line now ends with `dup=<pct>% runs=<1>/<2>/<3+> flips=<n>`: duplicate share, the
+run-length histogram of the duplicates dropped between kept frames, and output-mode flips per
+window. `scripts\bench-selftest.ps1` proves the parser/comparison against synthetic 60 fps and
+30 fps logs (no console needed).
+
+**Note:** starting a session takes the console away from the TV. Run the A/B when the console is
+free, or the local game drops to the dashboard.
+
+The first live run of this (2026-11-21, VRR and ALLM off, 30 fps game content) found **no change**
+to the console->PC cadence, RTT or decode, and the same ~24 Mbps REMB ceiling: see
+[BENCHMARK_2026-11-21.md](BENCHMARK_2026-11-21.md). The sweep table there is also the answer to
+"does the console send less bitrate now that VRR is off?" - it does not; the advertised REMB is
+still what sets it.
+
 ## Latency
 
 Please read **[LATENCY_OPTIMIZATION_NOTES.md](LATENCY_OPTIMIZATION_NOTES.md)** before changing the
@@ -174,6 +235,10 @@ phase NVENC timings, and `quest=` (PC→headset round trip measured by a per-fra
 | Blocky/garbled image that persists | Dropped frames broke the H.264 reference chain; the stream recovers on the next IDR |
 | Frame rate below target | Output resolution too high for the per-frame budget; try a lower resolution |
 | Frame generation keeps turning on and off | The dedup is misreading the source frame rate; see the notes |
+| **Direct mode: no video, `WebRTC connection failed`** | ICE never found a path. Check logcat for `signaling complete: N remote candidates`; if N is 0 the console's ICE exchange failed, if it is >0 the candidates or the mDNS rewrite are suspect. `adb logcat -s GTA60Direct` shows the JS log lines |
+| **Direct mode: sign-in dialog never confirms** | The device code is entered at `https://www.microsoft.com/link`; confirm the account has an Xbox profile. Tokens are AES-GCM/Keystore encrypted; if the Keystore key is lost the app asks to sign in again |
+| **Direct mode: the pad works in the Xbox guide but not in the game after the console woke from sleep** | A Quick-Resumed game can keep the previous session's virtual-pad binding. Keep pad 0 announced (the app never removes it - the console kicks a session with no pad after ~60 s) and press **Fix pad** in the Direct bar to re-announce it; no need to close the game. See notes section 12 and [DIRECT_MODE.md](DIRECT_MODE.md) |
+| **Direct mode looks softer than PC mode** | Expected: the console's own encode at 1080p-class resolution with no sharpening or frame generation. PC mode is the quality path |
 
 ## Scope
 

@@ -41,7 +41,8 @@ New-Item -ItemType Directory -Force -Path $OutBuild, $ResFlat, $GenJava, $ObjDir
 
 $Manifest = Join-Path $AppDir "src\main\AndroidManifest.xml"
 $ResDir = Join-Path $AppDir "src\main\res"
-$JavaSrc = Join-Path $AppDir "src\main\java\com\gtasixty\quest\MainActivity.java"
+$AssetsDir = Join-Path $AppDir "src\main\assets"
+$JavaSrcDir = Join-Path $AppDir "src\main\java"
 
 Write-Host "[Quest APK] Compiling resources with aapt2..."
 & $Aapt2 compile --dir $ResDir -o (Join-Path $ResFlat "res.zip")
@@ -49,18 +50,22 @@ if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 
 $UnalignedApk = Join-Path $Work "unaligned.apk"
 Write-Host "[Quest APK] Linking manifest & resources..."
-& $Aapt2 link `
-    -o $UnalignedApk `
-    -I $AndroidJar `
-    --manifest $Manifest `
-    --java $GenJava `
-    --min-sdk-version 29 `
-    --target-sdk-version 34 `
-    (Join-Path $ResFlat "res.zip")
+$linkArgs = @(
+    "link",
+    "-o", $UnalignedApk,
+    "-I", $AndroidJar,
+    "--manifest", $Manifest,
+    "--java", $GenJava,
+    "--min-sdk-version", "29",
+    "--target-sdk-version", "34"
+)
+$linkArgs += (Join-Path $ResFlat "res.zip")
+& $Aapt2 @linkArgs
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
-$JavaFiles = @($JavaSrc) + (Get-ChildItem -Path $GenJava -Filter "*.java" -Recurse | Select-Object -ExpandProperty FullName)
-Write-Host "[Quest APK] Compiling Java sources..."
+$JavaFiles = @(Get-ChildItem -Path $JavaSrcDir -Filter "*.java" -Recurse | Select-Object -ExpandProperty FullName) +
+             @(Get-ChildItem -Path $GenJava -Filter "*.java" -Recurse | Select-Object -ExpandProperty FullName)
+Write-Host "[Quest APK] Compiling $($JavaFiles.Count) Java sources..."
 & $Javac --release 11 -classpath $AndroidJar -d $ObjDir @JavaFiles
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
@@ -75,6 +80,14 @@ if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 Write-Host "[Quest APK] Adding classes.dex to APK..."
 & $Jar uf $UnalignedApk -C $DexDir "classes.dex"
 if ($LASTEXITCODE -ne 0) { throw "jar uf classes.dex failed" }
+
+# aapt2 on Windows stores -A entries with backslashes ("assets/direct\file.js"), which the
+# AssetManager cannot open. jar always writes '/', so package the assets here instead.
+if (Test-Path -LiteralPath $AssetsDir) {
+    Write-Host "[Quest APK] Adding assets..."
+    & $Jar uf $UnalignedApk -C (Join-Path $AppDir "src\main") "assets"
+    if ($LASTEXITCODE -ne 0) { throw "jar uf assets failed" }
+}
 
 $AlignedApk = Join-Path $Work "aligned.apk"
 Write-Host "[Quest APK] Aligning APK..."

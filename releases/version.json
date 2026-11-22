@@ -1,0 +1,6 @@
+{
+  "versionCode": 2,
+  "versionName": "1.1",
+  "apkUrl": "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/GTA-Sixty-Quest3.apk",
+  "notes": "Direct mode virtual-pad release for Xbox-paired controllers, wake-from-sleep black-screen fix, EASU SuperRes + quarter-texel FG upgrades, ? help dialogs, and 3-hour GitHub APK updater."
+}

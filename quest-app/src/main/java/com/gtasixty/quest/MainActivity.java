@@ -3,11 +3,16 @@ package com.gtasixty.quest;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.provider.Settings;
 import android.text.InputType;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
@@ -62,6 +67,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String TAG = "GTA60";
     private static final String TAG_PERF = "GTA60-Perf";
+    private static final String ACTION_STOP_STREAM = "com.gtasixty.quest.STOP_STREAM";
     // Empty means "nothing configured yet" - the app then scans the LAN instead of dialling a
     // hardcoded address.
     private static final String DEFAULT_PC_HOST = "";
@@ -114,6 +120,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile long lastGamepadSendMs = 0;
     private Button holdBtn;
     private TextView statusText;
+    private Button modeBtn;
+    private DirectController direct;
+    private AppUpdater updater;
+    private boolean directMode = false;
+    private final BroadcastReceiver stopStreamReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && ACTION_STOP_STREAM.equals(intent.getAction())) {
+                Log.i(TAG, "Received STOP_STREAM broadcast; stopping active stream cleanly");
+                stopAllStreamsCleanly();
+            }
+        }
+    };
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor();
 
@@ -159,8 +178,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        final IntentFilter stopFilter = new IntentFilter(ACTION_STOP_STREAM);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(stopStreamReceiver, stopFilter, Context.RECEIVER_EXPORTED);
+        } else {
+            @SuppressWarnings("deprecation")
+            final Intent ignored = registerReceiver(stopStreamReceiver, stopFilter);
+        }
+
         SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
         String savedHost = prefs.getString("host", DEFAULT_PC_HOST);
+        // Restore the last transport. If the user left the app in Direct mode, opening the panel
+        // must not auto-start a PC stream and steal the console's single session (the 2026-11-21
+        // "exclusive operation" collision).
+        directMode = prefs.getBoolean("directMode", false);
         if (!prefs.contains("prefs_v2")) {
             savedHost = DEFAULT_PC_HOST;
             prefs.edit().putBoolean("prefs_v2", true).putString("host", savedHost).apply();
@@ -240,9 +271,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hideBtn.setOnClickListener(v -> hudBar.setVisibility(View.GONE));
         row1.addView(hideBtn);
 
+        Button adbBtn = makeButton("Wi-Fi ADB", "#2563EB");
+        adbBtn.setOnClickListener(v -> openWirelessAdbHelper());
+        row1.addView(adbBtn);
+
         Button wakeBtn = makeButton("Wake PC", "#7C3AED");
         wakeBtn.setOnClickListener(v -> wakePc());
         row1.addView(wakeBtn);
+
+        modeBtn = makeButton("Mode: PC", "#0F766E");
+        modeBtn.setOnClickListener(v -> {
+            if (directMode) exitDirectMode();
+            else enterDirectMode();
+        });
+        row1.addView(modeBtn);
+
+        Button updateBtn = makeButton("Update", "#1E293B");
+        updateBtn.setOnClickListener(v -> checkForUpdates());
+        row1.addView(updateBtn);
+
+        Button helpBtn = makeButton("?", "#334155");
+        helpBtn.setOnClickListener(v -> showPcHelp());
+        row1.addView(helpBtn);
 
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
@@ -306,18 +356,143 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Gravity.TOP);
         root.addView(hudBar, hudParams);
 
+        direct = new DirectController(this, root);
+        updater = new AppUpdater(this);
+
         setContentView(root);
+        applyDisplayRefreshRate(120);
         scheduleTelemetryTick();
         learnPcMac();
+        updater.startPeriodicChecks();
+        // Debug hooks for on-device checks:
+        //   --ez direct true        open Direct mode without a controller tap
+        //   --ez directStart true   ...and provision the console immediately (needs a signed-in app)
+        //   --ei enhance <0..4>     select Direct GPU mode (0=Off, 1=RCAS, 2=SuperRes, 3=FG60, 4=FG60+SR)
+        //   --ei look <0..2>        select Direct color look (0=Normal, 1=Vivid, 2=Night)
+        final Intent launchIntent = getIntent() != null ? getIntent() : new Intent();
+        final boolean wantDirect = launchIntent.getBooleanExtra("direct", false) || directMode;
+        final boolean autoDirectStart = launchIntent.getBooleanExtra("directStart", false);
+        final int enhanceExtra = launchIntent.getIntExtra("enhance", -1);
+        if (enhanceExtra >= 0 && direct != null) {
+            direct.setEnhanceMode(enhanceExtra);
+        }
+        final int lookExtra = launchIntent.getIntExtra("look", -1);
+        if (lookExtra >= 0 && direct != null) {
+            direct.setLookMode(lookExtra);
+        }
+        if (launchIntent.getBooleanExtra("debugEcho", false)) startUdpEcho();
+        if (wantDirect) {
+            uiHandler.post(() -> {
+                enterDirectMode();
+                if (autoDirectStart && direct != null) {
+                    uiHandler.postDelayed(() -> direct.start(), 1500);
+                }
+            });
+        }
         Log.i(TAG, "MainActivity created; default host=" + savedHost);
     }
 
-    private void saveStreamPrefs() {
-        getSharedPreferences("gta60", MODE_PRIVATE).edit()
+    /**
+     * Request a 120 Hz (or 90 Hz) display refresh rate on the Quest 3 instead of the default 72 Hz
+     * panel rate. 72 Hz causes 4:1 pulldown judder (13.89 ms vs 27.78 ms holds) on 60 FPS streams
+     * and 2.4-vsync judder on 30 FPS streams, whereas 120 Hz divides both 60 FPS (2:2 vsyncs) and
+     * 30 FPS (4:4 vsyncs) evenly.
+     */
+    void applyDisplayRefreshRate(int targetHz) {
+        try {
+            android.view.Display display = getWindowManager().getDefaultDisplay();
+            if (display == null) return;
+            android.view.Display.Mode current = display.getMode();
+            android.view.Display.Mode[] modes = display.getSupportedModes();
+            android.view.Display.Mode best = null;
+            float bestDiff = Float.MAX_VALUE;
+            for (android.view.Display.Mode m : modes) {
+                if (current != null && (m.getPhysicalWidth() != current.getPhysicalWidth()
+                        || m.getPhysicalHeight() != current.getPhysicalHeight())) {
+                    continue;
+                }
+                float diff = Math.abs(m.getRefreshRate() - targetHz);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    best = m;
+                }
+            }
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.preferredRefreshRate = targetHz;
+            if (best != null && bestDiff < 2.0f) {
+                lp.preferredDisplayModeId = best.getModeId();
+                Log.i(TAG, "Requesting display modeId=" + best.getModeId() + " ("
+                        + best.getPhysicalWidth() + "x" + best.getPhysicalHeight() + " @ "
+                        + best.getRefreshRate() + " Hz)");
+            }
+            getWindow().setAttributes(lp);
+        } catch (Exception e) {
+            Log.w(TAG, "applyDisplayRefreshRate(" + targetHz + ") failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Opt-in UDP echo (--ez debugEcho true) used to settle whether the LAN can deliver inbound UDP
+     * to the headset at all. The console's SDP command appears to time out on the transport, and a
+     * UDP probe separates "network path" from "WebRTC stack".
+     */
+    private void startUdpEcho() {
+        Thread t = new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket(7665)) {
+                Log.i(TAG, "UDP echo listening on 7665");
+                byte[] buf = new byte[512];
+                while (true) {
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    socket.receive(packet);
+                    byte[] reply = "GTA60_ECHO".getBytes(StandardCharsets.US_ASCII);
+                    socket.send(new DatagramPacket(reply, reply.length, packet.getAddress(), packet.getPort()));
+                    Log.i(TAG, "UDP echo <- " + packet.getAddress().getHostAddress() + ":" + packet.getPort());
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "UDP echo failed: " + e.getMessage());
+            }
+        }, "GTA60-UdpEcho");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void saveStreamPrefs() {        getSharedPreferences("gta60", MODE_PRIVATE).edit()
                 .putInt("resIdx", resIdx)
                 .putInt("cfgFps", cfgFps)
                 .putInt("bitrateIdx", bitrateIdx)
                 .apply();
+    }
+
+    private void showPcHelp() {
+        final String msg =
+                "PC Mode streams your Xbox through your Windows PC (which runs D3D12 optical-flow enhancement & NVENC encoding).\n\n"
+                + "• PC IP box: Enter your PC's LAN IP address (or leave blank / tap LAN to auto-discover it).\n\n"
+                + "• LAN: Broadcasts on your local network to auto-find your PC running GTA-Sixty.\n\n"
+                + "• USB-C: Sets the address to 127.0.0.1 for streaming over a USB-C ADB reverse tunnel.\n\n"
+                + "• Start Stream / Disconnect: Connects to (or disconnects from) the PC streamer.\n\n"
+                + "• Refresh: Requests an immediate keyframe (IDR) if the video ever glitches.\n\n"
+                + "• Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
+                + "• Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
+                + "• Wake PC: Sends a Wake-on-LAN packet to wake your PC.\n\n"
+                + "• Mode: PC / Direct: Switches to Direct Mode, which connects straight to your Xbox via your Microsoft account (no PC or Xbox IP needed).\n\n"
+                + "• Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).\n\n"
+                + "• Res / FPS / Mbps: Sets the PC stream resolution, target framerate (60/90), and bitrate.\n\n"
+                + "• Hold: Keeps the Xbox session alive while you step away so the console does not idle you out.";
+
+        final android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        final TextView tv = new TextView(this);
+        tv.setText(msg);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        final int p = dp(16);
+        tv.setPadding(p, p, p, p);
+        sv.addView(tv);
+
+        new AlertDialog.Builder(this)
+                .setTitle("PC Mode Help")
+                .setView(sv)
+                .setPositiveButton("Close", null)
+                .show();
     }
 
     private Button makeButton(String label, String hexBg) {
@@ -341,7 +516,75 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void toggleHud() {
-        hudBar.setVisibility(hudBar.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        final boolean show = hudBar.getVisibility() != View.VISIBLE;
+        hudBar.setVisibility(show ? View.VISIBLE : View.GONE);
+    }
+
+    /**
+     * Android forbids normal apps from running 'adb tcpip 5555' directly, so this opens the
+     * headset's Developer Options / Wireless Debugging screen and shows the Quest's current Wi-Fi IP.
+     */
+    void openWirelessAdbHelper() {
+        final String ip = getLocalIpv4Address();
+        final String ipLine = ip.isEmpty() ? "(not connected to Wi-Fi)" : ip;
+        new AlertDialog.Builder(this)
+                .setTitle("Wireless ADB Helper")
+                .setMessage("Quest Wi-Fi IP: " + ipLine
+                        + "\n\nAndroid requires enabling Wireless Debugging in system Developer Options "
+                        + "(or running 'adb tcpip 5555' once over USB-C after a reboot).\n\n"
+                        + "Tap 'Developer Options' to open Android Developer Settings -> Wireless debugging.")
+                .setPositiveButton("Developer Options", (d, w) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                    } catch (Exception e) {
+                        try {
+                            startActivity(new Intent(Settings.ACTION_SETTINGS));
+                        } catch (Exception ignored) {
+                            setStatus("Could not open Android Settings: " + e.getMessage());
+                        }
+                    }
+                })
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private String getLocalIpv4Address() {
+        try {
+            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!nif.isUp() || nif.isLoopback()) continue;
+                for (InetAddress addr : Collections.list(nif.getInetAddresses())) {
+                    if (addr.isLoopbackAddress() || addr.isLinkLocalAddress()) continue;
+                    final String host = addr.getHostAddress();
+                    if (host != null && !host.contains(":")) return host;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    /**
+     * Direct mode hides the PC transport entirely: the WebView page owns the video surface and the
+     * headset's gamepad is forwarded over the console's own data channel (DirectController).
+     */
+    private void enterDirectMode() {
+        if (streaming.get()) disconnect();
+        directMode = true;
+        getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("directMode", true).apply();
+        modeBtn.setText("Mode: Direct");
+        hudBar.setVisibility(View.GONE);
+        surfaceView.setVisibility(View.GONE);
+        direct.show();
+    }
+
+    void exitDirectMode() {
+        if (direct != null) direct.hide();
+        directMode = false;
+        getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("directMode", false).apply();
+        modeBtn.setText("Mode: PC");
+        surfaceView.setVisibility(View.VISIBLE);
+        hudBar.setVisibility(View.VISIBLE);
+        setStatus("PC mode: press Start Stream");
     }
 
     private void setStatus(String text) {
@@ -350,6 +593,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void startStreamClicked() {
+        // In Direct mode the PC transport is out of the picture. The SurfaceView can be recreated
+        // when the panel resizes, and its auto-start must not quietly take the console's session.
+        if (directMode) return;
         String h = hostInput.getText().toString().trim();
         if (h.isEmpty()) {
             discoverLanHost(true);
@@ -457,6 +703,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         netThread = new Thread(() -> runStreamLoop(targetHost), "GTA60-Net");
         netThread.start();
+    }
+
+    void stopAllStreamsCleanly() {
+        if (direct != null) {
+            direct.stop();
+        }
+        if (streaming.get()) {
+            disconnect();
+        }
     }
 
     private void disconnect() {
@@ -1234,6 +1489,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void sendGamepadState() {
+        if (directMode) {
+            // Direct mode: the pad goes to the console through the WebView's input data channel.
+            if (direct != null) direct.pad(padButtons, padLX, padLY, padRX, padRY, padLT, padRT);
+            lastGamepadSendMs = System.currentTimeMillis();
+            return;
+        }
         if (!streaming.get()) return;
         ByteBuffer bb = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
         bb.put((byte) 0);
@@ -1249,8 +1510,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         sendControlPacket(TYPE_CLIENT_GAMEPAD, bb.array());
     }
 
-    @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
+    boolean handleGamepadKeyEvent(KeyEvent event) {
         if ((event.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD) {
             int mask = mapGamepadButton(event.getKeyCode());
             if (mask != 0) {
@@ -1260,12 +1520,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return true;
             }
         }
-        return super.dispatchKeyEvent(event);
+        return false;
     }
 
-    @Override
-    public boolean dispatchGenericMotionEvent(MotionEvent ev) {
-        if ((ev.getSource() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK &&
+    boolean handleGamepadMotionEvent(MotionEvent ev) {
+        // SOURCE_JOYSTICK alone also matches non-gamepad sticks; require GAMEPAD so a virtual or
+        // pointer device cannot look like a controller to the direct-mode presence tracking.
+        if ((ev.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD &&
                 ev.getAction() == MotionEvent.ACTION_MOVE) {
             short lx = axisToShort(ev.getAxisValue(MotionEvent.AXIS_X));
             short ly = axisToShort(-ev.getAxisValue(MotionEvent.AXIS_Y));
@@ -1284,6 +1545,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             return true;
         }
+        return false;
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (handleGamepadKeyEvent(event)) return true;
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent ev) {
+        if (handleGamepadMotionEvent(ev)) return true;
         return super.dispatchGenericMotionEvent(ev);
     }
 
@@ -1362,10 +1635,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (!autoStartTriggered) {
             autoStartTriggered = true;
-            Log.i(TAG, "Surface created; auto-starting stream to " + hostInput.getText().toString().trim());
-            uiHandler.post(() -> {
-                if (!streaming.get()) startStreamClicked();
-            });
+            if (!directMode) {
+                Log.i(TAG, "Surface created in PC mode; waiting for user to tap Start Stream");
+            }
         }
     }
 
@@ -1390,8 +1662,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        if (directMode && direct != null) direct.onActivityPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (directMode && direct != null) direct.onActivityResume();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && directMode && direct != null) direct.onActivityResume();
+    }
+
+    void checkForUpdates() {
+        if (updater != null) updater.checkNow(true);
+    }
+
+    @Override
     protected void onDestroy() {
+        try {
+            unregisterReceiver(stopStreamReceiver);
+        } catch (Exception ignored) {
+        }
         disconnect();
+        if (updater != null) updater.destroy();
+        if (direct != null) direct.destroy();
         sendExecutor.shutdownNow();
         super.onDestroy();
     }

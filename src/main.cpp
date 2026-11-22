@@ -57,9 +57,13 @@ BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
 }
 
 struct CliOptions {
-    enum class Mode { Help, Login, ListConsoles, Connect, SyntheticDemo, Agent };
+    enum class Mode { Help, Login, ListConsoles, StopSession, Connect, SyntheticDemo, Agent };
     Mode mode = Mode::Help;
     std::string serverId = "auto";
+    // --stop-session: terminate a session by id. The console allows one streaming session at a time,
+    // and a crashed/!killed client can leave it in ServerStartStreamingV2CommandSent, which blocks
+    // the next player with an HTTP 409 "exclusive operation already in progress".
+    std::string stopSessionId;
     uint32_t targetFps = 60;
     uint32_t outWidth = 2560;
     uint32_t outHeight = 1440;
@@ -93,6 +97,10 @@ struct CliOptions {
     // same headset cap carries visibly more detail. Opt-in while it is new: --codec hevc.
     media::VideoCodec codec = media::VideoCodec::H264;
     uint64_t syntheticFrames = 180;
+    // Benchmark support: stop the stream cleanly after N seconds (0 = run until Ctrl+C). A clean
+    // stop matters because killing the process skips rtc.close()/api.stop(), which is what leaves a
+    // stale virtual pad holding player 1 on the console (notes 12).
+    uint32_t runSeconds = 0;
     // Diagnostic: write per-frame luma-difference histograms here (empty = off).
     std::string picDumpPath;
     // Mean-absolute-difference threshold for treating a frame as a repeat. Measured luma MAD is
@@ -109,6 +117,7 @@ void printUsage() {
         "Usage:\n"
         "  GTA-Sixty.exe --login\n"
         "  GTA-Sixty.exe --list-consoles\n"
+        "  GTA-Sixty.exe --stop-session <id>   (release a stuck/exclusive console session)\n"
         "  GTA-Sixty.exe --connect <serverId|auto> [options]\n"
         "  GTA-Sixty.exe --synthetic-demo [options]\n"
         "  GTA-Sixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n\n"
@@ -134,6 +143,7 @@ void printUsage() {
         "  --headless                Run D3D12 GPU pipeline without OpenXR headset\n"
         "  --no-nvofa                Force D3D12 compute optical flow instead of NVOFA\n"
         "  --no-fg                   Disable optical-flow frame generation (lowest latency passthrough)\n"
+        "  --run-seconds <N>         Stop cleanly after N seconds of streaming (0 = until Ctrl+C) [default: 0]\n"
         "  --frames <N>              Frame count for --synthetic-demo (0 = run until Ctrl+C) [default: 180]\n");
 }
 
@@ -152,6 +162,9 @@ bool parseArgs(int argc, char** argv, CliOptions& opts) {
             opts.mode = CliOptions::Mode::Login;
         } else if (a == "--list-consoles") {
             opts.mode = CliOptions::Mode::ListConsoles;
+        } else if (a == "--stop-session") {
+            opts.mode = CliOptions::Mode::StopSession;
+            if (!nextVal(opts.stopSessionId)) return false;
         } else if (a == "--connect") {
             opts.mode = CliOptions::Mode::Connect;
             if (!nextVal(opts.serverId)) return false;
@@ -194,6 +207,10 @@ bool parseArgs(int argc, char** argv, CliOptions& opts) {
             opts.useNvofa = false;
         } else if (a == "--no-fg") {
             opts.allowFrameGen = false;
+        } else if (a == "--run-seconds") {
+            std::string v;
+            if (!nextVal(v)) return false;
+            opts.runSeconds = static_cast<uint32_t>(std::stoul(v));
         } else if (a == "--quest-server") {
             opts.questServer = true;
         } else if (a == "--port") {
@@ -297,6 +314,35 @@ int runLogin() {
         }
     }
     return 1;
+}
+
+int runStopSession(const std::string& sessionId) {
+    auto transport = xbox::makeWinHttpTransport(&g_stopRequested);
+    xbox::Account account(transport, xbox::dataDirectory() / L"tokens.bin");
+    if (!account.signedIn()) {
+        std::fprintf(stderr, "Not signed in. Run: GTA-Sixty.exe --login\n");
+        return 1;
+    }
+    if (sessionId.empty()) {
+        std::fprintf(stderr, "Usage: GTA-Sixty.exe --stop-session <id>\n");
+        return 1;
+    }
+    const auto access = account.streamingAccess();
+    xbox::StreamApi api(transport, access.host, access.gsToken);
+    try {
+        api.stop(sessionId);
+        std::printf("Stopped session %s\n", sessionId.c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        // A session that is already gone is a success for this command's purpose.
+        const std::string why = e.what();
+        if (why.find("404") != std::string::npos || why.find("not found") != std::string::npos) {
+            std::printf("Session %s is already gone.\n", sessionId.c_str());
+            return 0;
+        }
+        std::fprintf(stderr, "Could not stop session %s: %s\n", sessionId.c_str(), why.c_str());
+        return 1;
+    }
 }
 
 int runListConsoles() {
@@ -634,6 +680,13 @@ int runConnect(const CliOptions& initialOpts) {
                 break;
             } else if (st.state == "Failed") {
                 log::error("xbox", std::format("Session provisioning failed: {} {}", st.errorCode, st.errorMessage));
+                // This state is on the console, not in this process: the console's streaming stack
+                // failed while starting and stays in ServerStartStreamingV2CommandSent, rejecting
+                // every later client (PC or headset) until it is restarted.
+                if (st.errorMessage.find("ServerStartStreamingV2CommandSent") != std::string::npos) {
+                    log::error("xbox", "The console is stuck in a failed streaming start; restart the Xbox "
+                                       "(Guide > Restart console), then reconnect.");
+                }
                 api.stop(sessionId);
                 return 1;
             } else if (st.state == "ReadyToConnect" && !connectSent) {
@@ -885,6 +938,17 @@ int runConnect(const CliOptions& initialOpts) {
     std::atomic<uint64_t> perfUniqueFrames{0};
     std::atomic<uint64_t> perfDecodeCount{0};
     std::atomic<uint64_t> perfDecodeUsSum{0};
+    // Source-cadence instrumentation for the display-mode benchmark. On a 60 Hz stream, a kept frame
+    // followed by one repeat is 30 fps content, two repeats is 20 fps, and none is ~60 fps; the run
+    // histogram therefore exposes exactly what a console-side VRR / low-latency-mode change does to
+    // the cadence the rest of the pipeline sees. `flips` counts output-mode changes, because every
+    // flip costs a pipeline reset and a latency spike (notes 7.4).
+    std::atomic<uint64_t> perfSrcObserved{0};
+    std::atomic<uint64_t> perfSrcDropped{0};
+    std::atomic<uint64_t> perfRun1{0};
+    std::atomic<uint64_t> perfRun2{0};
+    std::atomic<uint64_t> perfRun3{0};
+    std::atomic<uint64_t> perfModeFlips{0};
     // How far behind the submitted access unit the frame that actually came out of the decoder is.
     // pcLat tags frames with the arrival time of the unit being submitted, so any internal MFT
     // buffering silently subtracts from the reported latency; this exposes it.
@@ -912,6 +976,7 @@ int runConnect(const CliOptions& initialOpts) {
     int lowFpsStreak = 0;
     int highFpsStreak = 0;
     const char* activeModeTag = "NV12";
+    const char* previousModeTag = nullptr;
 
     auto now100ns = []() -> int64_t {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -945,6 +1010,7 @@ int runConnect(const CliOptions& initialOpts) {
     }
     std::vector<uint8_t> prevSig, curSig;
     int64_t lastForwardPts = 0;
+    uint32_t srcRunDrops = 0;
 
         // Pre-allocated 4-frame pool eliminates 5.5 MB VirtualAlloc/page-fault churn per frame
         std::array<std::shared_ptr<media::DecodedNv12Frame>, 4> framePool;
@@ -1007,6 +1073,7 @@ int runConnect(const CliOptions& initialOpts) {
             // Report presentation immediately after MFT decode (~1-2 ms) so Xbox congestion control stays saturated
             rtc.videoPresented(unit.rtpTimestamp, unit.arrival100ns, submitted, decoded, decoded);
             if (!decodedOk) continue;
+            perfSrcObserved.fetch_add(1, std::memory_order_relaxed);
 
             // The MFT may hand back a frame we submitted several AUs ago. Measure that gap so the
             // true age of the picture is visible instead of being hidden inside pcLat.
@@ -1095,6 +1162,8 @@ int runConnect(const CliOptions& initialOpts) {
             if ((!dec.keep || madDuplicate) && !starving &&
                 mailboxLatestSeq.load(std::memory_order_relaxed) > 0) {
                 if (pic.commit) picRef.commit(planes, 2);
+                perfSrcDropped.fetch_add(1, std::memory_order_relaxed);
+                ++srcRunDrops;
                 continue;
             }
 
@@ -1115,6 +1184,10 @@ int runConnect(const CliOptions& initialOpts) {
             }
             mailboxCv.notify_one();
             perfUniqueFrames.fetch_add(1, std::memory_order_relaxed);
+            if (srcRunDrops == 1) perfRun1.fetch_add(1, std::memory_order_relaxed);
+            else if (srcRunDrops == 2) perfRun2.fetch_add(1, std::memory_order_relaxed);
+            else if (srcRunDrops >= 3) perfRun3.fetch_add(1, std::memory_order_relaxed);
+            srcRunDrops = 0;
 
             if (pic.commit) {
                 picRef.commit(planes, 2);
@@ -1192,6 +1265,13 @@ int runConnect(const CliOptions& initialOpts) {
 
         const uint64_t inUnits = perfInUnits.exchange(0, std::memory_order_relaxed);
         const uint64_t uniqCnt = perfUniqueFrames.exchange(0, std::memory_order_relaxed);
+        const uint64_t srcObs = perfSrcObserved.exchange(0, std::memory_order_relaxed);
+        const uint64_t srcDrop = perfSrcDropped.exchange(0, std::memory_order_relaxed);
+        const uint64_t run1 = perfRun1.exchange(0, std::memory_order_relaxed);
+        const uint64_t run2 = perfRun2.exchange(0, std::memory_order_relaxed);
+        const uint64_t run3 = perfRun3.exchange(0, std::memory_order_relaxed);
+        const uint64_t modeFlips = perfModeFlips.exchange(0, std::memory_order_relaxed);
+        const double dupPct = srcObs ? 100.0 * double(srcDrop) / double(srcObs) : 0.0;
         const uint64_t decCnt = perfDecodeCount.exchange(0, std::memory_order_relaxed);
         const uint64_t decUs = perfDecodeUsSum.exchange(0, std::memory_order_relaxed);
         const uint64_t decLagUsSum = perfDecLagUsSum.exchange(0, std::memory_order_relaxed);
@@ -1223,12 +1303,13 @@ int runConnect(const CliOptions& initialOpts) {
         const uint32_t inW = lastProcessedNv12 ? lastProcessedNv12->width : pipe.config().inputWidth;
         const uint32_t inH = lastProcessedNv12 ? lastProcessedNv12->height : pipe.config().inputHeight;
         const std::string summary = std::format(
-            "in={:.1f} ({:.1f}M {}x{}) uniq={:.1f} out={:.1f} fps [{}] -> {}x{}@{} | pcLat={:.2f}ms dec={:.2f}ms decLag={:.1f}/{:.1f}ms gpu={:.2f}ms(up={:.2f},flow={:.2f},fg+up={:.2f}) nvenc={:.2f}ms tcp={:.2f}/{:.2f}ms | out={:.1f} Mbps qDrop={} tcpDrop={} qMax={} rtt={:.1f}ms | quest={:.2f}/{:.2f}ms enc[s={:.2f} p={:.2f} w={:.2f} l={:.2f} c={:.2f}]",
+            "in={:.1f} ({:.1f}M {}x{}) uniq={:.1f} out={:.1f} fps [{}] -> {}x{}@{} | pcLat={:.2f}ms dec={:.2f}ms decLag={:.1f}/{:.1f}ms gpu={:.2f}ms(up={:.2f},flow={:.2f},fg+up={:.2f}) nvenc={:.2f}ms tcp={:.2f}/{:.2f}ms | out={:.1f} Mbps qDrop={} tcpDrop={} qMax={} rtt={:.1f}ms | quest={:.2f}/{:.2f}ms enc[s={:.2f} p={:.2f} w={:.2f} l={:.2f} c={:.2f}] dup={:.1f}% runs={}/{}/{} flips={}",
             inFps, xboxMbps, inW, inH, uniqFps, outFps, activeModeTag, opts.outWidth, opts.outHeight, opts.targetFps,
             pcLatMs, decMs, decLagMs, decLagMaxMs, gpuMs, upMs, flowMs, fgUpMs, nvencMs, qstats.tcpSendAvgMs, qstats.tcpSendMaxMs,
             mbps, qDrop, qstats.videoDropped, qstats.maxBacklog, rstats.rttMs,
             qstats.e2eMinMs, qstats.e2eAvgMs,
-            enc.submitMs, enc.picMs, enc.waitMs, enc.lockMs, enc.cbMs);
+            enc.submitMs, enc.picMs, enc.waitMs, enc.lockMs, enc.cbMs,
+            dupPct, run1, run2, run3, modeFlips);
         log::info("perf", summary);
         if (perfFile.is_open()) {
             perfFile << summary << '\n';
@@ -1251,8 +1332,15 @@ int runConnect(const CliOptions& initialOpts) {
 
     uint64_t consumedSeq = 0;
     auto lastKeyframeSentTime = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    const auto runDeadline = opts.runSeconds > 0
+                                 ? streamOrigin + std::chrono::seconds(opts.runSeconds)
+                                 : std::chrono::steady_clock::time_point::max();
 
-    while (!g_stopRequested.load() && !streamEnded.load()) {
+    while (!g_stopRequested.load() && !streamEnded.load() && std::chrono::steady_clock::now() < runDeadline) {
+        if (activeModeTag != previousModeTag) {
+            if (previousModeTag) perfModeFlips.fetch_add(1, std::memory_order_relaxed);
+            previousModeTag = activeModeTag;
+        }
         if (needXboxKeyframe.load(std::memory_order_relaxed)) {
             const auto now = std::chrono::steady_clock::now();
             if (now - lastKeyframeSentTime >= std::chrono::milliseconds(500)) {
@@ -1516,6 +1604,9 @@ int runConnect(const CliOptions& initialOpts) {
     }
 
     streamEnded.store(true);
+    if (opts.runSeconds > 0 && std::chrono::steady_clock::now() >= runDeadline) {
+        log::info("app", std::format("reached --run-seconds limit ({} s); stopping cleanly", opts.runSeconds));
+    }
     decodeThread.request_stop();
     videoCv.notify_all();
     if (decodeThread.joinable()) decodeThread.join();
@@ -1653,6 +1744,9 @@ int main(int argc, char** argv) {
             break;
         case CliOptions::Mode::ListConsoles:
             rc = runListConsoles();
+            break;
+        case CliOptions::Mode::StopSession:
+            rc = runStopSession(opts.stopSessionId);
             break;
         case CliOptions::Mode::Connect:
             rc = runConnect(opts);

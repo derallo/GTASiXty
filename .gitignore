@@ -2,6 +2,8 @@
 build/
 out/
 cmake-build-*/
+.gradle/
+local.properties
 
 # Downloaded / built third-party dependencies (restored by scripts/build.ps1)
 third_party/mbedtls-3.6.2/
@@ -25,6 +27,7 @@ quest-app/debug.keystore
 *.keystore
 *.jks
 *.apk
+!releases/GTA-Sixty-Quest3.apk
 *.idsig
 
 # Auth material - never commit
