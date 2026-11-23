@@ -96,7 +96,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int FLAG_GENERATED = 0x02;
     private static final int FLAG_DUPLICATE = 0x04;
 
-    private static final String[] ENHANCE_LABELS = {"Off", "RCAS", "SuperRes", "FG60", "FG60+SR", "FG90", "FG90+SR"};
+    private static final String[] ENHANCE_LABELS = {"Off", "RCAS", "SuperRes", "FG60", "FG60+SR", "FG90", "FG90+SR", "FG120", "FG120+SR"};
     private static final String[] LOOK_LABELS = {"Normal", "Vivid", "Night"};
 
     private static final int DEFAULT_TCP_PORT = 7660;
@@ -415,7 +415,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (streamWidth > 0 && streamHeight > 0) {
                 boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
                         || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR);
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
                 final int outW = sr ? Math.min(2560, Math.max(streamWidth, 2560)) : Math.min(2560, streamWidth);
                 final int outH = sr ? Math.min(1440, Math.max(streamHeight, 1440)) : Math.min(1440, streamHeight);
                 surfaceView.getHolder().setFixedSize(outW, outH);
@@ -426,6 +427,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 if (captureHzBtn != null) captureHzBtn.setText("90 Hz");
                 prefs.edit().putInt("captureRefreshHz", 90).apply();
                 applyDisplayRefreshRate(90);
+            } else if ((captureEnhanceMode == CaptureGlRenderer.MODE_FG120
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR) && captureRefreshHz != 120) {
+                captureRefreshHz = 120;
+                if (captureHzBtn != null) captureHzBtn.setText("120 Hz");
+                prefs.edit().putInt("captureRefreshHz", 120).apply();
+                applyDisplayRefreshRate(120);
             }
             setStatus("Capture GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
         });
@@ -1251,7 +1258,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Surface decodeSurf = surf;
             final boolean useSuperRes = captureMode && (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
                     || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
-                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR);
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
             final int outW = useSuperRes ? Math.min(2560, Math.max(width, 2560)) : Math.min(2560, width);
             final int outH = useSuperRes ? Math.min(1440, Math.max(height, 1440)) : Math.min(1440, height);
 

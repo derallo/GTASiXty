@@ -37,17 +37,20 @@ final class CaptureGlRenderer {
     static final int MODE_FG60_SR = 4;
     static final int MODE_FG90 = 5;
     static final int MODE_FG90_SR = 6;
+    static final int MODE_FG120 = 7;
+    static final int MODE_FG120_SR = 8;
 
     private static final long FG90_STEP_NS = 11_111_111L; // 1/90s = 11.111 ms
+    private static final long FG120_STEP_NS = 8_333_333L; // 1/120s = 8.333 ms
 
     static final int LOOK_NORMAL = 0;
     static final int LOOK_VIVID = 1;
     static final int LOOK_NIGHT = 2;
 
-    private static final int FLOW_LO_W = 80;
-    private static final int FLOW_LO_H = 45;
-    private static final int FLOW_HI_W = 320;
-    private static final int FLOW_HI_H = 180;
+    private static final int FLOW_LO_W = 160;
+    private static final int FLOW_LO_H = 90;
+    private static final int FLOW_HI_W = 640;
+    private static final int FLOW_HI_H = 360;
     private static final float RCAS_SHARPNESS = 0.10f;
 
     interface FrameListener {
@@ -112,10 +115,13 @@ final class CaptureGlRenderer {
     private int uWarpPrev = -1;
     private int uWarpCurr = -1;
     private int uWarpFlow = -1;
+    private int uWarpFlowBwd = -1;
     private int uWarpAlpha = -1;
 
-    // FG90 3x frame-generation sub-frame scheduler (owned by glThread)
-    private int fg90PendingPhase = 0; // 0=none, 1=warp(2/3), 2=real(U1)
+    // Multi-frame-generation sub-frame scheduler (FG90 3x & FG120 4x, owned by glThread)
+    private int fg90PendingPhase = 0; // 0=none, 1..fgSubFrameCount-1=warps, fgSubFrameCount=real(U1)
+    private int fgSubFrameCount = 2;  // 2 for FG90 (2/3, U1), 3 for FG120 (2/4, 3/4, U1)
+    private long fgStepNs = FG90_STEP_NS;
     private long fg90NextDueNs = 0L;
 
     private int progRcas = 0;
@@ -134,6 +140,7 @@ final class CaptureGlRenderer {
     private int texLumaLoPrev = 0, fboLumaLoPrev = 0;
     private int texLumaLoCurr = 0, fboLumaLoCurr = 0;
     private int texFlowCoarse = 0, fboFlowCoarse = 0;
+    private int texFlowBwd = 0, fboFlowBwd = 0;
     private int texFlowFine = 0, fboFlowFine = 0;
     private int texFlowSmooth = 0, fboFlowSmooth = 0;
     private int texFlowPrev = 0, fboFlowPrev = 0;
@@ -431,6 +438,7 @@ final class CaptureGlRenderer {
         uWarpPrev = GLES30.glGetUniformLocation(progWarp, "uPrevTex");
         uWarpCurr = GLES30.glGetUniformLocation(progWarp, "uCurrTex");
         uWarpFlow = GLES30.glGetUniformLocation(progWarp, "uFlowTex");
+        uWarpFlowBwd = GLES30.glGetUniformLocation(progWarp, "uFlowBwdTex");
         uWarpAlpha = GLES30.glGetUniformLocation(progWarp, "uAlpha");
 
         uRcasInput = GLES30.glGetUniformLocation(progRcas, "uInputTex");
@@ -451,6 +459,7 @@ final class CaptureGlRenderer {
         createTexFbo(FLOW_LO_W, FLOW_LO_H, pair); texLumaLoCurr = pair[0]; fboLumaLoCurr = pair[1];
 
         createTexFbo(FLOW_LO_W, FLOW_LO_H, pair); texFlowCoarse = pair[0]; fboFlowCoarse = pair[1];
+        createTexFbo(FLOW_LO_W, FLOW_LO_H, pair); texFlowBwd = pair[0]; fboFlowBwd = pair[1];
         createTexFbo(FLOW_HI_W, FLOW_HI_H, pair); texFlowFine = pair[0]; fboFlowFine = pair[1];
         createTexFbo(FLOW_HI_W, FLOW_HI_H, pair); texFlowSmooth = pair[0]; fboFlowSmooth = pair[1];
         createTexFbo(FLOW_HI_W, FLOW_HI_H, pair); texFlowPrev = pair[0]; fboFlowPrev = pair[1];
@@ -491,9 +500,11 @@ final class CaptureGlRenderer {
             return;
         }
 
-        // FG60 / FG60+SR (2x: t=0.5, 1.0) or FG90 / FG90+SR (3x: t=1/3, 2/3, 1.0)
+        // FG60/FG60+SR (2x), FG90/FG90+SR (3x), FG120/FG120+SR (4x)
+        final boolean fg120 = (mode == MODE_FG120 || mode == MODE_FG120_SR);
         final boolean fg90 = (mode == MODE_FG90 || mode == MODE_FG90_SR);
-        final boolean superRes = (mode == MODE_FG60_SR || mode == MODE_FG90_SR);
+        final boolean multiFg = fg90 || fg120;
+        final boolean superRes = (mode == MODE_FG60_SR || mode == MODE_FG90_SR || mode == MODE_FG120_SR);
         boolean generated = false;
         int displayTex = texCurr;
 
@@ -546,7 +557,19 @@ final class CaptureGlRenderer {
                 GLES30.glUniform1i(uCoarseCurr, 1);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
-                // Fine optical flow (320x180)
+                // Coarse backward optical flow (160x90, U1 -> U0 for disocclusion detection)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboFlowBwd);
+                GLES30.glViewport(0, 0, FLOW_LO_W, FLOW_LO_H);
+                GLES30.glUseProgram(progFlowCoarse);
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texLumaLoCurr);
+                GLES30.glUniform1i(uCoarsePrev, 0);
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE1);
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texLumaLoPrev);
+                GLES30.glUniform1i(uCoarseCurr, 1);
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+
+                // Fine optical flow (640x360)
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboFlowFine);
                 GLES30.glViewport(0, 0, FLOW_HI_W, FLOW_HI_H);
                 GLES30.glUseProgram(progFlowFine);
@@ -576,8 +599,8 @@ final class CaptureGlRenderer {
                 GLES30.glUniform1i(uSmoothPrevFlow, 2);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
-                // Warp Mid(U0, U1) -> fboMid (t = 0.5 for FG60, t = 1/3 for FG90)
-                final float warpAlpha = fg90 ? (1.0f / 3.0f) : 0.5f;
+                // Warp Mid(U0, U1) -> fboMid (t = 0.5 for FG60, 1/3 for FG90, 1/4 for FG120)
+                final float warpAlpha = fg120 ? 0.25f : (fg90 ? (1.0f / 3.0f) : 0.5f);
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboMid);
                 GLES30.glViewport(0, 0, width, height);
                 GLES30.glUseProgram(progWarp);
@@ -590,6 +613,9 @@ final class CaptureGlRenderer {
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE2);
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowSmooth);
                 GLES30.glUniform1i(uWarpFlow, 2);
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE3);
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowBwd);
+                GLES30.glUniform1i(uWarpFlowBwd, 3);
                 GLES30.glUniform1f(uWarpAlpha, warpAlpha);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
@@ -599,9 +625,11 @@ final class CaptureGlRenderer {
                 displayTex = texMid;
                 realFramePending = true;
                 generated = true;
-                if (fg90) {
+                if (multiFg) {
+                    fgSubFrameCount = fg120 ? 3 : 2;
+                    fgStepNs = fg120 ? FG120_STEP_NS : FG90_STEP_NS;
                     fg90PendingPhase = 1;
-                    fg90NextDueNs = System.nanoTime() + FG90_STEP_NS;
+                    fg90NextDueNs = System.nanoTime() + fgStepNs;
                 } else {
                     fg90PendingPhase = 0;
                 }
@@ -612,10 +640,10 @@ final class CaptureGlRenderer {
                 fg90PendingPhase = 0;
             }
         } else {
-            // Duplicate HDMI frame: in FG90 mode, let the 11.11ms cadence present Warp(2/3) then U1.
+            // Duplicate HDMI frame: in FG90/FG120 mode, let the sub-frame timer present the remaining frames.
             dupGateFrames = 12;
             consecDups++;
-            if (fg90 && fg90PendingPhase > 0) {
+            if (multiFg && fg90PendingPhase > 0) {
                 return;
             }
             displayTex = texCurr;
@@ -629,11 +657,13 @@ final class CaptureGlRenderer {
 
     private void renderFg90SubFrame() {
         final int mode = enhanceMode;
-        if (mode != MODE_FG90 && mode != MODE_FG90_SR) {
+        final boolean fg120 = (mode == MODE_FG120 || mode == MODE_FG120_SR);
+        final boolean fg90 = (mode == MODE_FG90 || mode == MODE_FG90_SR);
+        if (!fg90 && !fg120) {
             fg90PendingPhase = 0;
             return;
         }
-        final boolean superRes = (mode == MODE_FG90_SR);
+        final boolean superRes = (mode == MODE_FG90_SR || mode == MODE_FG120_SR);
         final int look = lookMode;
 
         EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, eglDim, 0);
@@ -643,8 +673,9 @@ final class CaptureGlRenderer {
 
         GLES30.glBindVertexArray(vaoId);
 
-        if (fg90PendingPhase == 1) {
-            // Second generated frame: Warp(U0, U1) at t = 2/3 reusing already-computed texFlowPrev
+        if (fg90PendingPhase < fgSubFrameCount) {
+            // Intermediate generated frame: Warp(U0, U1) reusing texFlowPrev + texFlowBwd
+            final float alpha = (float) (fg90PendingPhase + 1) / (float) (fgSubFrameCount + 1);
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboMid);
             GLES30.glViewport(0, 0, width, height);
             GLES30.glUseProgram(progWarp);
@@ -657,17 +688,20 @@ final class CaptureGlRenderer {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE2);
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowPrev);
             GLES30.glUniform1i(uWarpFlow, 2);
-            GLES30.glUniform1f(uWarpAlpha, 2.0f / 3.0f);
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE3);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowBwd);
+            GLES30.glUniform1i(uWarpFlowBwd, 3);
+            GLES30.glUniform1f(uWarpAlpha, alpha);
             GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
             renderRcasToScreen(texMid, surfW, surfH, superRes, look);
             EGL14.eglSwapBuffers(eglDisplay, eglSurface);
             if (listener != null) listener.onFrameRendered(true);
 
-            fg90PendingPhase = 2;
-            fg90NextDueNs += FG90_STEP_NS;
+            fg90PendingPhase++;
+            fg90NextDueNs += fgStepNs;
         } else {
-            // Third frame of the 90fps triad: real frame U1 (t = 1.0)
+            // Final frame of the triad/quad: real frame U1 (t = 1.0)
             renderRcasToScreen(texCurr, surfW, surfH, superRes, look);
             EGL14.eglSwapBuffers(eglDisplay, eglSurface);
             if (listener != null) listener.onFrameRendered(false);
@@ -781,12 +815,12 @@ final class CaptureGlRenderer {
         }
 
         int[] fbos = {fboPrev, fboCurr, fboMid, fboLumaHiPrev, fboLumaHiCurr,
-                fboLumaLoPrev, fboLumaLoCurr, fboFlowCoarse, fboFlowFine,
+                fboLumaLoPrev, fboLumaLoCurr, fboFlowCoarse, fboFlowBwd, fboFlowFine,
                 fboFlowSmooth, fboFlowPrev};
         GLES30.glDeleteFramebuffers(fbos.length, fbos, 0);
 
         int[] texs = {oesTexId, texPrev, texCurr, texMid, texLumaHiPrev, texLumaHiCurr,
-                texLumaLoPrev, texLumaLoCurr, texFlowCoarse, texFlowFine,
+                texLumaLoPrev, texLumaLoCurr, texFlowCoarse, texFlowBwd, texFlowFine,
                 texFlowSmooth, texFlowPrev};
         GLES30.glDeleteTextures(texs.length, texs, 0);
 
@@ -843,7 +877,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uHiLumaTex;\n"
             + "out vec4 fragColor;\n"
             + "void main() {\n"
-            + "  vec2 d = vec2(1.0 / 320.0, 1.0 / 180.0);\n"
+            + "  vec2 d = vec2(1.0 / 640.0, 1.0 / 360.0);\n"
             + "  float y = 0.25 * (\n"
             + "    texture(uHiLumaTex, vUv + vec2(-d.x, -d.y)).r +\n"
             + "    texture(uHiLumaTex, vUv + vec2( d.x, -d.y)).r +\n"
@@ -858,7 +892,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uPrevLumaLo;\n"
             + "uniform sampler2D uCurrLumaLo;\n"
             + "out vec4 fragColor;\n"
-            + "const vec2 STEP = vec2(1.0 / 80.0, 1.0 / 45.0);\n"
+            + "const vec2 STEP = vec2(1.0 / 160.0, 1.0 / 90.0);\n"
             + "const float MAX_UV = 0.08;\n"
             + "float patchSad(vec2 uvCurr, vec2 uvPrev) {\n"
             + "  float s = abs(texture(uCurrLumaLo, uvCurr).r - texture(uPrevLumaLo, uvPrev).r) * 2.0;\n"
@@ -872,8 +906,8 @@ final class CaptureGlRenderer {
             + "  float bestSad = patchSad(vUv, vUv);\n"
             + "  vec2 bestOff = vec2(0.0);\n"
             + "  if (bestSad > 0.008) {\n"
-            + "    for (int dy = -3; dy <= 3; dy++) {\n"
-            + "      for (int dx = -5; dx <= 5; dx++) {\n"
+            + "    for (int dy = -4; dy <= 4; dy++) {\n"
+            + "      for (int dx = -6; dx <= 6; dx++) {\n"
             + "        if (dx == 0 && dy == 0) continue;\n"
             + "        vec2 off = vec2(float(dx), float(dy)) * STEP;\n"
             + "        float penalty = 0.0012 * length(vec2(float(dx), float(dy)));\n"
@@ -893,7 +927,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uCurrLumaHi;\n"
             + "uniform sampler2D uCoarseFlow;\n"
             + "out vec4 fragColor;\n"
-            + "const vec2 STEP = vec2(1.0 / 320.0, 1.0 / 180.0);\n"
+            + "const vec2 STEP = vec2(1.0 / 640.0, 1.0 / 360.0);\n"
             + "const float MAX_UV = 0.08;\n"
             + "vec2 decodeFlow(vec2 r) { return (r - (128.0 / 255.0)) * 2.0 * MAX_UV; }\n"
             + "float patchSad(vec2 uvCurr, vec2 uvPrev) {\n"
@@ -978,7 +1012,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uCurrLuma;\n"
             + "uniform sampler2D uPrevFlowTex;\n"
             + "out vec4 fragColor;\n"
-            + "const vec2 STEP = vec2(1.0 / 320.0, 1.0 / 180.0);\n"
+            + "const vec2 STEP = vec2(1.0 / 640.0, 1.0 / 360.0);\n"
             + "const float MAX_UV = 0.08;\n"
             + "vec2 dec(vec2 r) { return (r - (128.0 / 255.0)) * 2.0 * MAX_UV; }\n"
             + "void main() {\n"
@@ -1021,6 +1055,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uPrevTex;\n"
             + "uniform sampler2D uCurrTex;\n"
             + "uniform sampler2D uFlowTex;\n"
+            + "uniform sampler2D uFlowBwdTex;\n"
             + "uniform float uAlpha;\n"
             + "out vec4 fragColor;\n"
             + "const float MAX_UV = 0.08;\n"
@@ -1054,9 +1089,12 @@ final class CaptureGlRenderer {
             + "  vec3 w1 = texture(uCurrTex, p1).rgb;\n"
             + "  float em = dot(abs(w0 - w1), vec3(0.333333));\n"
             + "  vec3 warpedMid = mix(w0, w1, uAlpha);\n"
+            + "  vec2 vBwd = decodeFlow(texture(uFlowBwdTex, p0).rg);\n"
+            + "  float fbErr = length(v + vBwd) / MAX_UV;\n"
+            + "  float fbGate = smoothstep(0.34, 0.06, fbErr);\n"
             + "  float fit = smoothstep(0.09, 0.012, em) * smoothstep(0.0, 0.022, es - em);\n"
             + "  float sadGate = smoothstep(0.38, 0.10, f.b);\n"
-            + "  float w = clamp(f.a * fit * sadGate, 0.0, 1.0);\n"
+            + "  float w = clamp(f.a * fit * sadGate * fbGate, 0.0, 1.0);\n"
             + "  fragColor = vec4(mix(c1, warpedMid, w), 1.0);\n"
             + "}\n";
 
@@ -1106,6 +1144,13 @@ final class CaptureGlRenderer {
             + "  }\n"
             + "  float nz = 0.25 * (bL + dL + fL + hL) - eL;\n"
             + "  float range = max(max(bL, dL), max(fL, max(hL, eL))) - min(min(bL, dL), min(fL, min(hL, eL)));\n"
+            + "  float debandW = smoothstep(0.024, 0.006, range) * 0.45;\n"
+            + "  if (debandW > 0.001) {\n"
+            + "    vec3 avg4 = 0.25 * (b + d + f + h);\n"
+            + "    float ig = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+            + "    e = mix(e, avg4, debandW) + (ig - 0.5) / 255.0;\n"
+            + "    eL = lum(e);\n"
+            + "  }\n"
             + "  float nzClamp = range > 1e-4 ? clamp(abs(nz) / range, 0.0, 1.0) : 0.0;\n"
             + "  float stipple = smoothstep(0.45, 0.85, nzClamp);\n"
             + "  vec3 mn = min(min(min(b, d), min(f, h)), e);\n"
