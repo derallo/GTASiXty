@@ -16,10 +16,26 @@ sock.bind(("0.0.0.0", PORT))
 print(f"[gta60-updater] listening on UDP {PORT} in {REPO_DIR}", flush=True)
 
 last_check = 0.0
+last_start = 0.0
 
 while True:
     data, addr = sock.recvfrom(256)
     msg = data.decode("ascii", errors="ignore").strip()
+    if msg == "GTA60_START":
+        now = time.monotonic()
+        if now - last_start < 5.0:
+            sock.sendto(b"GTA60_COOLDOWN", addr)
+            continue
+        last_start = now
+        try:
+            print(f"[gta60-updater] received GTA60_START from {addr[0]}, restarting gta60-capture", flush=True)
+            sock.sendto(b"GTA60_STARTING", addr)
+            subprocess.run(["sudo", "systemctl", "restart", "gta60-capture.service"], check=True, timeout=60)
+        except Exception as exc:
+            print(f"[gta60-updater] restart failed: {exc}", file=sys.stderr, flush=True)
+            sock.sendto(b"GTA60_START_ERR", addr)
+        continue
+
     if msg != "GTA60_UPDATE":
         continue
 

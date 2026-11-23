@@ -1067,14 +1067,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     if (!askedAgent) {
                         askedAgent = true;
                         if (captureMode) {
-                            Log.i(TAG, "no capture stream at " + host + "; not sending GTA60_START");
+                            Log.i(TAG, "no capture stream at " + host + "; asking MintBook updater to start/restart it");
+                            sendStartRequest(host);
                         } else {
                             Log.i(TAG, "no streamer at " + host + "; asking the PC agent to start one");
-                            sendStartRequest();
+                            sendStartRequest(null);
                         }
                     }
                     if (System.currentTimeMillis() > connectDeadline) throw ce;
-                    setStatus(captureMode ? "Waiting for the capture PC..." : "Starting the PC streamer...");
+                    setStatus(captureMode ? "Starting MintBook capture server..." : "Starting the PC streamer...");
                     Thread.sleep(1500);
                 }
             }
@@ -1674,15 +1675,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * Fire-and-forget: ask the PC agent on UDP 7662 to launch the streamer. The agent is the only
      * thing expected to be running on the PC when nothing is streaming.
      */
-    private void sendStartRequest() {
+    private void sendStartRequest(final String targetHost) {
         new Thread(() -> {
             try (DatagramSocket ds = new DatagramSocket()) {
                 ds.setBroadcast(true);
                 final byte[] cmd = "GTA60_START".getBytes(StandardCharsets.US_ASCII);
+                if (targetHost != null && !targetHost.isEmpty() && !"127.0.0.1".equals(targetHost)) {
+                    try {
+                        ds.send(new DatagramPacket(cmd, cmd.length, InetAddress.getByName(targetHost), START_UDP_PORT));
+                    } catch (Exception ignored) {}
+                }
                 for (InetAddress t : discoveryTargets()) {
                     try { ds.send(new DatagramPacket(cmd, cmd.length, t, START_UDP_PORT)); } catch (Exception ignored) {}
                 }
-                Log.i(TAG, "sent GTA60_START to the PC agent");
+                Log.i(TAG, "sent GTA60_START to " + (targetHost != null ? targetHost : "PC agent"));
             } catch (Exception e) {
                 Log.w(TAG, "could not send GTA60_START: " + e.getMessage());
             }

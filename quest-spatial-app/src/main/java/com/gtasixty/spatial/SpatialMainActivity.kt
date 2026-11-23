@@ -242,6 +242,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             R.id.main_stream_panel,
             Transform(initialPose),
             Grabbable(true, GrabbableType.PIVOT_Y),
+            IsdkPanelGrabHandle(),
             IsdkPanelResize(
                 currentSettings.curvePct == 0,
                 ResizeMode.Simple,
