@@ -487,7 +487,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         }
         val grabHandle = ent.tryGetComponent<IsdkPanelGrabHandle>()
         if (grabHandle != null) {
-            val targetColor = if (curved) Vector4(0f, 0f, 0f, 0f) else defaultGrabHandleColor
+            val targetColor = if (controllerVisualsVisible) defaultGrabHandleColor else Vector4(0f, 0f, 0f, 0f)
             if (grabHandle.color != targetColor) {
                 grabHandle.color = targetColor
                 ent.setComponent(grabHandle)
@@ -555,7 +555,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         avatarSystem.setShowControllers(visible)
         avatarSystem.setShowHands(visible)
         controllerVisualsVisible = visible
-        Log.i(TAG, "Quest controller/hand visuals visible=$visible")
+        panelEntity?.let { syncHandleComponentsForCurvature(it, appliedCurvePct > 0) }
+        Log.i(TAG, "Quest controller/hand visuals & bottom handle visible=$visible")
     }
 
     private fun applyDisplayRefreshRate(hz: Int) {

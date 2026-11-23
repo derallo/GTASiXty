@@ -700,12 +700,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         + "Tap 'Developer Options' to open Android Developer Settings -> Wireless debugging.")
                 .setPositiveButton("Developer Options", (d, w) -> {
                     try {
-                        startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                        // Bypass Horizon OS's VrShell settings relay so we land directly in Android Developer Options.
+                        Intent dev = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+                        dev.setClassName("com.android.settings",
+                                "com.android.settings.Settings$DevelopmentSettingsDashboardActivity");
+                        dev.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(dev);
                     } catch (Exception e) {
                         try {
-                            startActivity(new Intent(Settings.ACTION_SETTINGS));
-                        } catch (Exception ignored) {
-                            setStatus("Could not open Android Settings: " + e.getMessage());
+                            Intent devPkg = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+                            devPkg.setPackage("com.android.settings");
+                            devPkg.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            startActivity(devPkg);
+                        } catch (Exception e2) {
+                            try {
+                                startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+                            } catch (Exception e3) {
+                                try {
+                                    startActivity(new Intent(Settings.ACTION_SETTINGS));
+                                } catch (Exception ignored) {
+                                    setStatus("Could not open Android Settings: " + e.getMessage());
+                                }
+                            }
                         }
                     }
                 })
