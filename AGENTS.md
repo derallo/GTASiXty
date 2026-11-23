@@ -17,7 +17,11 @@ Streams Xbox gameplay to Meta Quest 3 at up to 1440p60/120fps over LAN using the
    - In **Capture** mode: connects to TCP 7660, decodes H.264/HEVC, plays 48 kHz PCM, never sends `GTA60_START` or gamepad frames, and can broadcast `GTA60_UPDATE` on UDP 7662 to trigger an update check on the Ubuntu capture box.
    - Build/install: `scripts\build-quest-apk.ps1`, `scripts\install-quest-apk.ps1`.
 
-3. **Linux Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
+3. **Quest 3 Spatial Client (`quest-spatial-app/`)**
+   - Side-by-side Meta Spatial SDK `0.15.0` Passthrough MR app (`com.gtasixty.spatial`, `GTA-Sixty Spatial`) hosting `MainActivity` inside a locked `16:9` `2560x1440 @ 256 dpi` (`mips = 1`) OpenXR layer with **Curve**, **Tilt**, **Height**, **Screen Size**, **Room Depth**, **Backdrop**, and **Recenter** controls (see [SPATIAL_APP_PLAN.md](SPATIAL_APP_PLAN.md)).
+   - Build/install: `scripts\build-quest-spatial-apk.ps1`, `scripts\install-quest-spatial-apk.ps1`.
+
+4. **Linux Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
    - Standalone CMake C++20 app for the dedicated Linux Mint / Ubuntu capture PC (no Windows/D3D12/WebRTC deps).
    - Grabs uncompressed UVC frames via V4L2 (2–3 buffer queue) + UAC audio via ALSA, encodes with VA-API (`hevc_vaapi` / `h264_vaapi`) via FFmpeg `libavcodec`, and serves GT60 on TCP 7660 / UDP 7661.
 

@@ -3,6 +3,7 @@ build/
 out/
 cmake-build-*/
 .gradle/
+.kotlin/
 local.properties
 
 # Downloaded / built third-party dependencies (restored by scripts/build.ps1)

@@ -34,7 +34,7 @@ struct Options {
     gta60_linux::VideoCodec codec = gta60_linux::VideoCodec::HEVC;
     uint16_t tcpPort = 7660;
     uint16_t udpPort = 7661;
-    double dupThreshold = 0.75;
+    double dupThreshold = 0.25;
     bool tagDuplicates = true;
     bool selfTest = false;
 };
@@ -210,7 +210,7 @@ bool parseArgs(int argc, char** argv, Options& opt) {
                         "  --bitrate <mbps>        CBR bitrate in Mbps (default 80)\n"
                         "  --codec <hevc|h264>     Codec (default hevc)\n"
                         "  --port <tcp>            GT60 TCP port (default 7660)\n"
-                        "  --dup-threshold <mad>   Luma MAD threshold for duplicate flag (default 0.75)\n"
+                        "  --dup-threshold <mad>   Luma MAD threshold for duplicate flag (default 0.25)\n"
                         "  --no-dup-flag           Log duplicate stats without setting GT60 bit2 flag\n"
                         "  --selftest              Run VA-API (+ V4L2 if present) self-test and exit\n");
             std::exit(0);
