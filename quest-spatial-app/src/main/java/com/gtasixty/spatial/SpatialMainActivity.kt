@@ -15,8 +15,10 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import com.meta.spatial.core.Entity
 import com.meta.spatial.core.Lut
+import com.meta.spatial.core.PerformanceLevel
 import com.meta.spatial.core.Pose
 import com.meta.spatial.core.Quaternion
+import com.meta.spatial.core.Query
 import com.meta.spatial.core.SpatialFeature
 import com.meta.spatial.core.Vector2
 import com.meta.spatial.core.Vector3
@@ -34,6 +36,8 @@ import com.meta.spatial.runtime.PanelShapeLayerBlendType
 import com.meta.spatial.runtime.SceneObject
 import com.meta.spatial.toolkit.ActivityPanelRegistration
 import com.meta.spatial.toolkit.AppSystemActivity
+import com.meta.spatial.toolkit.AvatarSystem
+import com.meta.spatial.toolkit.Controller
 import com.meta.spatial.toolkit.CylinderShapeOptions
 import com.meta.spatial.toolkit.DpDisplayOptions
 import com.meta.spatial.toolkit.Grabbable
@@ -73,6 +77,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         private const val PANEL_DP_H = 900f
         private const val PANEL_DPI = 256
         private const val MIN_RESHAPE_INTERVAL_MS = 45L
+        private const val CONTROLLER_HIDE_IDLE_MS = 5000L
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -97,6 +102,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     private var wasCornerResizing = false
     private var wasGrabbing = false
     private var lastViewerPos: Vector3? = null
+    private var lastControllerActivityMs = 0L
+    private var controllerVisualsVisible = true
 
     private val reshapeRunnable = Runnable {
         reshapeScheduled = false
@@ -186,6 +193,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     override fun onResume() {
         super.onResume()
         if (sceneReady) {
+            applyPerformanceBoost()
             needsInitialRecenter = true
             initialRecenterDeadlineMs = SystemClock.uptimeMillis() + 600L
             Log.i(TAG, "onResume: scheduled panel recenter")
@@ -195,6 +203,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     override fun onVRReady() {
         super.onVRReady()
         if (sceneReady) {
+            applyPerformanceBoost()
             needsInitialRecenter = true
             initialRecenterDeadlineMs = SystemClock.uptimeMillis() + 600L
             Log.i(TAG, "onVRReady: scheduled panel recenter")
@@ -205,8 +214,10 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         super.onSceneReady()
         sceneReady = true
 
+        applyPerformanceBoost()
         applyDisplayRefreshRate(SpatialDisplayBridge.getRequestedRefreshHz())
         applyBackdrop(currentSettings.backdropMode)
+        lastControllerActivityMs = SystemClock.uptimeMillis()
 
         val minH = SpatialDisplayBridge.MIN_WIDTH_M / SpatialDisplayBridge.ASPECT_RATIO
         val maxH = SpatialDisplayBridge.MAX_WIDTH_M / SpatialDisplayBridge.ASPECT_RATIO
@@ -325,6 +336,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
                 applyCurrentPose(ent)
             }
         }
+
+        updateControllerVisibility()
     }
 
     override fun onDisplaySettingsChanged(settings: SpatialDisplayBridge.DisplaySettings) {
@@ -503,6 +516,46 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             }
         }
         Log.i(TAG, "Backdrop applied: ${currentSettings.backdropLabel()} (mode=$mode)")
+    }
+
+    @OptIn(com.meta.spatial.core.SpatialSDKExperimentalAPI::class)
+    private fun applyPerformanceBoost() {
+        try {
+            val ok = spatial.setPerformanceLevel(PerformanceLevel.SUSTAINED_HIGH)
+            Log.i(TAG, "Requested Spatial PerformanceLevel.SUSTAINED_HIGH (ok=$ok)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "setPerformanceLevel(SUSTAINED_HIGH) failed: ${t.message}")
+        }
+    }
+
+    private fun updateControllerVisibility() {
+        val now = SystemClock.uptimeMillis()
+        var controllerActive = wasGrabbing || wasCornerResizing
+        if (!controllerActive) {
+            for (entity in Query.where { has(Controller.id) }.eval()) {
+                val c = entity.tryGetComponent<Controller>() ?: continue
+                if (c.buttonState != 0 || c.changedButtons != 0) {
+                    controllerActive = true
+                    break
+                }
+            }
+        }
+        if (controllerActive) {
+            lastControllerActivityMs = now
+            if (!controllerVisualsVisible) {
+                setControllerVisualsVisible(true)
+            }
+        } else if (controllerVisualsVisible && (now - lastControllerActivityMs) >= CONTROLLER_HIDE_IDLE_MS) {
+            setControllerVisualsVisible(false)
+        }
+    }
+
+    private fun setControllerVisualsVisible(visible: Boolean) {
+        val avatarSystem = systemManager.tryFindSystem<AvatarSystem>() ?: return
+        avatarSystem.setShowControllers(visible)
+        avatarSystem.setShowHands(visible)
+        controllerVisualsVisible = visible
+        Log.i(TAG, "Quest controller/hand visuals visible=$visible")
     }
 
     private fun applyDisplayRefreshRate(hz: Int) {

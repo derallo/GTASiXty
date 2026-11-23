@@ -10,8 +10,8 @@ android {
         applicationId = "com.gtasixty.spatial"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0-spatial"
+        versionCode = 2
+        versionName = "2.0"
 
         ndk {
             abiFilters += "arm64-v8a"

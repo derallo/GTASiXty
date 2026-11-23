@@ -48,7 +48,7 @@ public final class ApkFileProvider extends ContentProvider {
         final MatrixCursor c = new MatrixCursor(cols, 1);
         final Object[] row = new Object[cols.length];
         for (int i = 0; i < cols.length; i++) {
-            if (OpenableColumns.DISPLAY_NAME.equals(cols[i])) row[i] = "GTA-Sixty-Spatial-Quest3.apk";
+            if (OpenableColumns.DISPLAY_NAME.equals(cols[i])) row[i] = "GTA-Sixty-Quest3.apk";
             else if (OpenableColumns.SIZE.equals(cols[i])) row[i] = f.length();
         }
         c.addRow(row);

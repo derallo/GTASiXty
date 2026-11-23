@@ -269,7 +269,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         row1.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("GTA-Sixty Spatial");
+        title.setText("GTA-Sixty");
         title.setTextColor(Color.parseColor("#22C55E"));
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);

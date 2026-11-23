@@ -113,7 +113,7 @@ final class AppUpdater {
                         showUpdateDialog(remoteName, remoteCode, apkUrl, notes, localName);
                     } else if (userInitiated) {
                         new AlertDialog.Builder(activity)
-                                .setTitle("GTA-Sixty Spatial is up to date")
+                                .setTitle("GTA-Sixty is up to date")
                                 .setMessage("Installed version: v" + localName + " (build " + localCode + ")\n"
                                         + "Latest on GitHub: v" + remoteName + " (build " + remoteCode + ")")
                                 .setPositiveButton("OK", null)
@@ -136,7 +136,7 @@ final class AppUpdater {
     private void showUpdateDialog(String remoteName, long remoteCode, String apkUrl,
                                   String notes, String localName) {
         final StringBuilder msg = new StringBuilder();
-        msg.append("A new version of GTA-Sixty Spatial is available on GitHub.\n\n")
+        msg.append("A new version of GTA-Sixty is available on GitHub.\n\n")
            .append("Installed: v").append(localName).append("\n")
            .append("Available: v").append(remoteName).append(" (build ").append(remoteCode).append(")");
         if (!notes.isEmpty()) {
@@ -177,7 +177,7 @@ final class AppUpdater {
                 && !activity.getPackageManager().canRequestPackageInstalls()) {
             new AlertDialog.Builder(activity)
                     .setTitle("Allow App Installs")
-                    .setMessage("Android needs permission for GTA-Sixty Spatial to install updates. "
+                    .setMessage("Android needs permission for GTA-Sixty to install updates. "
                             + "Enable \"Allow from this source\" in Settings, then tap Update again.")
                     .setPositiveButton("Open Settings", (d, w) -> {
                         final Intent perm = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
