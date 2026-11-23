@@ -35,6 +35,10 @@ final class CaptureGlRenderer {
     static final int MODE_SUPERRES = 2;
     static final int MODE_FG60 = 3;
     static final int MODE_FG60_SR = 4;
+    static final int MODE_FG90 = 5;
+    static final int MODE_FG90_SR = 6;
+
+    private static final long FG90_STEP_NS = 11_111_111L; // 1/90s = 11.111 ms
 
     static final int LOOK_NORMAL = 0;
     static final int LOOK_VIVID = 1;
@@ -108,6 +112,11 @@ final class CaptureGlRenderer {
     private int uWarpPrev = -1;
     private int uWarpCurr = -1;
     private int uWarpFlow = -1;
+    private int uWarpAlpha = -1;
+
+    // FG90 3x frame-generation sub-frame scheduler (owned by glThread)
+    private int fg90PendingPhase = 0; // 0=none, 1=warp(2/3), 2=real(U1)
+    private long fg90NextDueNs = 0L;
 
     private int progRcas = 0;
     private int uRcasInput = -1;
@@ -215,15 +224,31 @@ final class CaptureGlRenderer {
                 width, height, enhanceMode, lookMode));
 
         while (running) {
-            boolean isDup;
+            boolean isDup = false;
+            boolean runSubFrame = false;
             synchronized (frameLock) {
                 while (running && (availableFrames <= 0 || dupQueue.isEmpty())) {
-                    try {
-                        frameLock.wait(250);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        running = false;
-                        break;
+                    if (fg90PendingPhase > 0) {
+                        long remNs = fg90NextDueNs - System.nanoTime();
+                        if (remNs <= 0L) {
+                            runSubFrame = true;
+                            break;
+                        }
+                        try {
+                            frameLock.wait(remNs / 1_000_000L, (int) (remNs % 1_000_000L));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            running = false;
+                            break;
+                        }
+                    } else {
+                        try {
+                            frameLock.wait(250);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            running = false;
+                            break;
+                        }
                     }
                 }
                 if (!running) break;
@@ -233,9 +258,22 @@ final class CaptureGlRenderer {
                     consecDups = 0;
                     dupGateFrames = 0;
                     realFramePending = false;
+                    fg90PendingPhase = 0;
                 }
-                availableFrames--;
-                isDup = dupQueue.pollFirst();
+                if (!runSubFrame) {
+                    availableFrames--;
+                    isDup = dupQueue.pollFirst();
+                }
+            }
+
+            if (runSubFrame) {
+                try {
+                    renderFg90SubFrame();
+                } catch (Exception e) {
+                    Log.w(TAG, "renderFg90SubFrame error", e);
+                    fg90PendingPhase = 0;
+                }
+                continue;
             }
 
             try {
@@ -393,6 +431,7 @@ final class CaptureGlRenderer {
         uWarpPrev = GLES30.glGetUniformLocation(progWarp, "uPrevTex");
         uWarpCurr = GLES30.glGetUniformLocation(progWarp, "uCurrTex");
         uWarpFlow = GLES30.glGetUniformLocation(progWarp, "uFlowTex");
+        uWarpAlpha = GLES30.glGetUniformLocation(progWarp, "uAlpha");
 
         uRcasInput = GLES30.glGetUniformLocation(progRcas, "uInputTex");
         uRcasTexelSize = GLES30.glGetUniformLocation(progRcas, "uTexelSize");
@@ -452,8 +491,9 @@ final class CaptureGlRenderer {
             return;
         }
 
-        // FG60 or FG60+SR (strict monotonic presentation: Mid(U0, U1) on unique arrival, U1 on duplicate slot)
-        final boolean superRes = (mode == MODE_FG60_SR);
+        // FG60 / FG60+SR (2x: t=0.5, 1.0) or FG90 / FG90+SR (3x: t=1/3, 2/3, 1.0)
+        final boolean fg90 = (mode == MODE_FG90 || mode == MODE_FG90_SR);
+        final boolean superRes = (mode == MODE_FG60_SR || mode == MODE_FG90_SR);
         boolean generated = false;
         int displayTex = texCurr;
 
@@ -536,7 +576,8 @@ final class CaptureGlRenderer {
                 GLES30.glUniform1i(uSmoothPrevFlow, 2);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
-                // Midpoint warp Mid(U0, U1) -> fboMid (t = 0.5)
+                // Warp Mid(U0, U1) -> fboMid (t = 0.5 for FG60, t = 1/3 for FG90)
+                final float warpAlpha = fg90 ? (1.0f / 3.0f) : 0.5f;
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboMid);
                 GLES30.glViewport(0, 0, width, height);
                 GLES30.glUseProgram(progWarp);
@@ -549,6 +590,7 @@ final class CaptureGlRenderer {
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE2);
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowSmooth);
                 GLES30.glUniform1i(uWarpFlow, 2);
+                GLES30.glUniform1f(uWarpAlpha, warpAlpha);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
                 tmpT = texFlowPrev; texFlowPrev = texFlowSmooth; texFlowSmooth = tmpT;
@@ -557,15 +599,25 @@ final class CaptureGlRenderer {
                 displayTex = texMid;
                 realFramePending = true;
                 generated = true;
+                if (fg90) {
+                    fg90PendingPhase = 1;
+                    fg90NextDueNs = System.nanoTime() + FG90_STEP_NS;
+                } else {
+                    fg90PendingPhase = 0;
+                }
             } else {
                 if (dupGateFrames > 0) dupGateFrames--;
                 displayTex = texCurr;
                 realFramePending = false;
+                fg90PendingPhase = 0;
             }
         } else {
-            // Duplicate HDMI frame: present the pending real frame U1 (t = 1.0) or hold U1 cleanly
+            // Duplicate HDMI frame: in FG90 mode, let the 11.11ms cadence present Warp(2/3) then U1.
             dupGateFrames = 12;
             consecDups++;
+            if (fg90 && fg90PendingPhase > 0) {
+                return;
+            }
             displayTex = texCurr;
             realFramePending = false;
         }
@@ -573,6 +625,56 @@ final class CaptureGlRenderer {
         renderRcasToScreen(displayTex, surfW, surfH, superRes, look);
         EGL14.eglSwapBuffers(eglDisplay, eglSurface);
         if (listener != null) listener.onFrameRendered(generated);
+    }
+
+    private void renderFg90SubFrame() {
+        final int mode = enhanceMode;
+        if (mode != MODE_FG90 && mode != MODE_FG90_SR) {
+            fg90PendingPhase = 0;
+            return;
+        }
+        final boolean superRes = (mode == MODE_FG90_SR);
+        final int look = lookMode;
+
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, eglDim, 0);
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, eglDim, 1);
+        final int surfW = eglDim[0] > 0 ? eglDim[0] : width;
+        final int surfH = eglDim[1] > 0 ? eglDim[1] : height;
+
+        GLES30.glBindVertexArray(vaoId);
+
+        if (fg90PendingPhase == 1) {
+            // Second generated frame: Warp(U0, U1) at t = 2/3 reusing already-computed texFlowPrev
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboMid);
+            GLES30.glViewport(0, 0, width, height);
+            GLES30.glUseProgram(progWarp);
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texPrev);
+            GLES30.glUniform1i(uWarpPrev, 0);
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE1);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texCurr);
+            GLES30.glUniform1i(uWarpCurr, 1);
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE2);
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texFlowPrev);
+            GLES30.glUniform1i(uWarpFlow, 2);
+            GLES30.glUniform1f(uWarpAlpha, 2.0f / 3.0f);
+            GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+
+            renderRcasToScreen(texMid, surfW, surfH, superRes, look);
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface);
+            if (listener != null) listener.onFrameRendered(true);
+
+            fg90PendingPhase = 2;
+            fg90NextDueNs += FG90_STEP_NS;
+        } else {
+            // Third frame of the 90fps triad: real frame U1 (t = 1.0)
+            renderRcasToScreen(texCurr, surfW, surfH, superRes, look);
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface);
+            if (listener != null) listener.onFrameRendered(false);
+
+            fg90PendingPhase = 0;
+            realFramePending = false;
+        }
     }
 
     private void copyOesToFbo(int targetFbo) {
@@ -919,6 +1021,7 @@ final class CaptureGlRenderer {
             + "uniform sampler2D uPrevTex;\n"
             + "uniform sampler2D uCurrTex;\n"
             + "uniform sampler2D uFlowTex;\n"
+            + "uniform float uAlpha;\n"
             + "out vec4 fragColor;\n"
             + "const float MAX_UV = 0.08;\n"
             + "vec2 decodeFlow(vec2 raw) {\n"
@@ -945,12 +1048,12 @@ final class CaptureGlRenderer {
             + "    fragColor = vec4(c1, 1.0);\n"
             + "    return;\n"
             + "  }\n"
-            + "  vec2 p0 = clamp(vUv + 0.5 * v, vec2(0.001), vec2(0.999));\n"
-            + "  vec2 p1 = clamp(vUv - 0.5 * v, vec2(0.001), vec2(0.999));\n"
+            + "  vec2 p0 = clamp(vUv + uAlpha * v, vec2(0.001), vec2(0.999));\n"
+            + "  vec2 p1 = clamp(vUv - (1.0 - uAlpha) * v, vec2(0.001), vec2(0.999));\n"
             + "  vec3 w0 = texture(uPrevTex, p0).rgb;\n"
             + "  vec3 w1 = texture(uCurrTex, p1).rgb;\n"
             + "  float em = dot(abs(w0 - w1), vec3(0.333333));\n"
-            + "  vec3 warpedMid = mix(w0, w1, 0.5);\n"
+            + "  vec3 warpedMid = mix(w0, w1, uAlpha);\n"
             + "  float fit = smoothstep(0.09, 0.012, em) * smoothstep(0.0, 0.022, es - em);\n"
             + "  float sadGate = smoothstep(0.38, 0.10, f.b);\n"
             + "  float w = clamp(f.a * fit * sadGate, 0.0, 1.0);\n"
