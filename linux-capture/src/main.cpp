@@ -34,7 +34,7 @@ struct Options {
     gta60_linux::VideoCodec codec = gta60_linux::VideoCodec::HEVC;
     uint16_t tcpPort = 7660;
     uint16_t udpPort = 7661;
-    double dupThreshold = 0.25;
+    double dupThreshold = 0.05;
     bool tagDuplicates = true;
     bool selfTest = false;
 };
@@ -210,7 +210,7 @@ bool parseArgs(int argc, char** argv, Options& opt) {
                         "  --bitrate <mbps>        CBR bitrate in Mbps (default 80)\n"
                         "  --codec <hevc|h264>     Codec (default hevc)\n"
                         "  --port <tcp>            GT60 TCP port (default 7660)\n"
-                        "  --dup-threshold <mad>   Luma MAD threshold for duplicate flag (default 0.25)\n"
+                        "  --dup-threshold <mad>   Luma MAD threshold for duplicate flag (default 0.05)\n"
                         "  --no-dup-flag           Log duplicate stats without setting GT60 bit2 flag\n"
                         "  --selftest              Run VA-API (+ V4L2 if present) self-test and exit\n");
             std::exit(0);
@@ -364,9 +364,13 @@ int main(int argc, char** argv) {
             const bool isDup = dupDet.observe(cf, opt.dupThreshold);
             dupDet.maybeLog(server.droppedVideoFrames());
 
+            // Never tag consecutive duplicates (dupConsec >= 2) with kFlagDuplicate:
+            // 30fps cadence always has dupConsec == 1, whereas static scenes/menus have
+            // dupConsec >= 2 and tagging them all would freeze Quest FG60 presentation.
+            const bool tagDup = isDup && opt.tagDuplicates && (dupDet.dupConsec == 1);
+
             auto onEncoded = [&](const uint8_t* data, size_t size, bool isIdr) {
-                server.sendVideoAccessUnit(data, size, cf.timestampMs, isIdr,
-                                           isDup && opt.tagDuplicates);
+                server.sendVideoAccessUnit(data, size, cf.timestampMs, isIdr, tagDup);
             };
 
             if (cf.format == gta60_linux::CapturePixelFormat::NV12) {
