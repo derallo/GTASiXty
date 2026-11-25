@@ -108,8 +108,7 @@ reinstalled** for HEVC: an older APK does not understand the current `VIDEO_CONF
 
 ## Headset app
 
-Build output is `build\GTA-Sixty-Quest3.apk`. The Android package stays `com.gtasixty.quest` because a
-Java package segment cannot contain the hyphen.
+Build output is `build\GTA-Sixty-Quest3.apk` (Meta Spatial SDK Passthrough MR app, `GTA-Sixty`). The Android package ID stays `com.gtasixty.spatial` so existing headset settings and Xbox tokens are preserved across upgrades, and `scripts\install-quest-apk.ps1` automatically removes any older `com.gtasixty.quest` install.
 
 ```powershell
 scripts\install-quest-apk.ps1 -Launch
@@ -117,8 +116,7 @@ scripts\install-quest-apk.ps1 -Launch
 
 Wireless ADB works too: `adb connect <quest-ip>:5555`.
 
-Buttons: **Start Stream**, **Refresh** (force an IDR), **Hide HUD**, **Wake PC**, and the
-resolution / frame-rate / bitrate selectors.
+Buttons: **Start Stream** / **Start USB**, **Refresh** (force an IDR), **Hide HUD**, **Display** (Curve, Tilt, Height, Screen Size, Room Depth, Backdrop), **Recenter**, **Wi-Fi ADB**, **Wake PC** / **Check Update**, **Net Check** (LAN/TCP/USB/Xbox diagnostics), and the resolution / frame-rate / bitrate / GPU / Look selectors. Grab the bottom handle bar with **Trigger** or **Grip/Pinch** to move the screen (push thumbstick up/down while holding Trigger to adjust depth).
 
 **Mode: PC / Direct** switches transports. Direct mode signs in to the Microsoft account on the
 headset, lists your consoles, and streams straight from the console (in the same app, behind the

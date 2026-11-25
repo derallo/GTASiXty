@@ -12,17 +12,12 @@ Streams Xbox gameplay to Meta Quest 3 at up to 1440p60/120fps over LAN using the
    - Build: `scripts\build.ps1` -> `build\GTA-Sixty.exe`.
    - Unit tests: `tests\PipelineAndXboxTests.cpp`, `scripts\bench-selftest.ps1`.
 
-2. **Quest 3 Spatial Client (`quest-spatial-app/`) — Primary Quest APK**
-   - Meta Spatial SDK `0.15.0` Passthrough MR app (`com.gtasixty.spatial`, `GTA-Sixty Spatial`) hosting `MainActivity` inside a locked `16:9` `2560x1440 @ 256 dpi` (`mips = 1`) OpenXR layer with **Curve**, **Tilt**, **Height**, **Screen Size**, **Room Depth**, **Backdrop**, and **Recenter** controls (see [SPATIAL_APP_PLAN.md](SPATIAL_APP_PLAN.md)).
-   - Receives all ongoing Quest client fixes and post-processing/FG60 enhancements (starting with dither-aware RCAS & foliage-safe FG60 warp).
-   - Build/install: `scripts\build-quest-spatial-apk.ps1`, `scripts\install-quest-spatial-apk.ps1`.
+2. **Quest 3 Client (`quest-spatial-app/`) — Main `GTA-Sixty` APK (`com.gtasixty.spatial`)**
+   - Meta Spatial SDK `0.15.0` Passthrough MR app (`com.gtasixty.spatial`, `GTA-Sixty`) hosting `MainActivity` inside a locked `16:9` `2560x1440 @ 256 dpi` (`mips = 1`) OpenXR layer with **Curve**, **Tilt**, **Height**, **Screen Size**, **Room Depth**, **Backdrop**, **Recenter**, bottom window drag handle (**Trigger** or **Grip/Pinch**), and built-in **Net Check** diagnostics (see [SPATIAL_APP_PLAN.md](SPATIAL_APP_PLAN.md)).
+   - Supports Capture (LAN or direct Quest USB-C UVC), Direct (Quest <-> Xbox WebRTC), and PC relay modes, plus dither-aware RCAS, foliage-safe FG60/FG90/FG120 warp, and `SUSTAINED_HIGH` GPU boost.
+   - Build/install: `scripts\build-quest-apk.ps1`, `scripts\install-quest-apk.ps1` (auto-removes any legacy `com.gtasixty.quest` install while preserving `com.gtasixty.spatial` settings).
 
-3. **Quest 3 Flat Client (`quest-app/`) — Legacy / Frozen at v1.4 (`4ee73e0`)**
-   - Original flat Android/MediaCodec app with 3 modes cycling **PC -> Direct -> Capture**.
-   - **Frozen**: No longer receives new features or fixes after `v1.4` (commit `4ee73e0`, prior to the dither-aware RCAS & foliage-safe FG60 warp enhancements). Use `quest-spatial-app/` for all new Quest work.
-   - Build/install: `scripts\build-quest-apk.ps1`, `scripts\install-quest-apk.ps1`.
-
-4. **Linux Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
+3. **Linux Capture-Card Passthrough (`linux-capture/`, `scripts/linux/`)**
    - Standalone CMake C++20 app for the dedicated Linux Mint / Ubuntu capture PC (no Windows/D3D12/WebRTC deps).
    - Grabs uncompressed UVC frames via V4L2 (2–3 buffer queue) + UAC audio via ALSA, encodes with VA-API (`hevc_vaapi` / `h264_vaapi`) via FFmpeg `libavcodec`, and serves GT60 on TCP 7660 / UDP 7661.
 

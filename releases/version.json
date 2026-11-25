@@ -1,6 +1,6 @@
 {
-  "versionCode": 5,
-  "versionName": "1.4",
-  "apkUrl": "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/GTA-Sixty-Quest3.apk",
-  "notes": "Capture mode default (192.168.68.90), on-Quest GPU EASU SuperRes + RCAS + optical-flow FG60 for Capture mode, monotonic FG60 frame ordering, HDMI audio auto-reopen, GTA60_UPDATE trigger, and cleaner mode-specific HUD."
+  "versionCode": 6,
+  "versionName": "2.1",
+  "apkUrl": "",
+  "notes": "Promoted Spatial app to main GTA-Sixty (com.gtasixty.spatial), fixed bottom window drag handle (Trigger + Grip/Pinch + thumbstick depth), added built-in Network & Device Check diagnostics, and added direct USB-C UVC capture."
 }

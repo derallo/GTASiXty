@@ -1,4 +1,4 @@
-// Protocol-level test for quest-app/src/main/assets/direct/direct.js.
+// Protocol-level test for quest-spatial-app/src/main/assets/direct/direct.js.
 //
 // No WebRTC is involved: a mock RTCPeerConnection records what the page does, so the parts that
 // are easy to get silently wrong can be checked on a desktop - SDP candidate stripping, the
@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const SCRIPT = path.join(__dirname, '..', 'quest-app', 'src', 'main', 'assets', 'direct', 'direct.js');
+const SCRIPT = path.join(__dirname, '..', 'quest-spatial-app', 'src', 'main', 'assets', 'direct', 'direct.js');
 const code = fs.readFileSync(SCRIPT, 'utf8');
 
 let failures = 0;

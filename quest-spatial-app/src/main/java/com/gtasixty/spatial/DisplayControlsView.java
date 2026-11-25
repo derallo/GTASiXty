@@ -103,7 +103,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         final TextView title = new TextView(getContext());
-        title.setText("Spatial Display (16:9 Locked)");
+        title.setText("Display Settings (16:9 Locked)");
         title.setTextColor(Color.parseColor("#22D3EE"));
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
@@ -256,8 +256,8 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
 
         final TextView noteBox = new TextView(getContext());
         noteBox.setText("Tip: Tilt downward/upward and adjust Height for reclined or couch play.\n"
-                + "When flat (0%), drag corners to resize 16:9. Grab any edge to move.\n"
-                + "Redrew Quest boundary? Tap Recenter to snap the screen back in front of you.");
+                + "Grab the bottom handle bar with Trigger or Grip/Pinch to move (thumbstick adjusts depth).\n"
+                + "When flat (0%), drag corners to resize 16:9. Tap Recenter if you redraw your boundary.");
         noteBox.setTextColor(Color.parseColor("#94A3B8"));
         noteBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         final LinearLayout.LayoutParams noteLp = new LinearLayout.LayoutParams(

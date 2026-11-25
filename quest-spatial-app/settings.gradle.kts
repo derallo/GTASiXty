@@ -14,4 +14,4 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "GTA-Sixty-Spatial-Quest3"
+rootProject.name = "GTA-Sixty-Quest3"

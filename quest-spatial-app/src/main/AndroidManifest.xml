@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="horizonos.permission.USB_CAMERA" />
     <!-- Normal permission: lets us clear background apps so they stop competing for the
          compositor/GPU/decoder while streaming. It cannot kill foreground apps. -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
@@ -19,6 +22,12 @@
         android:version="1" />
     <uses-feature
         android:name="com.oculus.feature.PASSTHROUGH"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.external"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.usb.host"
         android:required="false" />
 
     <application

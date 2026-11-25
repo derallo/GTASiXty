@@ -51,6 +51,8 @@ final class CaptureGlRenderer {
     private static final int FLOW_LO_H = 90;
     private static final int FLOW_HI_W = 640;
     private static final int FLOW_HI_H = 360;
+    private static final int TINY_W = 32;
+    private static final int TINY_H = 18;
     private static final float RCAS_SHARPNESS = 0.10f;
 
     interface FrameListener {
@@ -60,6 +62,8 @@ final class CaptureGlRenderer {
     private final Surface outputSurface;
     private final int width;
     private final int height;
+    private final boolean autoDetectDuplicates;
+    private final boolean yuy2Input;
     private final FrameListener listener;
 
     private volatile int enhanceMode;
@@ -86,10 +90,15 @@ final class CaptureGlRenderer {
     private int vaoId = 0;
     private int vboId = 0;
     private int oesTexId = 0;
+    private int texYuy2 = 0;
 
     private int progOesCopy = 0;
     private int uOesCopyTex = -1;
     private int uOesCopyStMatrix = -1;
+
+    private int progYuy2Copy = 0;
+    private int uYuy2Tex = -1;
+    private int uYuy2Width = -1;
 
     private int progLuma = 0;
     private int uLumaTex = -1;
@@ -144,6 +153,23 @@ final class CaptureGlRenderer {
     private int texFlowFine = 0, fboFlowFine = 0;
     private int texFlowSmooth = 0, fboFlowSmooth = 0;
     private int texFlowPrev = 0, fboFlowPrev = 0;
+    private int texLumaTiny = 0, fboLumaTiny = 0;
+
+    private ByteBuffer tinyCurrBuf;
+    private byte[] tinyCurrBytes;
+    private byte[] tinyPrevBytes;
+    private ByteBuffer yuy2UploadBuf;
+    private byte[] yuy2FrontBuf;
+    private byte[] yuy2BackBuf;
+    private byte[] yuy2PrevSample;
+    private boolean yuy2FrameReady = false;
+    private boolean yuy2PendingDup = false;
+    private boolean hasTinyPrev = false;
+    private boolean lastAutoDup = false;
+    private int autoDupInCount = 0;
+    private int autoDupTagCount = 0;
+    private double autoDupMadSum = 0.0;
+    private long autoDupLastLogMs = 0L;
 
     private int uniqueCount = 0;
     private int consecDups = 0;
@@ -154,11 +180,25 @@ final class CaptureGlRenderer {
 
     CaptureGlRenderer(Surface outputSurface, int width, int height,
                       int enhanceMode, int lookMode, FrameListener listener) {
+        this(outputSurface, width, height, enhanceMode, lookMode, false, false, listener);
+    }
+
+    CaptureGlRenderer(Surface outputSurface, int width, int height,
+                      int enhanceMode, int lookMode, boolean autoDetectDuplicates,
+                      FrameListener listener) {
+        this(outputSurface, width, height, enhanceMode, lookMode, autoDetectDuplicates, false, listener);
+    }
+
+    CaptureGlRenderer(Surface outputSurface, int width, int height,
+                      int enhanceMode, int lookMode, boolean autoDetectDuplicates,
+                      boolean yuy2Input, FrameListener listener) {
         this.outputSurface = outputSurface;
         this.width = width;
         this.height = height;
         this.enhanceMode = enhanceMode;
         this.lookMode = lookMode;
+        this.autoDetectDuplicates = autoDetectDuplicates;
+        this.yuy2Input = yuy2Input;
         this.listener = listener;
         start();
     }
@@ -168,13 +208,72 @@ final class CaptureGlRenderer {
         glThread.start();
     }
 
-    Surface getDecoderSurface() {
+    boolean awaitReady() {
         try {
             readyLatch.await(3000, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        return initSuccess ? decoderSurface : null;
+        return initSuccess;
+    }
+
+    Surface getDecoderSurface() {
+        return awaitReady() ? decoderSurface : null;
+    }
+
+    void submitYuy2Frame(byte[] frameData, int length) {
+        if (!running || !yuy2Input || frameData == null) return;
+        final int expected = width * height * 2;
+        if (length < expected || yuy2BackBuf == null || yuy2PrevSample == null) return;
+
+        boolean dup = false;
+        if (autoDetectDuplicates && enhanceMode >= MODE_FG60) {
+            float mad = 0f;
+            long sumAbs = 0L;
+            int idx = 0;
+            for (int sy = 0; sy < TINY_H; sy++) {
+                int y = (sy * height) / TINY_H;
+                int rowOff = y * width * 2;
+                for (int sx = 0; sx < TINY_W; sx++) {
+                    int x = (sx * width) / TINY_W;
+                    byte luma = frameData[rowOff + (x * 2)];
+                    if (hasTinyPrev) {
+                        sumAbs += Math.abs((luma & 0xFF) - (yuy2PrevSample[idx] & 0xFF));
+                    }
+                    yuy2PrevSample[idx++] = luma;
+                }
+            }
+            if (hasTinyPrev) {
+                mad = (float) sumAbs / (float) (TINY_W * TINY_H);
+                dup = !lastAutoDup && (mad < 1.5f);
+            }
+            hasTinyPrev = true;
+            lastAutoDup = dup;
+
+            autoDupInCount++;
+            if (dup) autoDupTagCount++;
+            autoDupMadSum += mad;
+            final long nowMs = System.currentTimeMillis();
+            if (autoDupLastLogMs == 0L) autoDupLastLogMs = nowMs;
+            if (nowMs - autoDupLastLogMs >= 2000L) {
+                final double dupPct = autoDupInCount > 0 ? (autoDupTagCount * 100.0 / autoDupInCount) : 0.0;
+                final double avgMad = autoDupInCount > 0 ? (autoDupMadSum / autoDupInCount) : 0.0;
+                Log.i(TAG, String.format("USB-Dup: in=%d dup=%d (%.1f%%) avgMad=%.2f",
+                        autoDupInCount, autoDupTagCount, dupPct, avgMad));
+                autoDupInCount = 0;
+                autoDupTagCount = 0;
+                autoDupMadSum = 0.0;
+                autoDupLastLogMs = nowMs;
+            }
+        }
+
+        synchronized (frameLock) {
+            if (!running) return;
+            System.arraycopy(frameData, 0, yuy2BackBuf, 0, expected);
+            yuy2PendingDup = dup;
+            yuy2FrameReady = true;
+            frameLock.notifyAll();
+        }
     }
 
     void setEnhanceMode(int mode) {
@@ -234,7 +333,7 @@ final class CaptureGlRenderer {
             boolean isDup = false;
             boolean runSubFrame = false;
             synchronized (frameLock) {
-                while (running && (availableFrames <= 0 || dupQueue.isEmpty())) {
+                while (running && (yuy2Input ? !yuy2FrameReady : (availableFrames <= 0 || (!autoDetectDuplicates && dupQueue.isEmpty())))) {
                     if (fg90PendingPhase > 0) {
                         long remNs = fg90NextDueNs - System.nanoTime();
                         if (remNs <= 0L) {
@@ -266,10 +365,22 @@ final class CaptureGlRenderer {
                     dupGateFrames = 0;
                     realFramePending = false;
                     fg90PendingPhase = 0;
+                    hasTinyPrev = false;
+                    lastAutoDup = false;
                 }
                 if (!runSubFrame) {
-                    availableFrames--;
-                    isDup = dupQueue.pollFirst();
+                    if (yuy2Input) {
+                        byte[] tmp = yuy2FrontBuf;
+                        yuy2FrontBuf = yuy2BackBuf;
+                        yuy2BackBuf = tmp;
+                        isDup = yuy2PendingDup;
+                        yuy2FrameReady = false;
+                    } else {
+                        availableFrames--;
+                        if (!autoDetectDuplicates) {
+                            isDup = dupQueue.pollFirst();
+                        }
+                    }
                 }
             }
 
@@ -284,15 +395,30 @@ final class CaptureGlRenderer {
             }
 
             try {
-                surfaceTexture.updateTexImage();
-                surfaceTexture.getTransformMatrix(stMatrix);
-                // Drain any backed-up SurfaceTexture frames so we always render the freshest image.
-                synchronized (frameLock) {
-                    while (availableFrames > 0 && !dupQueue.isEmpty()) {
-                        availableFrames--;
-                        isDup = dupQueue.pollFirst();
-                        surfaceTexture.updateTexImage();
-                        surfaceTexture.getTransformMatrix(stMatrix);
+                if (yuy2Input) {
+                    yuy2UploadBuf.clear();
+                    yuy2UploadBuf.put(yuy2FrontBuf, 0, width * height * 2);
+                    yuy2UploadBuf.flip();
+                    GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1);
+                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texYuy2);
+                    GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, width / 2, height,
+                            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, yuy2UploadBuf);
+                } else {
+                    surfaceTexture.updateTexImage();
+                    surfaceTexture.getTransformMatrix(stMatrix);
+                    // Drain any backed-up SurfaceTexture frames so we always render the freshest image.
+                    synchronized (frameLock) {
+                        while (availableFrames > 0 && (autoDetectDuplicates || !dupQueue.isEmpty())) {
+                            availableFrames--;
+                            if (!autoDetectDuplicates) {
+                                isDup = dupQueue.pollFirst();
+                            }
+                            surfaceTexture.updateTexImage();
+                            surfaceTexture.getTransformMatrix(stMatrix);
+                        }
+                    }
+                    if (autoDetectDuplicates && enhanceMode >= MODE_FG60) {
+                        isDup = detectAutoDuplicate();
                     }
                 }
                 renderFrame(isDup);
@@ -383,28 +509,47 @@ final class CaptureGlRenderer {
         GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, 0);
         GLES30.glBindVertexArray(0);
 
-        // External OES texture + SurfaceTexture
-        int[] tex = new int[1];
-        GLES30.glGenTextures(1, tex, 0);
-        oesTexId = tex[0];
-        GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
-        GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
-        GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
-        GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
-        GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+        if (yuy2Input) {
+            int[] yuyTex = new int[1];
+            GLES30.glGenTextures(1, yuyTex, 0);
+            texYuy2 = yuyTex[0];
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texYuy2);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, width / 2, height, 0,
+                    GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null);
+            int yuyBytes = width * height * 2;
+            yuy2UploadBuf = ByteBuffer.allocateDirect(yuyBytes);
+            yuy2FrontBuf = new byte[yuyBytes];
+            yuy2BackBuf = new byte[yuyBytes];
+            yuy2PrevSample = new byte[TINY_W * TINY_H];
+        } else {
+            // External OES texture + SurfaceTexture
+            int[] tex = new int[1];
+            GLES30.glGenTextures(1, tex, 0);
+            oesTexId = tex[0];
+            GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
+            GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR);
+            GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR);
+            GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE);
+            GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE);
 
-        surfaceTexture = new SurfaceTexture(oesTexId);
-        surfaceTexture.setDefaultBufferSize(width, height);
-        surfaceTexture.setOnFrameAvailableListener(st -> {
-            synchronized (frameLock) {
-                availableFrames++;
-                frameLock.notifyAll();
-            }
-        });
-        decoderSurface = new Surface(surfaceTexture);
+            surfaceTexture = new SurfaceTexture(oesTexId);
+            surfaceTexture.setDefaultBufferSize(width, height);
+            surfaceTexture.setOnFrameAvailableListener(st -> {
+                synchronized (frameLock) {
+                    availableFrames++;
+                    frameLock.notifyAll();
+                }
+            });
+            decoderSurface = new Surface(surfaceTexture);
+        }
 
         // Compile programs
         progOesCopy = linkProgram(VERT_FBO, FRAG_OES_COPY);
+        progYuy2Copy = yuy2Input ? linkProgram(VERT_FBO, FRAG_YUY2_COPY) : 0;
         progLuma = linkProgram(VERT_FBO, FRAG_LUMA);
         progDownsample = linkProgram(VERT_FBO, FRAG_DOWNSAMPLE);
         progFlowCoarse = linkProgram(VERT_FBO, FRAG_FLOW_COARSE);
@@ -413,13 +558,18 @@ final class CaptureGlRenderer {
         progWarp = linkProgram(VERT_FBO, FRAG_WARP);
         progRcas = linkProgram(VERT_FBO, FRAG_RCAS);
 
-        if (progOesCopy == 0 || progLuma == 0 || progDownsample == 0 || progFlowCoarse == 0
-                || progFlowFine == 0 || progFlowSmooth == 0 || progWarp == 0 || progRcas == 0) {
+        if (progOesCopy == 0 || (yuy2Input && progYuy2Copy == 0) || progLuma == 0 || progDownsample == 0
+                || progFlowCoarse == 0 || progFlowFine == 0 || progFlowSmooth == 0 || progWarp == 0
+                || progRcas == 0) {
             return false;
         }
 
         uOesCopyTex = GLES30.glGetUniformLocation(progOesCopy, "uOesTex");
         uOesCopyStMatrix = GLES30.glGetUniformLocation(progOesCopy, "uStMatrix");
+        if (yuy2Input) {
+            uYuy2Tex = GLES30.glGetUniformLocation(progYuy2Copy, "uYuy2Tex");
+            uYuy2Width = GLES30.glGetUniformLocation(progYuy2Copy, "uYuy2Width");
+        }
 
         uLumaTex = GLES30.glGetUniformLocation(progLuma, "uVideoTex");
         uDownsampleHi = GLES30.glGetUniformLocation(progDownsample, "uHiLumaTex");
@@ -464,6 +614,13 @@ final class CaptureGlRenderer {
         createTexFbo(FLOW_HI_W, FLOW_HI_H, pair); texFlowSmooth = pair[0]; fboFlowSmooth = pair[1];
         createTexFbo(FLOW_HI_W, FLOW_HI_H, pair); texFlowPrev = pair[0]; fboFlowPrev = pair[1];
 
+        if (autoDetectDuplicates && !yuy2Input) {
+            createTexFbo(TINY_W, TINY_H, pair); texLumaTiny = pair[0]; fboLumaTiny = pair[1];
+            tinyCurrBuf = ByteBuffer.allocateDirect(TINY_W * TINY_H * 4);
+            tinyCurrBytes = new byte[TINY_W * TINY_H * 4];
+            tinyPrevBytes = new byte[TINY_W * TINY_H * 4];
+        }
+
         return true;
     }
 
@@ -481,12 +638,16 @@ final class CaptureGlRenderer {
         if (mode == MODE_OFF) {
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0);
             GLES30.glViewport(0, 0, surfW, surfH);
-            GLES30.glUseProgram(progOesCopy);
-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
-            GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
-            GLES30.glUniform1i(uOesCopyTex, 0);
-            GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
-            GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+            if (yuy2Input) {
+                drawYuy2Input();
+            } else {
+                GLES30.glUseProgram(progOesCopy);
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+                GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
+                GLES30.glUniform1i(uOesCopyTex, 0);
+                GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+            }
             EGL14.eglSwapBuffers(eglDisplay, eglSurface);
             if (listener != null) listener.onFrameRendered(false);
             return;
@@ -711,14 +872,80 @@ final class CaptureGlRenderer {
         }
     }
 
-    private void copyOesToFbo(int targetFbo) {
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, targetFbo);
-        GLES30.glViewport(0, 0, width, height);
+    private boolean detectAutoDuplicate() {
+        GLES30.glBindVertexArray(vaoId);
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fboLumaTiny);
+        GLES30.glViewport(0, 0, TINY_W, TINY_H);
         GLES30.glUseProgram(progOesCopy);
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
         GLES30.glUniform1i(uOesCopyTex, 0);
         GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+
+        tinyCurrBuf.clear();
+        GLES30.glReadPixels(0, 0, TINY_W, TINY_H, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, tinyCurrBuf);
+        tinyCurrBuf.rewind();
+        tinyCurrBuf.get(tinyCurrBytes);
+
+        float mad = 0f;
+        boolean dup = false;
+        if (hasTinyPrev) {
+            long sumAbs = 0L;
+            final int nPixels = TINY_W * TINY_H;
+            for (int i = 0; i < nPixels * 4; i += 4) {
+                sumAbs += Math.abs((tinyCurrBytes[i] & 0xFF) - (tinyPrevBytes[i] & 0xFF));
+                sumAbs += Math.abs((tinyCurrBytes[i + 1] & 0xFF) - (tinyPrevBytes[i + 1] & 0xFF));
+                sumAbs += Math.abs((tinyCurrBytes[i + 2] & 0xFF) - (tinyPrevBytes[i + 2] & 0xFF));
+            }
+            mad = (float) sumAbs / (float) (nPixels * 3);
+            // Never tag consecutive duplicates so static scenes/menus keep refreshing.
+            dup = !lastAutoDup && (mad < 1.2f);
+        }
+
+        System.arraycopy(tinyCurrBytes, 0, tinyPrevBytes, 0, tinyCurrBytes.length);
+        hasTinyPrev = true;
+        lastAutoDup = dup;
+
+        autoDupInCount++;
+        if (dup) autoDupTagCount++;
+        autoDupMadSum += mad;
+        final long nowMs = System.currentTimeMillis();
+        if (autoDupLastLogMs == 0L) autoDupLastLogMs = nowMs;
+        if (nowMs - autoDupLastLogMs >= 2000L) {
+            final double dupPct = autoDupInCount > 0 ? (autoDupTagCount * 100.0 / autoDupInCount) : 0.0;
+            final double avgMad = autoDupInCount > 0 ? (autoDupMadSum / autoDupInCount) : 0.0;
+            Log.i(TAG, String.format("USB-Dup: in=%d dup=%d (%.1f%%) avgMad=%.2f",
+                    autoDupInCount, autoDupTagCount, dupPct, avgMad));
+            autoDupInCount = 0;
+            autoDupTagCount = 0;
+            autoDupMadSum = 0.0;
+            autoDupLastLogMs = nowMs;
+        }
+        return dup;
+    }
+
+    private void copyOesToFbo(int targetFbo) {
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, targetFbo);
+        GLES30.glViewport(0, 0, width, height);
+        if (yuy2Input) {
+            drawYuy2Input();
+            return;
+        }
+        GLES30.glUseProgram(progOesCopy);
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+        GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
+        GLES30.glUniform1i(uOesCopyTex, 0);
+        GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    private void drawYuy2Input() {
+        GLES30.glUseProgram(progYuy2Copy);
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texYuy2);
+        GLES30.glUniform1i(uYuy2Tex, 0);
+        GLES30.glUniform1f(uYuy2Width, (float) width);
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
     }
 
@@ -808,7 +1035,7 @@ final class CaptureGlRenderer {
         }
         if (eglContext == EGL14.EGL_NO_CONTEXT) return;
 
-        int[] progs = {progOesCopy, progLuma, progDownsample, progFlowCoarse,
+        int[] progs = {progOesCopy, progYuy2Copy, progLuma, progDownsample, progFlowCoarse,
                 progFlowFine, progFlowSmooth, progWarp, progRcas};
         for (int p : progs) {
             if (p != 0) GLES30.glDeleteProgram(p);
@@ -816,12 +1043,12 @@ final class CaptureGlRenderer {
 
         int[] fbos = {fboPrev, fboCurr, fboMid, fboLumaHiPrev, fboLumaHiCurr,
                 fboLumaLoPrev, fboLumaLoCurr, fboFlowCoarse, fboFlowBwd, fboFlowFine,
-                fboFlowSmooth, fboFlowPrev};
+                fboFlowSmooth, fboFlowPrev, fboLumaTiny};
         GLES30.glDeleteFramebuffers(fbos.length, fbos, 0);
 
-        int[] texs = {oesTexId, texPrev, texCurr, texMid, texLumaHiPrev, texLumaHiCurr,
+        int[] texs = {oesTexId, texYuy2, texPrev, texCurr, texMid, texLumaHiPrev, texLumaHiCurr,
                 texLumaLoPrev, texLumaLoCurr, texFlowCoarse, texFlowBwd, texFlowFine,
-                texFlowSmooth, texFlowPrev};
+                texFlowSmooth, texFlowPrev, texLumaTiny};
         GLES30.glDeleteTextures(texs.length, texs, 0);
 
         if (vboId != 0) GLES30.glDeleteBuffers(1, new int[]{vboId}, 0);
@@ -858,6 +1085,28 @@ final class CaptureGlRenderer {
             + "void main() {\n"
             + "  vec2 uv = (uStMatrix * vec4(vUv, 0.0, 1.0)).xy;\n"
             + "  fragColor = vec4(texture(uOesTex, uv).rgb, 1.0);\n"
+            + "}\n";
+
+    private static final String FRAG_YUY2_COPY = "#version 300 es\n"
+            + "precision highp float;\n"
+            + "in vec2 vUv;\n"
+            + "uniform sampler2D uYuy2Tex;\n"
+            + "uniform float uYuy2Width;\n"
+            + "out vec4 fragColor;\n"
+            + "void main() {\n"
+            + "  ivec2 ts = textureSize(uYuy2Tex, 0);\n"
+            + "  int w = int(uYuy2Width + 0.5);\n"
+            + "  int px = clamp(int(floor(vUv.x * uYuy2Width)), 0, max(w - 1, 0));\n"
+            + "  int py = clamp(int(floor((1.0 - vUv.y) * float(ts.y))), 0, max(ts.y - 1, 0));\n"
+            + "  vec4 yuyv = texelFetch(uYuy2Tex, ivec2(px >> 1, py), 0);\n"
+            + "  float Y = ((px & 1) == 0) ? yuyv.r : yuyv.b;\n"
+            + "  float U = yuyv.g - 0.5;\n"
+            + "  float V = yuyv.a - 0.5;\n"
+            + "  float y = (Y - (16.0 / 255.0)) * 1.164383;\n"
+            + "  float r = y + 1.792741 * V;\n"
+            + "  float g = y - 0.213249 * U - 0.532909 * V;\n"
+            + "  float b = y + 2.112402 * U;\n"
+            + "  fragColor = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);\n"
             + "}\n";
 
     private static final String FRAG_LUMA = "#version 300 es\n"

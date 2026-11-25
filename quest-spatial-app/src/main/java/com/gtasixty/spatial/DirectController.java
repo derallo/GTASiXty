@@ -171,6 +171,10 @@ final class DirectController {
         return visible;
     }
 
+    boolean isSignedIn() {
+        return xbox.signedIn();
+    }
+
     void show() {
         if (visible) return;
         visible = true;
@@ -186,8 +190,8 @@ final class DirectController {
         }
         updateButtons();
         setStatus(xbox.signedIn()
-                ? "Direct: ready â€” tap Console or Start direct (finds Xbox via account, no IP needed)"
-                : "Direct: tap Sign in (finds your Xbox automatically â€” no IP needed)");
+                ? "Direct: ready \u2014 tap Console or Start direct (finds Xbox via account, no IP needed)"
+                : "Direct: tap Sign in (finds your Xbox automatically \u2014 no IP needed)");
     }
 
     void hide() {
@@ -748,24 +752,24 @@ final class DirectController {
     private void showHelp() {
         final String msg =
                 "Direct Mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC needed).\n\n"
-                + "â€¢ Finding your Xbox (No IP needed): Direct mode discovers your console automatically through your Microsoft account â€” you do NOT enter an IP address. (Only PC mode uses an IP.)\n\n"
-                + "â€¢ Sign in: Signs into your Microsoft/Xbox account using a device code.\n\n"
-                + "â€¢ Console: Lists consoles on your account and lets you pick which Xbox to stream from.\n\n"
-                + "â€¢ Start direct / Stop: Starts or cleanly stops the direct WebRTC stream and releases the console session.\n\n"
-                + "â€¢ Fix pad: If your controller is paired to the Xbox and stops working in-game, this releases the Quest's virtual pad so your Xbox controller keeps Player 1. If your controller is paired to the Quest, it re-announces the pad to wake up a resumed game.\n\n"
-                + "â€¢ Enhance (Adreno 740 GPU):\n"
+                + "\u2022 Finding your Xbox (No IP needed): Direct mode discovers your console automatically through your Microsoft account \u2014 you do NOT enter an IP address. (Only PC and Capture LAN modes use an IP.)\n\n"
+                + "\u2022 Sign in: Signs into your Microsoft/Xbox account using a device code.\n\n"
+                + "\u2022 Console: Lists consoles on your account and lets you pick which Xbox to stream from.\n\n"
+                + "\u2022 Start direct / Stop: Starts or cleanly stops the direct WebRTC stream and releases the console session.\n\n"
+                + "\u2022 Fix pad: If your controller is paired to the Xbox and stops working in-game, this releases the Quest's virtual pad so your Xbox controller keeps Player 1. If your controller is paired to the Quest, it re-announces the pad to wake up a resumed game.\n\n"
+                + "\u2022 Enhance (Adreno 740 GPU):\n"
                 + "  - Off: Raw decoded video.\n"
                 + "  - RCAS: AMD FidelityFX Contrast-Adaptive Sharpening.\n"
-                + "  - SuperRes: Edge-Adaptive Spatial Upscaling (3200x1800) + RCAS.\n"
-                + "  - FG 60: 30â†’60 fps optical-flow frame generation (auto-bypasses on native 60 fps games) + RCAS.\n"
+                + "  - SuperRes: Edge-Adaptive Spatial Upscaling (2560x1440) + RCAS.\n"
+                + "  - FG 60: 30\u219260 fps optical-flow frame generation (auto-bypasses on native 60 fps games) + RCAS.\n"
                 + "  - FG60+SR: Frame generation + SuperRes + RCAS.\n\n"
-                + "â€¢ Look: Color grading preset (Normal, Vivid, or Night for dark scenes).\n\n"
-                + "â€¢ 120 Hz / 90 Hz: Display refresh rate. 120 Hz divides both 60 fps (2:2) and 30 fps (4:4) evenly with zero judder.\n\n"
-                + "â€¢ Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
-                + "â€¢ Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
-                + "â€¢ Capture: HDMI capture card on the PC. Run GTA-Sixty.exe --capture there. The Xbox controller stays paired to the console.\n\n"
-                + "â€¢ PC mode: Switches back to the PC relay streamer (which uses your PC's IP).\n\n"
-                + "â€¢ Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).";
+                + "\u2022 Look: Color grading preset (Normal, Vivid, or Night for dark scenes).\n\n"
+                + "\u2022 Window Handle & Display: Grab the bottom handle bar with Trigger or Grip/Pinch to move the screen (push thumbstick up/down while holding Trigger to adjust depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Backdrop.\n\n"
+                + "\u2022 120 Hz / 90 Hz: Display refresh rate. 120 Hz divides both 60 fps (2:2) and 30 fps (4:4) evenly with zero judder.\n\n"
+                + "\u2022 Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
+                + "\u2022 Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
+                + "\u2022 Capture / PC mode: Switch to HDMI capture (LAN or USB-C) or PC relay.\n\n"
+                + "\u2022 Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).";
 
         final android.widget.ScrollView sv = new android.widget.ScrollView(activity);
         final TextView tv = new TextView(activity);
@@ -779,6 +783,11 @@ final class DirectController {
         new AlertDialog.Builder(activity)
                 .setTitle("Direct Mode Help")
                 .setView(sv)
+                .setNeutralButton("Run Network Check", (d, w) -> {
+                    if (activity instanceof MainActivity) {
+                        ((MainActivity) activity).openNetworkDiagnostics();
+                    }
+                })
                 .setPositiveButton("Close", null)
                 .show();
         if (streaming) scheduleAutoHideHud(8000);

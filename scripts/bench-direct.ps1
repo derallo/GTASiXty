@@ -72,13 +72,13 @@ foreach ($m in $ModeList) {
     $mName = if ($ModeNames.ContainsKey($m)) { $ModeNames[$m] } else { "Mode$m" }
     Write-Host "`n[bench-direct] === Testing enhance=$m ($mName) look=$Look ==="
 
-    & adb -s $Serial shell "am force-stop com.gtasixty.quest" | Out-Null
+    & adb -s $Serial shell "am force-stop com.gtasixty.spatial" | Out-Null
     $preState = ((& adb -s $Serial shell "dumpsys vrpowermanager | grep 'State:' | head -n 1") -join '').Trim()
     if ($preState -match 'HEADSET_UNMOUNTED') {
         & adb -s $Serial shell "input keyevent KEYCODE_SLEEP; sleep 1" | Out-Null
     }
     & adb -s $Serial logcat -c
-    & adb -s $Serial shell "input keyevent KEYCODE_WAKEUP; cmd display set-user-preferred-display-mode 4128 2208 120.00001 0; setprop debug.oculus.refreshRate 120; setprop debug.oculus.gpuLevel 4; setprop debug.oculus.cpuLevel 4; am start -n com.gtasixty.quest/.MainActivity --ez direct true --ez directStart true --ei enhance $m --ei look $Look" | Out-Null
+    & adb -s $Serial shell "input keyevent KEYCODE_WAKEUP; cmd display set-user-preferred-display-mode 4128 2208 120.00001 0; setprop debug.oculus.refreshRate 120; setprop debug.oculus.gpuLevel 4; setprop debug.oculus.cpuLevel 4; am start -n com.gtasixty.spatial/.SpatialMainActivity --ez direct true --ez directStart true --ei enhance $m --ei look $Look" | Out-Null
 
     # Wait for streaming to start (up to 25 s)
     $readyAt = $null
@@ -127,7 +127,7 @@ foreach ($m in $ModeList) {
     }
 
     # Capture SurfaceFlinger latency + gfxinfo while still active
-    $sfLayerRaw = & adb -s $Serial shell "dumpsys SurfaceFlinger --list | grep -E 'com\.gtasixty\.quest/com\.gtasixty\.quest\.MainActivity#' | tail -n 1"
+    $sfLayerRaw = & adb -s $Serial shell "dumpsys SurfaceFlinger --list | grep -E 'com\.gtasixty\.spatial/com\.gtasixty\.spatial\.(MainActivity|SpatialMainActivity)#' | tail -n 1"
     $sfLayer = ($sfLayerRaw | Out-String).Trim()
     $sfFps = 0.0; $sfP50 = 0.0; $sfP95 = 0.0; $sfLe17 = 0.0
     if ($sfLayer) {
@@ -157,7 +157,7 @@ foreach ($m in $ModeList) {
         }
     }
 
-    $gfxText = (& adb -s $Serial shell "dumpsys gfxinfo com.gtasixty.quest") -join "`n"
+    $gfxText = (& adb -s $Serial shell "dumpsys gfxinfo com.gtasixty.spatial") -join "`n"
     $jankPct = "n/a"; $gfxP95 = "n/a"; $hiInput = 0
     if ($gfxText -match 'Janky frames:\s+\d+\s+\(([\d\.]+)%\)') { $jankPct = $Matches[1] }
     if ($gfxText -match '95th percentile:\s+(\d+ms)') { $gfxP95 = $Matches[1] }
@@ -247,7 +247,7 @@ foreach ($m in $ModeList) {
 }
 } finally {
     # Leave app cleanly stopped after benchmark
-    & adb -s $Serial shell "am force-stop com.gtasixty.quest" | Out-Null
+    & adb -s $Serial shell "am force-stop com.gtasixty.spatial" | Out-Null
 }
 
 $results | Export-Csv -NoTypeInformation -Path $csvPath

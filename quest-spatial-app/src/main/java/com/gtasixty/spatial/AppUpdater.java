@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class AppUpdater {
     private static final String TAG = "GTA60Update";
     private static final String VERSION_URL =
-            "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/spatial-version.json";
+            "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/version.json";
     private static final long CHECK_INTERVAL_MS = 3L * 60L * 60L * 1000L; // 3 hours
     private static final String PREF_LAST_CHECK = "lastUpdateCheckMs";
 
@@ -254,7 +254,7 @@ final class AppUpdater {
             c.setConnectTimeout(10000);
             c.setReadTimeout(20000);
             c.setInstanceFollowRedirects(false);
-            c.setRequestProperty("User-Agent", "GTA-Sixty-Spatial-Quest3");
+            c.setRequestProperty("User-Agent", "GTA-Sixty-Quest3");
             final int code = c.getResponseCode();
             if (code >= 300 && code < 400) {
                 final String loc = c.getHeaderField("Location");

@@ -1,5 +1,6 @@
 package com.gtasixty.spatial;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
@@ -113,8 +114,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private LinearLayout hudBar;
     private DisplayControlsView displayControls;
     private EditText hostInput;
+    private Button lanBtn;
     private Button usbBtn;
     private Button startBtn;
+    private Button refreshBtn;
     private Button wakeBtn;
     private Button resBtn;
     private Button fpsBtn;
@@ -122,6 +125,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Button enhanceBtn;
     private Button lookBtn;
     private Button captureHzBtn;
+    private Button captureSourceBtn;
     // "Hold session": re-send the current pad state every ~20 s so the console never decides the
     // player went idle. That is what stops the stream from dying while you are away, and - more
     // importantly - what stops a reconnect from attaching a new client mid-game (which drops the
@@ -134,10 +138,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Button modeBtn;
     private DirectController direct;
     private AppUpdater updater;
+    private UsbCaptureController usbCapture;
+    private static final int REQ_USB_CAPTURE_PERMS = 4001;
+    private static final String PERM_USB_CAMERA = "horizonos.permission.USB_CAMERA";
     private boolean directMode = false;
-    // HDMI capture on the PC. Mutually exclusive with directMode. Does not launch the Xbox streamer
-    // and does not forward the headset pad (that pad stays paired to the console).
+    // HDMI capture on the PC (or direct USB-C on Quest when captureUsbMode=true). Mutually exclusive with directMode.
     private volatile boolean captureMode = false;
+    private volatile boolean captureUsbMode = false;
     private volatile boolean captureUpdateCheckedThisBoot = false;
     private volatile boolean autoCaptureStart = false;
     private final BroadcastReceiver stopStreamReceiver = new BroadcastReceiver() {
@@ -217,6 +224,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // "exclusive operation" collision).
         directMode = prefs.getBoolean("directMode", false);
         captureMode = prefs.getBoolean("captureMode", false);
+        captureUsbMode = prefs.getBoolean("captureUsbMode", false);
         if (captureMode) directMode = false;
         if (!prefs.contains("prefs_v4")) {
             captureMode = true;
@@ -289,7 +297,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         ipLp.rightMargin = dp(6);
         row1.addView(hostInput, ipLp);
 
-        Button lanBtn = makeButton("LAN", "#334155");
+        lanBtn = makeButton("LAN", "#334155");
         lanBtn.setOnClickListener(v -> discoverLanHost(false));
         row1.addView(lanBtn);
 
@@ -297,14 +305,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         usbBtn.setOnClickListener(v -> hostInput.setText("127.0.0.1"));
         row1.addView(usbBtn);
 
-        startBtn = makeButton("Start Stream", "#16A34A");
+        startBtn = makeButton(captureMode && captureUsbMode ? "Start USB" : "Start Stream", "#16A34A");
         startBtn.setOnClickListener(v -> {
-            if (streaming.get()) disconnect();
+            if (streaming.get() || isUsbCaptureRunning()) disconnect();
             else startStreamClicked();
         });
         row1.addView(startBtn);
 
-        Button refreshBtn = makeButton("Refresh", "#475569");
+        refreshBtn = makeButton("Refresh", "#475569");
         refreshBtn.setOnClickListener(v -> sendControlPacket(TYPE_CLIENT_IDR, null));
         row1.addView(refreshBtn);
 
@@ -337,6 +345,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             else enterDirectMode();
         });
         row1.addView(modeBtn);
+
+        captureSourceBtn = makeButton(captureUsbMode ? "Src: USB" : "Src: LAN", "#0369A1");
+        captureSourceBtn.setOnClickListener(v -> {
+            if (streaming.get() || isUsbCaptureRunning()) disconnect();
+            captureUsbMode = !captureUsbMode;
+            persistTransportMode();
+            captureSourceBtn.setText(captureUsbMode ? "Src: USB" : "Src: LAN");
+            updateHudForMode();
+            setStatus(captureUsbMode
+                    ? "Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB."
+                    : "Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox.");
+        });
+        row1.addView(captureSourceBtn);
 
         Button updateBtn = makeButton("Update", "#1E293B");
         updateBtn.setOnClickListener(v -> checkForUpdates());
@@ -412,6 +433,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     .putInt("captureEnhanceMode", captureEnhanceMode).apply();
             CaptureGlRenderer gl = captureGl;
             if (gl != null) gl.setEnhanceMode(captureEnhanceMode);
+            if (usbCapture != null) usbCapture.setEnhanceMode(captureEnhanceMode);
             if (streamWidth > 0 && streamHeight > 0) {
                 boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
                         || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
@@ -446,6 +468,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     .putInt("captureLookMode", captureLookMode).apply();
             CaptureGlRenderer gl = captureGl;
             if (gl != null) gl.setLookMode(captureLookMode);
+            if (usbCapture != null) usbCapture.setLookMode(captureLookMode);
             setStatus("Capture Look: " + LOOK_LABELS[captureLookMode]);
         });
         row2.addView(lookBtn);
@@ -461,10 +484,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
         row2.addView(captureHzBtn);
 
+        Button netCheckBtn = makeButton("Net Check", "#0369A1");
+        netCheckBtn.setOnClickListener(v -> openNetworkDiagnostics());
+        row2.addView(netCheckBtn);
+
         statusText = new TextView(this);
         statusText.setText(captureMode
-                ? "Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays on the Xbox."
-                : "Ready â€” Tap Start Stream (or LAN to auto-find PC)");
+                ? (captureUsbMode
+                        ? "Capture (USB): plug Xbox capture card into Quest USB-C, then tap Start USB."
+                        : "Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays on the Xbox.")
+                : "Ready — Tap Start Stream (or LAN to auto-find PC)");
         statusText.setTextColor(Color.parseColor("#CBD5E1"));
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         statusText.setPadding(dp(8), 0, 0, 0);
@@ -519,6 +548,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final Intent launchIntent = getIntent() != null ? new Intent(getIntent()) : new Intent();
         final Bundle spatialExtras = SpatialDisplayBridge.consumePendingLaunchExtras();
         if (spatialExtras != null) launchIntent.putExtras(spatialExtras);
+        if (launchIntent.hasExtra("captureUsb")) {
+            captureUsbMode = launchIntent.getBooleanExtra("captureUsb", false);
+            if (captureUsbMode) {
+                captureMode = true;
+                directMode = false;
+            }
+            persistTransportMode();
+        } else if ("usb".equalsIgnoreCase(launchIntent.getStringExtra("captureSource"))) {
+            captureMode = true;
+            directMode = false;
+            captureUsbMode = true;
+            persistTransportMode();
+        } else if ("lan".equalsIgnoreCase(launchIntent.getStringExtra("captureSource"))) {
+            captureMode = true;
+            directMode = false;
+            captureUsbMode = false;
+            persistTransportMode();
+        }
         final boolean wantCapture = launchIntent.getBooleanExtra("capture", false) || captureMode;
         final boolean wantDirect = !wantCapture && (launchIntent.getBooleanExtra("direct", false) || directMode);
         final boolean autoDirectStart = launchIntent.getBooleanExtra("directStart", false);
@@ -618,25 +665,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void showPcHelp() {
+        final String modeLabel = captureMode
+                ? (captureUsbMode ? "Capture USB" : "Capture LAN")
+                : "PC Mode";
         final String msg =
-                "PC Mode streams your Xbox through your Windows PC (which runs D3D12 optical-flow enhancement & NVENC encoding).\n\n"
-                + "â€¢ PC IP box: Enter your PC's LAN IP address (or leave blank / tap LAN to auto-discover it).\n\n"
-                + "â€¢ LAN: Broadcasts on your local network to auto-find your PC running GTA-Sixty.\n\n"
-                + "â€¢ USB-C: Sets the address to 127.0.0.1 for streaming over a USB-C ADB reverse tunnel.\n\n"
-                + "â€¢ Start Stream / Disconnect: Connects to (or disconnects from) the PC streamer.\n\n"
-                + "â€¢ Refresh: Requests an immediate keyframe (IDR) if the video ever glitches.\n\n"
-                + "â€¢ Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
-                + "â€¢ Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
-                + "â€¢ Wake PC: Sends a Wake-on-LAN packet to wake your PC.\n\n"
-                + "â€¢ Mode: cycles PC, then Direct, then Capture.\n"
-                + "  - PC: Xbox remote play through this PC (frame generation and upscaling).\n"
-                + "  - Direct: the headset connects straight to the Xbox. No PC stream.\n"
-                + "  - Capture: the PC's HDMI capture card. On the PC run GTA-Sixty.exe --capture. "
-                + "The picture size follows the card. The Xbox controller stays paired to the console. "
-                + "This mode does not start remote play.\n\n"
-                + "â€¢ Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).\n\n"
-                + "â€¢ Res / FPS / Mbps: Sets the PC stream resolution, target framerate (60/90), and bitrate.\n\n"
-                + "â€¢ Hold: Keeps the Xbox session alive while you step away so the console does not idle you out.";
+                "GTA-Sixty supports Capture (LAN or USB-C), PC Mode, and Direct Mode:\n\n"
+                + "\u2022 Mode: Cycles Capture \u2192 PC \u2192 Direct.\n"
+                + "  - Capture (Src: LAN): Streams HDMI from your Linux capture box (192.168.68.90) or PC running GTA-Sixty.exe --capture.\n"
+                + "  - Capture (Src: USB): Plugs an HDMI-to-USB-C capture card straight into Quest 3 (close Meta Quest HDMI Link first, then tap Start USB).\n"
+                + "  - PC: Xbox remote play through your Windows PC (D3D12 optical-flow + NVENC).\n"
+                + "  - Direct: Quest connects straight to your Xbox via your Microsoft account (no IP needed).\n\n"
+                + "\u2022 LAN / Net Check: LAN scans UDP 7661 to auto-find servers on your network. Net Check tests Quest Wi-Fi, subnet match, UDP 7661 discovery, TCP 7660 reachability, USB-C UVC devices, and Xbox Direct status.\n\n"
+                + "\u2022 Host IP / USB-C: Enter a server IP (blank = auto-scan), or tap USB-C for 127.0.0.1 over ADB reverse.\n\n"
+                + "\u2022 Window Handle & Display: Grab the bottom handle bar with Trigger or Grip/Pinch to move the screen (push thumbstick up/down while holding Trigger to adjust depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Backdrop.\n\n"
+                + "\u2022 Recenter / Hide HUD: Recenter snaps the screen in front of you; Hide HUD hides the bar (tap video to show it again).\n\n"
+                + "\u2022 Wake PC / Check Update: In PC mode, sends Wake-on-LAN + GTA60_START. In Capture LAN mode, triggers GTA60_UPDATE on the capture box.\n\n"
+                + "\u2022 Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK (also checks every 3 hours).";
 
         final android.widget.ScrollView sv = new android.widget.ScrollView(this);
         final TextView tv = new TextView(this);
@@ -648,10 +692,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         sv.addView(tv);
 
         new AlertDialog.Builder(this)
-                .setTitle("PC Mode Help")
+                .setTitle("GTA-Sixty Help (" + modeLabel + ")")
                 .setView(sv)
+                .setNeutralButton("Run Network Check", (d, w) -> openNetworkDiagnostics())
                 .setPositiveButton("Close", null)
                 .show();
+    }
+
+    void openNetworkDiagnostics() {
+        final SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
+        final String capHost = prefs.getString("captureHost", DEFAULT_CAPTURE_HOST);
+        final String pcHost = prefs.getString("host", DEFAULT_PC_HOST);
+        final String curField = hostInput != null ? hostInput.getText().toString().trim() : "";
+        final String modeLabel = captureMode
+                ? (captureUsbMode ? "Capture USB" : "Capture LAN")
+                : (directMode ? "Direct" : "PC");
+        final boolean signedIn = direct != null && direct.isSignedIn();
+        NetworkDiagnosticsHelper.show(
+                this,
+                modeLabel,
+                curField,
+                capHost,
+                pcHost,
+                discoveryTargets(),
+                signedIn,
+                foundIp -> {
+                    if (hostInput != null) hostInput.setText(foundIp);
+                    prefs.edit().putString(captureMode ? "captureHost" : "host", foundIp).apply();
+                    setStatus("Selected discovered host: " + foundIp + " \u2014 tap Start Stream");
+                });
     }
 
     private Button makeButton(String label, String hexBg) {
@@ -770,8 +839,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateHudForMode() {
+        final boolean usbCap = captureMode && captureUsbMode;
+        final boolean lanCap = captureMode && !captureUsbMode;
         final int pcVis = captureMode ? View.GONE : View.VISIBLE;
         final int capVis = captureMode ? View.VISIBLE : View.GONE;
+        final int netCapVis = usbCap ? View.GONE : View.VISIBLE;
+        if (hostInput != null) hostInput.setVisibility(netCapVis);
+        if (lanBtn != null) lanBtn.setVisibility(netCapVis);
+        if (refreshBtn != null) refreshBtn.setVisibility(netCapVis);
+        if (wakeBtn != null) wakeBtn.setVisibility(usbCap ? View.GONE : View.VISIBLE);
+        if (captureSourceBtn != null) {
+            captureSourceBtn.setVisibility(capVis);
+            captureSourceBtn.setText(captureUsbMode ? "Src: USB" : "Src: LAN");
+        }
         if (usbBtn != null) usbBtn.setVisibility(pcVis);
         if (resBtn != null) resBtn.setVisibility(pcVis);
         if (fpsBtn != null) fpsBtn.setVisibility(pcVis);
@@ -780,7 +860,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (enhanceBtn != null) enhanceBtn.setVisibility(capVis);
         if (lookBtn != null) lookBtn.setVisibility(capVis);
         if (captureHzBtn != null) captureHzBtn.setVisibility(capVis);
-        if (wakeBtn != null) wakeBtn.setText(captureMode ? "Check Update" : "Wake PC");
+        if (wakeBtn != null && !usbCap) wakeBtn.setText(lanCap ? "Check Update" : "Wake PC");
+        if (startBtn != null && !streaming.get() && !isUsbCaptureRunning()) {
+            startBtn.setText(usbCap ? "Start USB" : "Start Stream");
+            startBtn.setBackgroundColor(Color.parseColor("#16A34A"));
+        }
         applyDisplayRefreshRate(captureMode ? captureRefreshHz : 120);
     }
 
@@ -801,16 +885,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         getSharedPreferences("gta60", MODE_PRIVATE).edit()
                 .putBoolean("directMode", directMode)
                 .putBoolean("captureMode", captureMode)
+                .putBoolean("captureUsbMode", captureUsbMode)
                 .apply();
     }
 
     /**
-     * Capture plays the PC's HDMI capture stream. Hiding Direct stops an xhome session if one is up.
+     * Capture plays the PC's HDMI capture stream (Src: LAN) or a USB-C HDMI capture card plugged
+     * straight into Quest 3 (Src: USB). Hiding Direct stops an xhome session if one is up.
      * Do not broadcast GTA60_STOP here: that packet is how Direct releases a PC streamer, and it would
      * also kill a capture process that is already serving the card.
      */
     void enterCaptureMode() {
-        if (streaming.get()) disconnect();
+        if (streaming.get() || isUsbCaptureRunning()) disconnect();
         if (direct != null) direct.hide();
         directMode = false;
         captureMode = true;
@@ -820,15 +906,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
-        setStatus("Capture mode: ready (mintbook-g11). Controller stays paired to the Xbox.");
-        if (!captureUpdateCheckedThisBoot) {
-            captureUpdateCheckedThisBoot = true;
-            requestCaptureUpdateAsync(false);
+        if (captureUsbMode) {
+            setStatus("Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB.");
+        } else {
+            setStatus("Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox.");
+            if (!captureUpdateCheckedThisBoot) {
+                captureUpdateCheckedThisBoot = true;
+                requestCaptureUpdateAsync(false);
+            }
         }
     }
 
     private void exitCaptureMode() {
-        if (streaming.get()) disconnect();
+        if (streaming.get() || isUsbCaptureRunning()) disconnect();
         directMode = false;
         captureMode = false;
         persistTransportMode();
@@ -849,6 +939,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // In Direct mode the PC transport is out of the picture. The SurfaceView can be recreated
         // when the panel resizes, and its auto-start must not quietly take the console's session.
         if (directMode) return;
+        if (captureMode && captureUsbMode) {
+            startUsbCaptureWithPerms();
+            return;
+        }
         // Capture is allowed to connect. It must not ask the agent to launch the Xbox streamer.
         String h = hostInput.getText().toString().trim();
         if (h.isEmpty()) {
@@ -856,6 +950,148 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         } else {
             connect(h);
         }
+    }
+
+    private boolean isUsbCaptureRunning() {
+        return usbCapture != null && usbCapture.isRunning();
+    }
+
+    private boolean hasOrUnsupportedUsbCameraPermission() {
+        try {
+            getPackageManager().getPermissionInfo(PERM_USB_CAMERA, 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            return true;
+        }
+        return checkSelfPermission(PERM_USB_CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void startUsbCaptureWithPerms() {
+        final boolean hasUsbCam = hasOrUnsupportedUsbCameraPermission();
+        final boolean hasAudio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (!hasUsbCam) {
+            final List<String> missing = new ArrayList<>();
+            missing.add(PERM_USB_CAMERA);
+            if (!hasAudio) missing.add(Manifest.permission.RECORD_AUDIO);
+            setStatus("Grant USB Camera permission for the capture card...");
+            requestPermissions(missing.toArray(new String[0]), REQ_USB_CAPTURE_PERMS);
+            return;
+        }
+        if (!hasAudio && !getSharedPreferences("gta60", MODE_PRIVATE).getBoolean("usbAudioPermAsked", false)) {
+            getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("usbAudioPermAsked", true).apply();
+            setStatus("Grant audio permission for USB capture sound (optional)...");
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_USB_CAPTURE_PERMS);
+            return;
+        }
+        startUsbCaptureNow();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_USB_CAPTURE_PERMS) {
+            if (hasOrUnsupportedUsbCameraPermission()) {
+                startUsbCaptureNow();
+            } else {
+                setStatus("USB Camera permission denied — cannot access USB capture card.");
+            }
+        }
+    }
+
+    private void startUsbCaptureNow() {
+        if (streaming.getAndSet(true)) {
+            Log.w(TAG, "startUsbCaptureNow ignored: a stream is already running");
+            return;
+        }
+        final Surface surf = activeSurface;
+        if (surf == null || !surf.isValid()) {
+            streaming.set(false);
+            setStatus("USB capture error: display surface unavailable");
+            return;
+        }
+        if (usbCapture != null) {
+            usbCapture.stop();
+            usbCapture = null;
+        }
+        firstFrameRendered = false;
+        streamWidth = 0;
+        streamHeight = 0;
+        statFrames = 0;
+        statRendered = 0;
+        statGenFrames = 0;
+        statBytes = 0;
+        pruneOtherApps();
+        uiHandler.post(() -> {
+            startBtn.setText("Stop");
+            startBtn.setBackgroundColor(Color.parseColor("#DC2626"));
+        });
+        setStatus("Starting USB-C capture...");
+
+        final UsbCaptureController[] holder = new UsbCaptureController[1];
+        final UsbCaptureController ctrl = new UsbCaptureController(this, new UsbCaptureController.Listener() {
+            @Override
+            public void onStarted(int width, int height, int fps) {
+                streamWidth = width;
+                streamHeight = height;
+                targetFps = fps;
+                final boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
+                final int outW = sr ? Math.min(2560, Math.max(width, 2560)) : Math.min(2560, width);
+                final int outH = sr ? Math.min(1440, Math.max(height, 1440)) : Math.min(1440, height);
+                uiHandler.post(() -> {
+                    surfaceView.getHolder().setFixedSize(outW, outH);
+                    adjustSurfaceAspect(width, height);
+                    applySurfaceFrameRate(fps);
+                });
+                setStatus(String.format("USB %dx%d @ %d fps (%s -> %dx%d)",
+                        width, height, fps, ENHANCE_LABELS[captureEnhanceMode], outW, outH));
+            }
+
+            @Override
+            public void onFrameRendered(boolean generated) {
+                if (!firstFrameRendered) {
+                    firstFrameRendered = true;
+                    Log.i(TAG, String.format("First USB capture frame rendered (%dx%d)", streamWidth, streamHeight));
+                }
+                statFrames++;
+                statRendered++;
+                if (generated) statGenFrames++;
+            }
+
+            @Override
+            public void onStatus(String message) {
+                setStatus(message);
+            }
+
+            @Override
+            public void onError(String message) {
+                streaming.set(false);
+                if (usbCapture == holder[0]) {
+                    usbCapture = null;
+                }
+                uiHandler.post(() -> {
+                    startBtn.setText(captureMode && captureUsbMode ? "Start USB" : "Start Stream");
+                    startBtn.setBackgroundColor(Color.parseColor("#16A34A"));
+                });
+                setStatus(message);
+            }
+
+            @Override
+            public void onStopped() {
+                streaming.set(false);
+                if (usbCapture == holder[0]) {
+                    usbCapture = null;
+                }
+                uiHandler.post(() -> {
+                    startBtn.setText(captureMode && captureUsbMode ? "Start USB" : "Start Stream");
+                    startBtn.setBackgroundColor(Color.parseColor("#16A34A"));
+                });
+            }
+        });
+        holder[0] = ctrl;
+        usbCapture = ctrl;
+        ctrl.start(surf, captureEnhanceMode, captureLookMode);
     }
 
     /**
@@ -886,8 +1122,49 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void discoverLanHost(boolean autoConnectAfter) {
-        setStatus("Scanning LAN (UDP 7661) for GTA-Sixty PC...");
+        setStatus("Scanning LAN (UDP 7661) for GTA-Sixty...");
         new Thread(() -> {
+            if (!autoConnectAfter) {
+                final List<NetworkDiagnosticsHelper.DiscoveredServer> found =
+                        NetworkDiagnosticsHelper.scanLanForOffers(discoveryTargets(), 1500);
+                if (found.isEmpty()) {
+                    setStatus("No host found on LAN \u2014 tap Net Check for network help");
+                    return;
+                }
+                final SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
+                for (NetworkDiagnosticsHelper.DiscoveredServer srv : found) {
+                    if (isValidMac(srv.mac)) {
+                        prefs.edit().putString("pcMac", normalizeMac(srv.mac)).apply();
+                        break;
+                    }
+                }
+                if (found.size() == 1) {
+                    final NetworkDiagnosticsHelper.DiscoveredServer srv = found.get(0);
+                    uiHandler.post(() -> {
+                        hostInput.setText(srv.ip);
+                        prefs.edit().putString(captureMode ? "captureHost" : "host", srv.ip).apply();
+                        setStatus("Found host at " + srv.ip + " (" + srv.summary + ")");
+                    });
+                } else {
+                    uiHandler.post(() -> {
+                        final String[] labels = new String[found.size()];
+                        for (int i = 0; i < found.size(); i++) {
+                            labels[i] = found.get(i).ip + "  (" + found.get(i).summary + ")";
+                        }
+                        new AlertDialog.Builder(this)
+                                .setTitle("Select GTA-Sixty Host")
+                                .setItems(labels, (d, which) -> {
+                                    final NetworkDiagnosticsHelper.DiscoveredServer picked = found.get(which);
+                                    hostInput.setText(picked.ip);
+                                    prefs.edit().putString(captureMode ? "captureHost" : "host", picked.ip).apply();
+                                    setStatus("Selected " + picked.ip + " (" + picked.summary + ")");
+                                })
+                                .setNegativeButton("Cancel", null)
+                                .show();
+                    });
+                }
+                return;
+            }
             try (DatagramSocket ds = new DatagramSocket()) {
                 ds.setBroadcast(true);
                 ds.setSoTimeout(1500);
@@ -910,23 +1187,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 uiHandler.post(() -> {
                     hostInput.setText(ip);
-                    if (autoConnectAfter) {
-                        connect(ip);
-                    } else {
-                        setStatus("Found PC at " + ip + " (" + msg + ")");
-                    }
+                    connect(ip);
                 });
             } catch (Exception e) {
-                if (autoConnectAfter && captureMode) {
-                    setStatus("No capture stream found. On the PC run GTA-Sixty.exe --capture");
-                } else if (autoConnectAfter) {
+                if (captureMode) {
+                    setStatus("No capture stream found \u2014 tap Net Check for network help");
+                } else {
                     // Nothing answered, which normally means no streamer is running on the PC. Ask
                     // the agent to start one and keep polling; it answers discovery once the Xbox
                     // session is up. This is the "start it from the headset" path.
-                    setStatus("No streamer running â€” asking the PC to start one...");
+                    setStatus("No streamer running \u2014 asking the PC to start one...");
                     requestPcAppStart();
-                } else {
-                    setStatus("LAN discovery timed out â€” enter PC IP or use USB-C (127.0.0.1)");
                 }
             }
         }, "GTA60-Discover").start();
@@ -967,21 +1238,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (direct != null) {
             direct.stop();
         }
-        if (streaming.get()) {
+        if (streaming.get() || isUsbCaptureRunning()) {
             disconnect();
         }
     }
 
     private void disconnect() {
         streaming.set(false);
+        UsbCaptureController uc = usbCapture;
+        usbCapture = null;
+        if (uc != null) {
+            uc.stop();
+        }
         closeSocket();
         releaseCodec();
         releaseAudio();
+        final boolean usbCap = captureMode && captureUsbMode;
         uiHandler.post(() -> {
-            startBtn.setText("Start Stream");
+            startBtn.setText(usbCap ? "Start USB" : "Start Stream");
             startBtn.setBackgroundColor(Color.parseColor("#16A34A"));
         });
-        setStatus("Disconnected â€” Tap Start Stream to reconnect");
+        setStatus(usbCap
+                ? "Disconnected — Tap Start USB to reconnect"
+                : "Disconnected — Tap Start Stream to reconnect");
     }
 
     private void closeSocket() {
@@ -1822,13 +2101,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         } catch (Exception ignored) {
         }
-        final String known = getSharedPreferences("gta60", MODE_PRIVATE).getString("host", "");
-        if (known != null && known.matches("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")) {
-            try {
-                final String[] o = known.split("\\.");
-                final InetAddress remembered = InetAddress.getByName(o[0] + "." + o[1] + "." + o[2] + ".255");
-                if (!targets.contains(remembered)) targets.add(remembered);
-            } catch (Exception ignored) {
+        final SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
+        for (String savedIp : new String[]{
+                prefs.getString("captureHost", ""),
+                prefs.getString("host", ""),
+                hostInput != null ? hostInput.getText().toString().trim() : ""}) {
+            if (savedIp != null && savedIp.matches("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")
+                    && !"127.0.0.1".equals(savedIp)) {
+                try {
+                    final InetAddress directIp = InetAddress.getByName(savedIp);
+                    if (!targets.contains(directIp)) targets.add(directIp);
+                    final String[] o = savedIp.split("\\.");
+                    final InetAddress remembered = InetAddress.getByName(o[0] + "." + o[1] + "." + o[2] + ".255");
+                    if (!targets.contains(remembered)) targets.add(remembered);
+                } catch (Exception ignored) {
+                }
             }
         }
         return targets;
@@ -2066,8 +2353,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     double renFps = r / dt;
                     double mbps = (b * 8.0) / (dt * 1e6);
                     long genPct = f > 0 ? Math.round((g * 100.0) / f) : 0;
-                    String hudMsg = String.format("%dx%d @ %.1f/%.1f fps (Gen %d%%) | %.1f Mbps | Feed %.2f ms",
-                            streamWidth, streamHeight, renFps, recvFps, genPct, mbps, lastDecodeMs);
+                    final boolean usbCap = captureMode && captureUsbMode && isUsbCaptureRunning();
+                    final String hudMsg = usbCap
+                            ? String.format("USB %dx%d @ %.1f fps (Gen %d%%) | GPU: %s",
+                                    streamWidth, streamHeight, renFps, genPct, ENHANCE_LABELS[captureEnhanceMode])
+                            : String.format("%dx%d @ %.1f/%.1f fps (Gen %d%%) | %.1f Mbps | Feed %.2f ms",
+                                    streamWidth, streamHeight, renFps, recvFps, genPct, mbps, lastDecodeMs);
                     statusText.setText(hudMsg);
                     if (now - lastPerfLogTimeMs >= 2000) {
                         lastPerfLogTimeMs = now;

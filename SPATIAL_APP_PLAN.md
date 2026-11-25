@@ -1,6 +1,8 @@
-# GTA-Sixty Spatial (`com.gtasixty.spatial`) — Architecture & Recovery Plan
+# GTA-Sixty (`com.gtasixty.spatial`) — Architecture & Recovery Plan
 
-## 1. Side-by-Side App Separation
+> **Update (v2.1):** The legacy flat `quest-app/` (`com.gtasixty.quest`) has been retired and removed. This spatial app (in `quest-spatial-app/`, keeping package ID `com.gtasixty.spatial` to retain settings) is now the sole, main **GTA-Sixty** Quest 3 app, built and installed via `scripts\build-quest-apk.ps1` and `scripts\install-quest-apk.ps1` (`build\GTA-Sixty-Quest3.apk`).
+
+## 1. Historical Side-by-Side Separation
 
 `GTA-Sixty Spatial` lives in its own isolated Android/Gradle module ([quest-spatial-app/](quest-spatial-app/)) and installs side-by-side with the stable flat 2D panel app ([quest-app/](quest-app/)). Neither shares a package ID, launcher tile, preferences file, or auto-updater feed:
 

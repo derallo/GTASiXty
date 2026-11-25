@@ -13,6 +13,7 @@ import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import com.meta.spatial.core.Color4
 import com.meta.spatial.core.Entity
 import com.meta.spatial.core.Lut
 import com.meta.spatial.core.PerformanceLevel
@@ -23,25 +24,40 @@ import com.meta.spatial.core.SpatialFeature
 import com.meta.spatial.core.Vector2
 import com.meta.spatial.core.Vector3
 import com.meta.spatial.core.Vector4
+import com.meta.spatial.isdk.IsdkBoxCollider
+import com.meta.spatial.isdk.IsdkGrabMovementType
+import com.meta.spatial.isdk.IsdkGrabState
+import com.meta.spatial.isdk.IsdkGrabbable
+import com.meta.spatial.isdk.IsdkPanelDimensions
 import com.meta.spatial.isdk.IsdkPanelGrabHandle
 import com.meta.spatial.isdk.IsdkPanelResize
+import com.meta.spatial.isdk.IsdkSystem
 import com.meta.spatial.isdk.ResizeCornerState
 import com.meta.spatial.isdk.ResizeMode
 import com.meta.spatial.isdk.updateIsdkComponentProperties
 import com.meta.spatial.runtime.AlphaMode
+import com.meta.spatial.runtime.ButtonBits
 import com.meta.spatial.runtime.LayerFilters
 import com.meta.spatial.runtime.PanelConfigOptions
 import com.meta.spatial.runtime.PanelSceneObject
 import com.meta.spatial.runtime.PanelShapeLayerBlendType
+import com.meta.spatial.runtime.PointerEvent
+import com.meta.spatial.runtime.PointerEventType
 import com.meta.spatial.runtime.SceneObject
+import com.meta.spatial.runtime.SemanticType
 import com.meta.spatial.toolkit.ActivityPanelRegistration
 import com.meta.spatial.toolkit.AppSystemActivity
 import com.meta.spatial.toolkit.AvatarSystem
+import com.meta.spatial.toolkit.Box
 import com.meta.spatial.toolkit.Controller
 import com.meta.spatial.toolkit.CylinderShapeOptions
 import com.meta.spatial.toolkit.DpDisplayOptions
 import com.meta.spatial.toolkit.Grabbable
 import com.meta.spatial.toolkit.GrabbableType
+import com.meta.spatial.toolkit.Hittable
+import com.meta.spatial.toolkit.Material
+import com.meta.spatial.toolkit.Mesh
+import com.meta.spatial.toolkit.MeshCollision
 import com.meta.spatial.toolkit.PanelRegistration
 import com.meta.spatial.toolkit.PanelRenderMode
 import com.meta.spatial.toolkit.QuadShapeOptions
@@ -51,12 +67,13 @@ import com.meta.spatial.toolkit.Transform
 import com.meta.spatial.toolkit.UIPanelRenderOptions
 import com.meta.spatial.toolkit.UIPanelSettings
 import com.meta.spatial.toolkit.UIPanelShapeOptions
+import com.meta.spatial.toolkit.Visible
 import com.meta.spatial.toolkit.createPanelEntity
 import com.meta.spatial.vr.VRFeature
 import kotlin.math.abs
 
 /**
- * Meta Spatial SDK Passthrough MR host activity for GTA-Sixty Spatial.
+ * Meta Spatial SDK Passthrough MR host activity for GTA-Sixty.
  *
  * Critical swapchain invariant: ALWAYS keep `mips = 1`, `enableLayer = true`,
  * `forceSceneTexture = false`, and `fragmentShader = ""` so PanelSurface remains on
@@ -78,10 +95,25 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         private const val PANEL_DPI = 256
         private const val MIN_RESHAPE_INTERVAL_MS = 45L
         private const val CONTROLLER_HIDE_IDLE_MS = 5000L
+
+        private const val HANDLE_BOTTOM_GAP_M = 0.065f
+        private val HANDLE_COLLIDER_SIZE = Vector3(0.56f, 0.14f, 0.08f)
+        private val HANDLE_RAY_HALF_EXTENTS = Vector3(0.30f, 0.09f, 0.06f)
+        private val HANDLE_COLOR_IDLE = Color4(0.88f, 0.93f, 1.0f, 0.85f)
+        private val HANDLE_COLOR_HOVER = Color4(0.35f, 0.88f, 1.0f, 0.98f)
+        private val HANDLE_COLOR_DRAG = Color4(0.18f, 0.95f, 0.65f, 1.0f)
+        private const val HANDLE_VISUAL_IDLE = 0
+        private const val HANDLE_VISUAL_HOVER = 1
+        private const val HANDLE_VISUAL_DRAG = 2
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var panelEntity: Entity? = null
+    private var grabHandleEntity: Entity? = null
+    private var grabHandleVisualEntity: Entity? = null
+    private var grabHandleMaterial: Material? = null
+    private var grabHandleVisualState = -1
+    private var handleObserverHandle: IsdkSystem.InteractableObserverHandle? = null
     private var sceneReady = false
 
     private var appliedCurvePct = -1
@@ -101,6 +133,14 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     private var initialRecenterDeadlineMs = 0L
     private var wasCornerResizing = false
     private var wasGrabbing = false
+    private var wasHandleGrabbing = false
+    private val hoveredHandleSources = HashSet<Entity>()
+    private var rayHoveredHandle = false
+    private val prevTriggerDown = HashMap<Long, Boolean>()
+    private var triggerDragSource: Entity? = null
+    private var triggerDragDist = 2.2f
+    private var triggerDragOffset = Vector3(0f, 0f, 0f)
+    private var lastSceneTickMs = 0L
     private var lastViewerPos: Vector3? = null
     private var lastControllerActivityMs = 0L
     private var controllerVisualsVisible = true
@@ -243,6 +283,12 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             Transform(initialPose),
             Grabbable(true, GrabbableType.PIVOT_Y),
             IsdkPanelGrabHandle(),
+            IsdkPanelDimensions(
+                Vector2(
+                    appliedWidthMeters,
+                    appliedWidthMeters / SpatialDisplayBridge.ASPECT_RATIO
+                )
+            ),
             IsdkPanelResize(
                 currentSettings.curvePct == 0,
                 ResizeMode.Simple,
@@ -253,6 +299,45 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         )
         panelEntity = ent
         syncHandleComponentsForCurvature(ent, currentSettings.curvePct > 0)
+
+        val handlePose = computeGrabHandlePose()
+        val handleEnt = Entity.create(
+            listOf(
+                Transform(handlePose),
+                IsdkBoxCollider(HANDLE_COLLIDER_SIZE, Vector3(0f, 0f, 0f)),
+                IsdkGrabbable(
+                    enabled = true,
+                    grabState = IsdkGrabState.NotGrabbed,
+                    movementType = IsdkGrabMovementType.AxialBillboard
+                ),
+                Hittable(MeshCollision.LineTest),
+                Visible(true)
+            )
+        )
+        grabHandleEntity = handleEnt
+
+        val handleMat = Material().apply {
+            baseColor = HANDLE_COLOR_IDLE
+            unlit = true
+            alphaMode = AlphaMode.TRANSLUCENT.ordinal
+        }
+        grabHandleMaterial = handleMat
+        grabHandleVisualState = HANDLE_VISUAL_IDLE
+        grabHandleVisualEntity = Entity.create(
+            listOf(
+                Mesh(Box.URI),
+                Box(Vector3(-0.22f, -0.014f, -0.008f), Vector3(0.22f, 0.014f, 0.008f)),
+                handleMat,
+                Transform(handlePose),
+                Hittable(MeshCollision.NoCollision),
+                Visible(true)
+            )
+        )
+
+        handleObserverHandle = systemManager.tryFindSystem<IsdkSystem>()
+            ?.registerInteractableObserver(handleEnt) { event ->
+                onHandlePointerEvent(event)
+            }
 
         needsInitialRecenter = true
         initialRecenterDeadlineMs = SystemClock.uptimeMillis() + 1500L
@@ -265,21 +350,25 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     override fun onSceneTick() {
         super.onSceneTick()
         val ent = panelEntity ?: return
+        val now = SystemClock.uptimeMillis()
+        val dtSec = if (lastSceneTickMs > 0L) ((now - lastSceneTickMs) / 1000.0f).coerceIn(0.001f, 0.05f) else 0.011f
+        lastSceneTickMs = now
+
         val viewer = scene.getViewerPose()
         val hasRealHead = viewer.t.length() > 0.01f || abs(viewer.q.w - 1f) > 0.001f
 
         if (needsInitialRecenter) {
-            if (hasRealHead || SystemClock.uptimeMillis() >= initialRecenterDeadlineMs) {
+            if (hasRealHead || now >= initialRecenterDeadlineMs) {
                 needsInitialRecenter = false
                 lastViewerPos = viewer.t
                 recenterPanelNow()
             }
-        } else if (hasRealHead && !wasGrabbing && !wasCornerResizing) {
+        } else if (hasRealHead && !wasGrabbing && !wasCornerResizing && !wasHandleGrabbing && triggerDragSource == null) {
             val prevPos = lastViewerPos
             lastViewerPos = viewer.t
             val headJump = if (prevPos != null) (viewer.t - prevPos).length() else 0f
             val distToAnchor = (viewer.t - anchorCenter).length()
-            val maxReachableDist = currentSettings.distanceMeters + 3.0f
+            val maxReachableDist = maxOf(currentSettings.distanceMeters + 3.5f, 7.5f)
             if (headJump > 0.85f || distToAnchor > maxReachableDist) {
                 Log.i(
                     TAG,
@@ -327,18 +416,111 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             wasCornerResizing = false
         }
 
-        val grabComp = ent.tryGetComponent<Grabbable>()
-        if (grabComp != null) {
-            if (grabComp.isGrabbed) {
-                wasGrabbing = true
-            } else if (wasGrabbing) {
-                wasGrabbing = false
-                syncAnchorFromEntity(ent)
-                applyCurrentPose(ent)
+        val handleEnt = grabHandleEntity
+        val triggerMask = ButtonBits.ButtonTriggerL or ButtonBits.ButtonTriggerR
+        val pushMask = ButtonBits.ButtonThumbLU or ButtonBits.ButtonThumbRU
+        val pullMask = ButtonBits.ButtonThumbLD or ButtonBits.ButtonThumbRD
+        rayHoveredHandle = false
+        val handlePose = handleEnt?.tryGetComponent<Transform>()?.transform
+
+        for (cEnt in Query.where { has(Controller.id, Transform.id) }.eval()) {
+            val c = cEnt.tryGetComponent<Controller>() ?: continue
+            val triggerDown = (c.buttonState and triggerMask) != 0
+            val wasDown = prevTriggerDown[cEnt.id] ?: false
+            prevTriggerDown[cEnt.id] = triggerDown
+
+            val cPose = cEnt.tryGetComponent<Transform>()?.transform ?: continue
+            if (handlePose != null) {
+                val rawFwd = cPose.forward()
+                val rayDir = if (rawFwd.length() > 1e-4f) rawFwd.normalize() else Vector3(0f, 0f, 1f)
+                val hitT = intersectRayHandleObb(cPose.t, rayDir, handlePose, HANDLE_RAY_HALF_EXTENTS)
+                if (hitT != null) {
+                    rayHoveredHandle = true
+                    if (triggerDown && !wasDown && triggerDragSource == null && !wasHandleGrabbing && !wasGrabbing) {
+                        beginTriggerDrag(cEnt, cPose.t + rayDir * hitT)
+                    }
+                }
             }
         }
 
+        val dragSrc = triggerDragSource
+        if (dragSrc != null) {
+            val srcCtrl = dragSrc.tryGetComponent<Controller>()
+            if (srcCtrl != null && (srcCtrl.buttonState and triggerMask) == 0) {
+                endTriggerDrag()
+            } else {
+                if (srcCtrl != null) {
+                    if ((srcCtrl.buttonState and pushMask) != 0) {
+                        triggerDragDist = (triggerDragDist + 1.4f * dtSec).coerceIn(
+                            SpatialDisplayBridge.MIN_DIST_M,
+                            SpatialDisplayBridge.MAX_DIST_M
+                        )
+                    } else if ((srcCtrl.buttonState and pullMask) != 0) {
+                        triggerDragDist = (triggerDragDist - 1.4f * dtSec).coerceIn(
+                            SpatialDisplayBridge.MIN_DIST_M,
+                            SpatialDisplayBridge.MAX_DIST_M
+                        )
+                    }
+                }
+                val srcPose = dragSrc.tryGetComponent<Transform>()?.transform
+                if (srcPose != null) {
+                    val rawFwd = srcPose.forward()
+                    val rayDir = if (rawFwd.length() > 1e-4f) rawFwd.normalize() else Vector3(0f, 0f, 1f)
+                    val targetHandlePos = srcPose.t + rayDir * triggerDragDist + triggerDragOffset
+                    val toTarget = Vector3(targetHandlePos.x - viewer.t.x, 0f, targetHandlePos.z - viewer.t.z)
+                    if (toTarget.length() > 0.05f) {
+                        anchorYaw = Quaternion.lookRotationAroundY(toTarget.normalize())
+                    }
+                    val rot = anchorYaw * Quaternion.fromAxisAngle(Vector3(1f, 0f, 0f), currentSettings.tiltDeg)
+                    val up = Pose(Vector3(0f, 0f, 0f), rot).up()
+                    val panelW = if (appliedWidthMeters > 0f) appliedWidthMeters else currentSettings.widthMeters
+                    val panelH = panelW / SpatialDisplayBridge.ASPECT_RATIO
+                    val visualCenter = targetHandlePos + up * (panelH * 0.5f + HANDLE_BOTTOM_GAP_M)
+                    anchorCenter = Vector3(
+                        visualCenter.x,
+                        visualCenter.y - currentSettings.heightOffsetM,
+                        visualCenter.z
+                    )
+                    applyCurrentPose(ent)
+                }
+            }
+        }
+
+        val isPanelGrabbed = triggerDragSource == null && (
+            (ent.tryGetComponent<IsdkGrabbable>()?.grabState == IsdkGrabState.Grabbed) ||
+                (ent.tryGetComponent<Grabbable>()?.isGrabbed == true)
+            )
+        if (isPanelGrabbed) {
+            wasGrabbing = true
+            syncAnchorFromEntity(ent)
+            val hp = computeGrabHandlePose()
+            grabHandleEntity?.setComponent(Transform(hp))
+            grabHandleVisualEntity?.setComponent(Transform(hp))
+        } else if (wasGrabbing) {
+            wasGrabbing = false
+            syncAnchorFromEntity(ent)
+            applyCurrentPose(ent)
+        }
+
+        val isHandleGrabbed = triggerDragSource == null && handleEnt != null && (
+            (handleEnt.tryGetComponent<IsdkGrabbable>()?.grabState == IsdkGrabState.Grabbed) ||
+                (handleEnt.tryGetComponent<Grabbable>()?.isGrabbed == true)
+            )
+        if (isHandleGrabbed && handleEnt != null) {
+            wasHandleGrabbing = true
+            syncAnchorFromGrabHandle(handleEnt)
+            applyPanelPoseOnly(ent)
+            handleEnt.tryGetComponent<Transform>()?.transform?.let { hp ->
+                grabHandleVisualEntity?.setComponent(Transform(hp))
+            }
+        } else if (wasHandleGrabbing && handleEnt != null) {
+            wasHandleGrabbing = false
+            syncAnchorFromGrabHandle(handleEnt)
+            applyCurrentPose(ent)
+        }
+
         updateControllerVisibility()
+        updateGrabHandleVisualState()
     }
 
     override fun onDisplaySettingsChanged(settings: SpatialDisplayBridge.DisplaySettings) {
@@ -397,6 +579,10 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(reshapeRunnable)
+        handleObserverHandle?.let { h ->
+            systemManager.tryFindSystem<IsdkSystem>()?.unregisterInteractableObserver(h)
+        }
+        handleObserverHandle = null
         SpatialDisplayBridge.setSpatialListener(null)
         try {
             unregisterReceiver(debugReceiver)
@@ -531,7 +717,12 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
 
     private fun updateControllerVisibility() {
         val now = SystemClock.uptimeMillis()
-        var controllerActive = wasGrabbing || wasCornerResizing
+        var controllerActive = wasGrabbing ||
+            wasCornerResizing ||
+            wasHandleGrabbing ||
+            triggerDragSource != null ||
+            rayHoveredHandle ||
+            hoveredHandleSources.isNotEmpty()
         if (!controllerActive) {
             for (entity in Query.where { has(Controller.id) }.eval()) {
                 val c = entity.tryGetComponent<Controller>() ?: continue
@@ -557,7 +748,118 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         avatarSystem.setShowHands(visible)
         controllerVisualsVisible = visible
         panelEntity?.let { syncHandleComponentsForCurvature(it, appliedCurvePct > 0) }
+        grabHandleEntity?.setComponent(Visible(true))
+        grabHandleVisualEntity?.setComponent(Visible(visible))
         Log.i(TAG, "Quest controller/hand visuals & bottom handle visible=$visible")
+    }
+
+    private fun onHandlePointerEvent(event: PointerEvent) {
+        when (event.type) {
+            PointerEventType.Hover.id -> {
+                hoveredHandleSources.add(event.source)
+                lastControllerActivityMs = SystemClock.uptimeMillis()
+                if (!controllerVisualsVisible) {
+                    setControllerVisualsVisible(true)
+                }
+            }
+            PointerEventType.Unhover.id -> {
+                hoveredHandleSources.remove(event.source)
+            }
+            PointerEventType.Select.id -> {
+                if (event.semanticType == SemanticType.Select.id &&
+                    triggerDragSource == null &&
+                    !wasHandleGrabbing &&
+                    !wasGrabbing
+                ) {
+                    beginTriggerDrag(event.source, event.hitInfo.point)
+                }
+            }
+            PointerEventType.Unselect.id, PointerEventType.Cancel.id -> {
+                if (event.source == triggerDragSource) {
+                    endTriggerDrag()
+                }
+            }
+        }
+    }
+
+    private fun beginTriggerDrag(source: Entity, hitPoint: Vector3) {
+        if (triggerDragSource != null) return
+        val handlePose = grabHandleEntity?.tryGetComponent<Transform>()?.transform ?: return
+        val srcPose = source.tryGetComponent<Transform>()?.transform ?: return
+        triggerDragSource = source
+        val dist = (hitPoint - srcPose.t).length().coerceIn(0.4f, SpatialDisplayBridge.MAX_DIST_M + 1.5f)
+        triggerDragDist = dist
+        val rawFwd = srcPose.forward()
+        val rayDir = if (rawFwd.length() > 1e-4f) rawFwd.normalize() else Vector3(0f, 0f, 1f)
+        triggerDragOffset = handlePose.t - (srcPose.t + rayDir * dist)
+        lastControllerActivityMs = SystemClock.uptimeMillis()
+        if (!controllerVisualsVisible) {
+            setControllerVisualsVisible(true)
+        }
+        Log.i(TAG, "Started bottom handle trigger drag (dist=${dist}m)")
+    }
+
+    private fun endTriggerDrag() {
+        if (triggerDragSource == null) return
+        triggerDragSource = null
+        panelEntity?.let { applyCurrentPose(it) }
+        Log.i(TAG, "Ended bottom handle trigger drag")
+    }
+
+    private fun updateGrabHandleVisualState() {
+        val mat = grabHandleMaterial ?: return
+        val nextState = when {
+            triggerDragSource != null || wasHandleGrabbing -> HANDLE_VISUAL_DRAG
+            rayHoveredHandle || hoveredHandleSources.isNotEmpty() -> HANDLE_VISUAL_HOVER
+            else -> HANDLE_VISUAL_IDLE
+        }
+        if (nextState == grabHandleVisualState) return
+        grabHandleVisualState = nextState
+        mat.baseColor = when (nextState) {
+            HANDLE_VISUAL_DRAG -> HANDLE_COLOR_DRAG
+            HANDLE_VISUAL_HOVER -> HANDLE_COLOR_HOVER
+            else -> HANDLE_COLOR_IDLE
+        }
+        grabHandleVisualEntity?.setComponent(mat)
+    }
+
+    private fun intersectRayHandleObb(
+        rayOrigin: Vector3,
+        rayDir: Vector3,
+        handlePose: Pose,
+        halfExtents: Vector3
+    ): Float? {
+        val invQ = handlePose.q.inverse()
+        val o = invQ * (rayOrigin - handlePose.t)
+        val d = invQ * rayDir
+        var tMin = 0.1f
+        var tMax = 8.0f
+
+        val axes = arrayOf(
+            floatArrayOf(o.x, d.x, halfExtents.x),
+            floatArrayOf(o.y, d.y, halfExtents.y),
+            floatArrayOf(o.z, d.z, halfExtents.z)
+        )
+        for (a in axes) {
+            val origin = a[0]
+            val dir = a[1]
+            val half = a[2]
+            if (abs(dir) < 1e-5f) {
+                if (origin < -half || origin > half) return null
+            } else {
+                var t1 = (-half - origin) / dir
+                var t2 = (half - origin) / dir
+                if (t1 > t2) {
+                    val tmp = t1
+                    t1 = t2
+                    t2 = tmp
+                }
+                if (t1 > tMin) tMin = t1
+                if (t2 < tMax) tMax = t2
+                if (tMin > tMax) return null
+            }
+        }
+        return tMin
     }
 
     private fun applyDisplayRefreshRate(hz: Int) {
@@ -649,7 +951,39 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         return Pose(entityPos, rot)
     }
 
-    private fun applyCurrentPose(ent: Entity) {
+    private fun computeGrabHandlePose(): Pose {
+        val visualCenter = Vector3(
+            anchorCenter.x,
+            anchorCenter.y + currentSettings.heightOffsetM,
+            anchorCenter.z
+        )
+        val rot = anchorYaw * Quaternion.fromAxisAngle(Vector3(1f, 0f, 0f), currentSettings.tiltDeg)
+        val up = Pose(Vector3(0f, 0f, 0f), rot).up()
+        val panelW = if (appliedWidthMeters > 0f) appliedWidthMeters else currentSettings.widthMeters
+        val panelH = panelW / SpatialDisplayBridge.ASPECT_RATIO
+        return Pose(visualCenter - up * (panelH * 0.5f + HANDLE_BOTTOM_GAP_M), rot)
+    }
+
+    private fun syncAnchorFromGrabHandle(handleEnt: Entity) {
+        val tComp = handleEnt.tryGetComponent<Transform>() ?: return
+        val pose = tComp.transform
+        val fwd = pose.forward()
+        val horiz = Vector3(fwd.x, 0f, fwd.z)
+        if (horiz.length() > 1e-4f) {
+            anchorYaw = Quaternion.lookRotationAroundY(horiz.normalize())
+        }
+        val up = pose.up()
+        val panelW = if (appliedWidthMeters > 0f) appliedWidthMeters else currentSettings.widthMeters
+        val panelH = panelW / SpatialDisplayBridge.ASPECT_RATIO
+        val visualCenter = pose.t + up * (panelH * 0.5f + HANDLE_BOTTOM_GAP_M)
+        anchorCenter = Vector3(
+            visualCenter.x,
+            visualCenter.y - currentSettings.heightOffsetM,
+            visualCenter.z
+        )
+    }
+
+    private fun applyPanelPoseOnly(ent: Entity) {
         val pose = composePanelPose(
             anchorCenter,
             anchorYaw,
@@ -659,5 +993,14 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         )
         lastWrittenPose = pose
         ent.setComponent(Transform(pose))
+    }
+
+    private fun applyCurrentPose(ent: Entity) {
+        applyPanelPoseOnly(ent)
+        if (!wasHandleGrabbing) {
+            val handlePose = computeGrabHandlePose()
+            grabHandleEntity?.setComponent(Transform(handlePose))
+            grabHandleVisualEntity?.setComponent(Transform(handlePose))
+        }
     }
 }

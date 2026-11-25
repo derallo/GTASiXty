@@ -24,11 +24,9 @@ third_party/build-mbedtls.cmd
 *.jpeg
 
 # Android signing material
-quest-app/debug.keystore
 *.keystore
 *.jks
 *.apk
-!releases/GTA-Sixty-Quest3.apk
 *.idsig
 
 # Auth material - never commit
