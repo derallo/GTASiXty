@@ -18,6 +18,17 @@ struct CaptureFormat {
     bool audio = false;
 };
 
+// What a caller is willing to accept from the card. The defaults are the Quest capture-card mode's
+// contract (uncompressed up to 1440p): raising them is opt-in because 4K60 NV12 is 746 MB/s, which
+// only fits a 10 Gbit/s USB link, and because the Quest encode path is already over budget at 2160p.
+struct CaptureLimits {
+    uint32_t maxWidth = 2560;
+    uint32_t maxHeight = 1440;
+    uint32_t minWidth = 1280;
+    uint32_t minHeight = 720;
+    uint32_t maxFps = 120;
+};
+
 // One ReadSample. Video and audio arrive as separate samples, so a single read() fills at most one.
 struct CaptureRead {
     bool video = false;
@@ -37,6 +48,8 @@ public:
 
     // Empty substring selects the first video capture device.
     bool open(const std::wstring& deviceNameSubstring);
+    // Same, with an explicit resolution envelope (TV mode raises it to 4K).
+    bool open(const std::wstring& deviceNameSubstring, const CaptureLimits& limits);
     void close();
 
     const CaptureFormat& format() const;

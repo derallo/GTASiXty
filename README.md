@@ -1,258 +1,208 @@
-# GTA-Sixty
+# GTA-Sixty (`GTASiXty`)
 
-Play your Xbox Series X|S on a Meta Quest 3 over your LAN, with an optional GPU pass that can
-upscale and/or interpolate frames before they reach the headset.
+Play your **Xbox Series X|S** on a **Meta Quest 3** at up to **1440p60 / 120 fps** in Mixed Reality or inside a full 3D VR recreation of **Jimmy De Santa's bedroom from GTA V**, with real-time on-headset **Adreno 740 upscaling** and **optical-flow frame generation** (30 fps → 60 / 90 / 120 fps).
 
+[![Download Latest APK](https://img.shields.io/badge/Download-Quest%203%20APK%20(v2.1)-00b894?style=for-the-badge)](https://github.com/derallo/GTASiXty/releases/latest)
+
+---
+
+## Highlights
+
+- **Jimmy's Room 3D VR Environment** — Step inside Jimmy De Santa's bedroom (`V_Michael_1_Son` from GTA V Enhanced) at locked **120 Hz** on Quest 3, with your live Xbox display mounted cleanly inside Jimmy's TV bezel.
+- **On-Quest Adreno 740 Upscaling & Optical-Flow Frame Generation** — 3-phase OpenGL ES 3.0/3.1 post-processing pipeline featuring **Qualcomm SGSR1** 12-tap `fastLanczos2` super-resolution, dither-aware **RCAS**, YCoCg variance-clamped temporal foliage accumulation (**SGSR2-lite TAA**), and **GLES 3.1 shared-memory compute optical flow** (`640×360`) for **FG60 / FG90 / FG120** frame generation.
+- **Flexible Low-Latency Streaming Modes**:
+  1. **Capture Mode (LAN or Direct USB-C UVC)** — HDMI capture card via dedicated Linux VA-API box (`linux-capture/`), Windows NVENC PC (`--capture`), or plugged straight into the Quest 3 USB-C port. Leaves your Xbox controller paired natively to the console.
+  2. **Direct Mode (Quest ↔ Xbox WebRTC)** — No PC required; the headset signs in to your Xbox account and streams directly over LAN WebRTC ([DIRECT_MODE.md](DIRECT_MODE.md)).
+  3. **Windows PC Relay Mode** — Xbox Remote Play → Windows PC (D3D12 dedup + NVOFA optical-flow FG + EASU/RCAS + NVENC H.264/HEVC) → Quest 3 over TCP (`7660`).
+- **Spatial MR Theater Controls** — Locked `16:9` `2560×1440` zero-copy OpenXR layer (`mips = 1`, `LayerFilters.HIGHEST_QUALITY`) with **Curve** (`0–100%`), **Tilt** (`-45°` to `+45°`), **Height**, **Screen Size**, **Room Depth**, **Backdrop** (`Passthrough → Dim → Dark → Jimmy's Room`), **Recenter**, bottom window drag handle (**Trigger** or **Grip/Pinch** + thumbstick depth), and built-in **Net Check** diagnostics.
+
+---
+
+## Jimmy's Room 3D VR Environment
+
+Cycle **Display → Backdrop** (`Passthrough → Dim → Dark → Jimmy's Room`) to leave passthrough behind and play your Xbox on Jimmy's bedroom TV inside a 1:1 3D VR room built from GTA V Enhanced (`v_int_44` / `V_Michael_1_Son`).
+
+- **Genuine Geometry & Textures**: Assembled from 47/48 unique room shell, furniture, and prop meshes (`prop_tv_flat_01`, `v_res_msoncabinet`, `prop_console_01`, `prop_speaker_06`, guitar/amp stack, bed, desk, PC setup, posters, clutter) and 147/147 decoded BC1–BC7 textures packaged into `quest-spatial-app/src/main/assets/scenes/jimmys_room.glb`.
+- **120 Hz Quest 3 Performance**: Uses `KHR_materials_unlit` with pre-baked vertex lighting (combining Rockstar's baked artificial/natural/AO vertex channels, overhead spotlights, golden sunlight shaft through the curtains, warm bedside lamp glow, desk lamp spotlight, and subtle TV/monitor bounce) plus normal-map micro-relief baked into diffuse maps — leaving full GPU headroom for 1440p upscaling and optical-flow frame generation.
+- **TV Bezel Lock & Comfort Controls**:
+  - The live `2560×1440` OpenXR panel locks flat at exact `16:9` (`2.100 m × 1.181 m`) inside Jimmy's TV bay (`1.5 cm` proud of the bezel to prevent Z-fighting).
+  - **Screen Size**, **Curve**, and **Tilt** are automatically locked while in the room so the screen never detaches from the TV, and **Room Depth** switches to **Seat Distance to TV** (`1.32 m – 3.57 m`), moving the room and TV together as a rigid unit alongside **Height** and **Recenter**.
+  - Switching back to `Passthrough`, `Dim`, or `Dark` restores your saved flat/curved theater size, curve, and tilt.
+
+See [JIMMYS_ROOM_HANDOFF.md](JIMMYS_ROOM_HANDOFF.md) for the coordinate mapping, extraction/build scripts (`scripts/extract_gtav_enhanced_jimmys_room.py`, `scripts/build_real_jimmys_room_glb.py`), and spatial invariants.
+
+---
+
+## Upscaling & Optical-Flow Frame Generation
+
+GTA-Sixty runs a dedicated real-time GPU enhancement pipeline designed for **30 fps console games** (like GTA V / GTA VI) as well as native **60 fps** streams.
+
+### On-Quest Adreno 740 Pipeline (`CaptureGlRenderer.java`)
+
+Built in OpenGL ES 3.0 / 3.1 directly on the Quest 3's Snapdragon XR2 Gen 2 (Adreno 740) with `SUSTAINED_HIGH` GPU boost and **1:1 `2560×1440`** output into the OpenXR `AndroidSurfaceSwapchain` (`mips = 1` + `LayerFilters.HIGHEST_QUALITY` compositor super-sampling):
+
+1. **Super-Resolution & Sharpening (`SR` / `RCAS`)**:
+   - **Qualcomm SGSR1** 12-tap `fastLanczos2` edge-directed spatial upscaling to `2560×1440`.
+   - **Dither-aware RCAS** (Robust Contrast Adaptive Sharpening) tuned to sharpen detail without amplifying compression noise or sky banding, plus **sky debanding**.
+   - **YCoCg Variance-Clamped Temporal Accumulation (SGSR2-lite TAA)** to stabilize fine foliage and sub-pixel shimmer.
+2. **Optical-Flow Frame Generation (`FG60`, `FG90`, `FG120` + optional `+SR`)**:
+   - **GLES 3.1 Shared-Memory Compute Optical Flow** (`COMP_FLOW_COARSE` `160×90` → `COMP_FLOW_FINE` `640×360`, with automatic fragment-shader fallback) writing `GL_RGBA16F` motion vectors (`MAX_UV = 0.20`).
+   - **Foliage-Safe 4× Bilinear Luma Box Downsample**, **Bidirectional Occlusion Check**, **4-Candidate Trajectory Warp**, and smooth confidence fallback to prevent HUD/foliage tearing.
+   - **Async PBO Affine `GlobalMotionEstimator`** to lock fast camera pans and stabilize motion estimation.
+   - **Choreographer VSync-Locked Sub-Frame Pacing** (`eglPresentationTimeANDROID`) + **ADPF `PerformanceHintManager`** CPU boost + fixed cadence locking (`CaptureCadenceController`) to convert 30 fps console cadence smoothly into **60 fps (2×)**, **90 fps (3×)**, or **120 fps (4×)**.
+
+| On-Quest Mode | What It Does |
+|---|---|
+| `Off` | Zero-overhead passthrough |
+| `RCAS` | Dither-aware contrast-adaptive sharpening |
+| `SR` | Qualcomm SGSR1 12-tap upscaling + RCAS + temporal foliage stabilization |
+| `FG60` / `FG60+SR` | 2× optical-flow frame generation (30 → 60 fps), optionally paired with SR |
+| `FG90` / `FG90+SR` | 3× optical-flow frame generation (30 → 90 fps), optionally paired with SR |
+| `FG120` / `FG120+SR` | 4× optical-flow frame generation (30 → 120 fps), optionally paired with SR |
+
+### Windows PC D3D12 Pipeline (`src/`)
+
+When using the Windows PC streamer (`GTA-Sixty.exe`), an optional NVIDIA D3D12 GPU pass performs duplicate-frame detection, **NVOFA** optical-flow interpolation, **EASU / RCAS** upscaling & sharpening (`--upscale 1080p|1440p|4k`, `--sharpness`), and single-pass ultra-low-latency **NVENC** (`H.264` or `HEVC`) before streaming over TCP `7660`.
+
+---
+
+## Streaming Architecture
+
+```text
+1) Capture Mode (LAN — Linux VA-API or Windows NVENC)
+   Xbox Series X --HDMI--> Capture Card --> Linux/PC Encoder --GT60 TCP 7660 (HEVC/H.264)--> Quest 3 (Adreno 740 SR/FG)
+
+2) Capture Mode (Direct USB-C UVC)
+   Xbox Series X --HDMI--> USB-C UVC Capture Card --> Quest 3 (Direct UVC -> Adreno 740 SR/FG)
+
+3) Direct Mode (No PC)
+   Xbox Series X --WebRTC (ICE/SRTP over LAN)--> Quest 3 APK
+
+4) Windows PC Relay Mode
+   Xbox Series X --WebRTC (LAN)--> Windows PC (D3D12 dedup/NVOFA/EASU/NVENC) --GT60 TCP 7660--> Quest 3
 ```
-Xbox Series X  --WebRTC(1440p H.264)-->  Windows PC  --TCP(NVENC)-->  Quest 3 APK
-   (console,           (LAN)             D3D12 pipeline:              MediaCodec
-    remote play)                        decode -> dedup -> upscale      -> Surface
-                                        -> NVENC (H.264 or HEVC, ULL)
-```
 
-The PC sits in the middle so it can do work the console can't: remove duplicated frames, run
-optical-flow frame interpolation, and upscale/sharpene with EASU/RCAS before re-encoding for the
-headset. It also keeps you off the cloud relay, since the console and PC talk directly over the LAN.
+---
 
-**Direct mode** skips the PC entirely: the headset signs in to the account itself and receives the
-console's WebRTC stream, with no decode/upscale/re-encode hop. It trades the PC's frame generation
-and sharpening for one less encode and one less network hop - see [DIRECT_MODE.md](DIRECT_MODE.md).
+## Quick Start (Quest 3 APK)
 
-```
-Xbox Series X  --WebRTC(ICE/SRTP over the LAN)-->  Quest 3 APK (Direct mode)
-```
+1. Download **`GTA-Sixty-Quest3.apk`** from the [GitHub Releases](https://github.com/derallo/GTASiXty/releases/latest) page.
+2. Sideload via ADB (USB or wireless `adb connect <quest-ip>:5555`):
+   ```powershell
+   adb install -r GTA-Sixty-Quest3.apk
+   ```
+   Or from this repo:
+   ```powershell
+   scripts\install-quest-apk.ps1 -Launch
+   ```
+3. Launch **GTA-Sixty** from Unknown Sources on Quest 3:
+   - Tap **Mode** to pick **Capture**, **Direct**, or **PC**.
+   - Tap **Display** to adjust **Curve**, **Tilt**, **Height**, **Screen Size**, **Room Depth**, or switch **Backdrop** to **Jimmy's Room**.
+   - Grab the bottom handle bar with **Trigger** or **Grip/Pinch** to move the screen (push thumbstick up/down while holding Trigger to adjust depth).
+   - Use **Net Check** anytime to verify LAN, TCP `7660`, USB UVC, and Xbox connectivity.
 
-## Requirements
+---
 
-- **Windows 10/11 x64** (developed against the Windows 10/11 SDK)
-- **NVIDIA GPU** with NVENC — the encoder is bound to D3D12, and DXVA decode is used where available
-- **Xbox Series X|S** with remote play enabled and the console on the same LAN
-- **Meta Quest 3** (Quest 2/Pro will likely work but is untested)
-- **Wired Ethernet** on all three is strongly recommended. Latency is dominated by the console's
-  encoder and the network path, not the PC.
-- Visual Studio 2022 (C++ tools), CMake, Ninja, Windows SDK `dxc.exe`
-- Android SDK build-tools + JDK 17 (only if you want to rebuild the headset APK)
+## Building From Source
 
-## Build
+### Requirements
+- **Quest 3 APK (`quest-spatial-app/`)**: Android SDK (API 35) + JDK 17.
+- **Linux Capture Server (`linux-capture/`)**: CMake, C++20 compiler, FFmpeg (`libavcodec`/`libavutil`), ALSA (`libasound2-dev`), Intel/AMD VA-API (`libva`).
+- **Windows PC Streamer (`src/`)**: Windows 10/11 x64, NVIDIA GPU (NVENC/NVOFA), Visual Studio 2022 (C++), CMake, Ninja, Windows SDK `dxc.exe`.
+
+### Build Commands
 
 ```powershell
-# PC side (downloads OpenXR loader + builds mbedTLS on first run)
+# Quest 3 APK -> build\GTA-Sixty-Quest3.apk
+scripts\build-quest-apk.ps1
+
+# Windows PC streamer -> build\GTA-Sixty.exe
 scripts\build.ps1
 
-# Headset APK
-scripts\build-quest-apk.ps1
-```
-
-Both write into `build\`.
-
-```powershell
-# D3D12 / NVOFA / NVENC / GT60 protocol tests (the encode round-trip runs once per codec)
+# Windows unit / protocol tests
 build\GTA-Sixty_tests.exe
 ```
 
-## Run
-
-```powershell
-# one-time: sign in to your Microsoft account (device-code flow)
-build\GTA-Sixty.exe --login
-
-# confirm the console is visible
-build\GTA-Sixty.exe --list-consoles
-
-# stream to the headset
-build\GTA-Sixty.exe --connect auto --quest-server --bitrate 120
-
-# HDMI capture card on this PC, encoded here and sent to the Quest (no Xbox remote play)
-build\GTA-Sixty.exe --capture --bitrate 50
+```bash
+# Linux capture-card server (on Linux capture PC)
+cmake -B linux-capture/build -S linux-capture
+cmake --build linux-capture/build -j
 ```
 
-Then open **GTA-Sixty** on the headset and tap **Start Stream**. It finds the PC automatically via
-a UDP broadcast (`7661`), or you can type the PC's IP. For a capture card, tap **Mode** until it says
-**Capture**, then **Start Stream**. Capture leaves the Xbox controller paired to the console.
+---
 
-### Options
+## Running the Streamers
+
+### Windows PC Streamer
+```powershell
+# One-time Microsoft account sign-in (device-code flow)
+build\GTA-Sixty.exe --login
+
+# List consoles on LAN
+build\GTA-Sixty.exe --list-consoles
+
+# Stream Xbox Remote Play to Quest 3
+build\GTA-Sixty.exe --connect auto --quest-server --codec hevc --bitrate 80
+
+# Or stream an HDMI capture card connected to this PC
+build\GTA-Sixty.exe --capture --codec hevc --bitrate 80
+```
 
 | Flag | Meaning |
 |---|---|
-| `--connect <id\|auto>` | Console to stream from |
-| `--quest-server` | Encode and serve the Quest APK (rather than the local OpenXR window) |
-| `--bitrate <Mbps>` | NVENC CBR target for the PC→Quest stream |
-| `--codec <h264\|hevc>` | Codec for the PC→Quest stream. **HEVC** roughly halves the bitrate needed for the same quality, so the same headset cap carries visibly more detail. Default **h264**; needs the headset APK rebuilt (see below) |
-| `--max-bitrate <Mbps>` | Cap what the headset is allowed to request (`0` = no cap) |
-| `--max-output-height <px>` | Cap the encode height (`0` = no cap). Default **1440**; 2160p roughly doubles NVENC cost and starts dropping frames |
-| `--xbox-bitrate <Mbps>` | LAN bandwidth advertised to the console via REMB. Default **50**; the console caps itself near 24 Mbps, so advertising more changes nothing. `0` sends no REMB at all, which drops the source to ~15 Mbps |
-| `--sharpness <0..2>` | RCAS sharpening amount. Lower values amplify the source's quantization noise less (default 0.25) |
-| `--agent` | Listen on UDP 7662 so the headset can launch a stream remotely |
-| `--capture` | Capture-card mode. Grabs the HDMI capture device, encodes with NVENC, serves the Quest on TCP 7660. Does not sign in to Xbox or open remote play. Stays running when the headset disconnects. |
-| `--capture-device <text>` | Friendly-name substring of the card. Default is the first video capture device. |
-| `--upscale <1080p\|1440p\|4k>` | Initial output resolution (the headset can override it live) |
+| `--connect <id\|auto>` | Xbox console to stream from |
+| `--quest-server` | Encode and serve the Quest 3 APK on TCP `7660` / UDP `7661` |
+| `--capture` | Capture-card mode (HDMI capture → NVENC → Quest, no Xbox sign-in) |
+| `--capture-device <text>` | Substring match for capture device friendly name |
+| `--codec <h264\|hevc>` | Video codec for PC → Quest (`hevc` carries ~2× detail per Mbps) |
+| `--bitrate <Mbps>` | NVENC CBR target bitrate |
+| `--max-bitrate <Mbps>` | Cap what the headset can request (`0` = no cap) |
+| `--max-output-height <px>` | Cap encode height (default `1440`) |
+| `--upscale <1080p\|1440p\|4k>` | Initial PC output resolution (overridable live from Quest) |
+| `--sharpness <0..2>` | PC RCAS sharpening amount (default `0.25`) |
 | `--fps <60\|90>` | Output frame rate |
-| `--no-fg` | Disable frame generation entirely (lowest latency) |
-| `--headless` | Run the D3D12 pipeline with no headset attached |
-| `--run-seconds <n>` | Stop cleanly after n seconds (builds the benchmark captures; `0` = until Ctrl+C) |
+| `--no-fg` | Disable PC frame generation (lowest latency) |
+| `--agent` | Listen on UDP `7662` so the Quest can launch the streamer remotely |
 
-### Codec: H.264 vs HEVC
-
-Both run through the same NVENC path (single-pass ULL, AQ 8, 250 ms VBV, 2 s IDR), so switching
-codec does not change the pipeline, the latency budget, or any other flag — only `--codec` and,
-on the headset, which MediaCodec is instantiated.
-
-- `--codec h264` (default) is the measured baseline.
-- `--codec hevc` uses HEVC Main. At the same visual quality it needs roughly half the bits, so the
-  80 Mbps the headset asks for carries noticeably more detail; at the same bitrate it should encode
-  faster than H.264. Quest 3 (Snapdragon XR2 Gen 2) decodes HEVC Main fine.
-
-The `VIDEO_CONFIG` packet carries a codec byte alongside the parameter sets, and the headset splits
-NVENC's `VPS+SPS+PPS` blob into MediaCodec `csd-0/1/2`. **The headset APK must be rebuilt and
-reinstalled** for HEVC: an older APK does not understand the current `VIDEO_CONFIG` layout.
-
-## Headset app
-
-Build output is `build\GTA-Sixty-Quest3.apk` (Meta Spatial SDK Passthrough MR app, `GTA-Sixty`). The Android package ID stays `com.gtasixty.spatial` so existing headset settings and Xbox tokens are preserved across upgrades, and `scripts\install-quest-apk.ps1` automatically removes any older `com.gtasixty.quest` install.
-
+### Remote Wake & Auto-Start (Windows PC)
+Install the lightweight background agent (`UDP 7662`) so pressing **Start Stream** or **Wake PC** on the Quest automatically wakes the PC (Wake-on-LAN) and launches the streamer:
 ```powershell
-scripts\install-quest-apk.ps1 -Launch
+scripts\install-autostart.ps1 -StartNow
+scripts\install-autostart.ps1 -Remove
 ```
 
-Wireless ADB works too: `adb connect <quest-ip>:5555`.
+---
 
-Buttons: **Start Stream** / **Start USB**, **Refresh** (force an IDR), **Hide HUD**, **Display** (Curve, Tilt, Height, Screen Size, Room Depth, Backdrop), **Recenter**, **Wi-Fi ADB**, **Wake PC** / **Check Update**, **Net Check** (LAN/TCP/USB/Xbox diagnostics), and the resolution / frame-rate / bitrate / GPU / Look selectors. Grab the bottom handle bar with **Trigger** or **Grip/Pinch** to move the screen (push thumbstick up/down while holding Trigger to adjust depth).
+## Documentation & Deep Dives
 
-**Mode: PC / Direct** switches transports. Direct mode signs in to the Microsoft account on the
-headset, lists your consoles, and streams straight from the console (in the same app, behind the
-same controller input). It is new and marked experimental: check [DIRECT_MODE.md](DIRECT_MODE.md)
-for what is verified and the on-device test ladder. Your first direct session needs a phone or PC
-for the one-time device-code sign-in; the PC does not have to be running.
+- [SPATIAL_APP_PLAN.md](SPATIAL_APP_PLAN.md) — Meta Spatial SDK `0.15.0` architecture, zero-copy `mips = 1` swapchain invariants, and cylinder math.
+- [JIMMYS_ROOM_HANDOFF.md](JIMMYS_ROOM_HANDOFF.md) — Jimmy's Room 3D VR scene asset pipeline, lighting model, and TV-lock invariants.
+- [CAPTURE_MODE.md](CAPTURE_MODE.md) — HDMI capture-card setup (Linux VA-API & Windows NVENC) and GT60 protocol details.
+- [DIRECT_MODE.md](DIRECT_MODE.md) — PC-less Quest ↔ Xbox WebRTC direct mode.
+- [LATENCY_OPTIMIZATION_NOTES.md](LATENCY_OPTIMIZATION_NOTES.md) — End-to-end latency measurements, decoder buffering traps (`MF_LOW_LATENCY`), and benchmarks.
+- [GTA_HANDS_HANDOFF.md](GTA_HANDS_HANDOFF.md) — Experimental OpenXR hand-tracked GTA V hands + virtual Xbox controller rig.
 
-Starting a stream also clears background processes of other user-installed apps, so a leftover app
-cannot keep holding the compositor, GPU or decoder (requires `KILL_BACKGROUND_PROCESSES` +
-`QUERY_ALL_PACKAGES`). It cannot kill a *foreground* app — Android does not allow that without root.
+---
 
-### Starting the PC remotely
+## Contributing
 
-**Nothing needs to be running on the PC except the agent.** Press **Start Stream** (or **Wake PC**) on
-the headset and the app asks the agent, which launches the streamer; the app retries until it appears,
-typically 8-14 s.
+**Please merge your improvements into this project rather than creating a separate repo or standalone app.** See [agents/README.md](agents/README.md) and [AGENTS.md](AGENTS.md) for architecture notes, invariants, and build/test workflows before making changes.
 
-**Wake PC** does the whole chain:
-
-1. Sends a Wake-on-LAN magic packet (if the MAC is known).
-2. Sends `GTA60_START` to the PC agent on **UDP 7662**.
-3. Polls LAN discovery and connects as soon as the streamer answers.
-
-The PC-side agent is what launches the app — Wake-on-LAN can only power the machine on:
-
-```powershell
-scripts\install-autostart.ps1 -StartNow   # run --agent at sign-in and start it now
-scripts\install-autostart.ps1 -Remove     # uninstall
-```
-
-It installs a Startup-folder shortcut (no admin needed) running `GTA-Sixty.exe --agent`. The
-agent listens on UDP 7662, and on request launches
-`GTA-Sixty.exe --connect auto --quest-server --bitrate 120` unless a streamer is already
-listening on TCP 7660.
-
-Wake-on-LAN only reaches the sign-in screen, so a fully hands-off wake-and-stream also needs
-automatic sign-in enabled for the account.
-
-### Wake-on-LAN
-
-The **Wake PC** button sends a standard magic packet. The PC advertises its MAC in the LAN
-discovery reply, so the headset learns it automatically and remembers it — meaning it can wake the
-machine after the PC has gone to sleep or shut down. If the MAC is unknown it asks once.
-
-This will only work if your BIOS/network adapter allows wake from the relevant power state
-(the adapter must have *Wake on Magic Packet* enabled, and BIOS-level deep power-off must not be
-blocking it).
-
-## Benchmarking a console display-mode change
-
-Remote play captures the console's own composited output. The TV is strictly downstream, so a TV
-picture setting cannot change the streamed frames - but a console *display* setting can, through one
-path: presentation cadence. With VRR off the console presents on a fixed 60 Hz grid, so 30 fps
-content is repeated twice and 40-59 fps content gets uneven holds. The RTP rate stays ~60 fps; the
-**content rate** (`uniq`) changes, and that is what the frame-generation gate and the perceived
-smoothness depend on. ALLM ("allow low latency mode") is only a signal telling the TV to switch
-picture modes and has no path into the capture at all. There is also a real chance the console
-already forces VRR/ALLM off during remote play (Xbox Insider 2504 fixed those settings being left
-changed after a session), which would make the dashboard toggle irrelevant to this pipeline.
-
-Measure it instead of guessing:
-
-```powershell
-# 1. console on the old settings, nobody playing on the TV:
-scripts\bench.ps1 -Label vrr-on-llm-on -Headless -Seconds 90
-
-# 2. change the two settings in Settings > General > TV & display options > Video modes,
-#    let the console settle, then:
-scripts\bench.ps1 -Label vrr-off-llm-off -Headless -Seconds 90
-
-# 3. compare:
-scripts\bench-compare.ps1 -A build\bench\<stamp>-vrr-on-llm-on.json `
-                          -B build\bench\<stamp>-vrr-off-llm-off.json
-```
-
-`-Headless` measures the console -> PC source without a headset (cadence, duplicate ratio, RTT,
-decode cost). Without it, a connected headset adds `pcLat`, output fps, NVENC and the `quest=`
-echo. The capture stops via `--run-seconds`, which tears the session down cleanly instead of
-leaving a stale virtual pad on the console.
-
-The telemetry line now ends with `dup=<pct>% runs=<1>/<2>/<3+> flips=<n>`: duplicate share, the
-run-length histogram of the duplicates dropped between kept frames, and output-mode flips per
-window. `scripts\bench-selftest.ps1` proves the parser/comparison against synthetic 60 fps and
-30 fps logs (no console needed).
-
-**Note:** starting a session takes the console away from the TV. Run the A/B when the console is
-free, or the local game drops to the dashboard.
-
-The first live run of this (2026-11-21, VRR and ALLM off, 30 fps game content) found **no change**
-to the console->PC cadence, RTT or decode, and the same ~24 Mbps REMB ceiling: see
-[BENCHMARK_2026-11-21.md](BENCHMARK_2026-11-21.md). The sweep table there is also the answer to
-"does the console send less bitrate now that VRR is off?" - it does not; the advertised REMB is
-still what sets it.
-
-## Latency
-
-Please read **[LATENCY_OPTIMIZATION_NOTES.md](LATENCY_OPTIMIZATION_NOTES.md)** before changing the
-pipeline. **Section 6 is the handoff** — current measured numbers, what is already maxed out, what is
-worth doing next, and the measurement traps. It documents several things that cost hours, including:
-
-- `CODECAPI_AVLowLatencyMode` alone is **not** enough — without `MF_LOW_LATENCY` the Microsoft H.264
-  decoder silently queues ~37 frames (~618 ms).
-- Measure latency by frame **identity** (PTS), never by how long a call takes to return.
-- NVENC cost is fixed per frame, not bitrate-dependent, but it is pixel-bound: 4K costs roughly
-  double 1440p.
-- DXVA/D3D11 hardware decode must be verified not to reintroduce DPB buffering.
-
-The telemetry line printed every 2 s includes `decLag` (decoder buffering — must stay ~0), the per
-phase NVENC timings, and `quest=` (PC→headset round trip measured by a per-frame present echo).
+---
 
 ## Troubleshooting
 
-| Symptom | Likely cause |
+| Symptom | Likely Cause & Fix |
 |---|---|
-| `WinHttpSendRequest failed (12185)` | WPAD/auto-proxy failure; the app now connects directly |
-| **Headset times out connecting, or LAN scan finds nothing** | **Windows Firewall.** Its allow rules are bound to the exe *path*, so a moved or renamed `GTA-Sixty.exe` matches none. The PC still looks healthy — the socket listens and the discovery responder answers a loopback probe. Tell-tale: `ping` from the headset succeeds but a TCP connect to 7660 times out. Fix from an elevated shell: `New-NetFirewallRule -DisplayName 'GTA-Sixty' -Direction Inbound -Profile Any -Program '<full path>\GTA-Sixty.exe' -Action Allow` |
-| Decoder errors or a wrong image after updating | PC and APK must match: `VIDEO_CONFIG` gained a codec byte, so an older APK misreads the parameter sets. Rebuild and reinstall both |
-| Stream dies while unattended, then Start Stream cannot connect | The console ended the remote-play session for being idle (`Session ended: WarningForBeingIdle`); the PC streamer exits with it, so nothing is listening on 7660. The console is still on — just start the streamer again (or press **Wake PC**). See notes 10.5 |
-| Huge lag, everything else looks fine | Decoder buffering — check `decLag` |
-| Blocky/garbled image that persists | Dropped frames broke the H.264 reference chain; the stream recovers on the next IDR |
-| Frame rate below target | Output resolution too high for the per-frame budget; try a lower resolution |
-| Frame generation keeps turning on and off | The dedup is misreading the source frame rate; see the notes |
-| **Direct mode: no video, `WebRTC connection failed`** | ICE never found a path. Check logcat for `signaling complete: N remote candidates`; if N is 0 the console's ICE exchange failed, if it is >0 the candidates or the mDNS rewrite are suspect. `adb logcat -s GTA60Direct` shows the JS log lines |
-| **Direct mode: sign-in dialog never confirms** | The device code is entered at `https://www.microsoft.com/link`; confirm the account has an Xbox profile. Tokens are AES-GCM/Keystore encrypted; if the Keystore key is lost the app asks to sign in again |
-| **Direct mode: the pad works in the Xbox guide but not in the game after the console woke from sleep** | A Quick-Resumed game can keep the previous session's virtual-pad binding. Keep pad 0 announced (the app never removes it - the console kicks a session with no pad after ~60 s) and press **Fix pad** in the Direct bar to re-announce it; no need to close the game. See notes section 12 and [DIRECT_MODE.md](DIRECT_MODE.md) |
-| **Direct mode looks softer than PC mode** | Expected: the console's own encode at 1080p-class resolution with no sharpening or frame generation. PC mode is the quality path |
+| Headset times out connecting or LAN scan finds nothing | **Windows Firewall** rules bind to exe path. Allow `GTA-Sixty.exe` inbound on TCP `7660` / UDP `7661`–`7662` (or run **Net Check** on the headset). |
+| Decoder errors or garbled video after updating | Keep PC/Linux streamer and Quest APK in sync (both support the `VIDEO_CONFIG` codec byte). |
+| Huge latency on Windows PC mode | Check `decLag` in telemetry — `MF_LOW_LATENCY` must remain enabled on the H.264 decoder (see [LATENCY_OPTIMIZATION_NOTES.md](LATENCY_OPTIMIZATION_NOTES.md)). |
+| Direct mode pad works in Xbox Guide but not in a Quick-Resumed game | Press **Fix pad** in the Direct bar to re-announce virtual pad 0 without closing the game. |
 
-## Scope
+---
 
-This is an interoperability project: it speaks Microsoft's Xbox remote-play protocol using **your
-own** account and **your own** console on **your own** LAN. It ships no Microsoft code and no
-credentials. Use it with hardware and accounts you are entitled to use.
+## Scope & Licence
 
-## Licence
+This is an interoperability project: it speaks Microsoft's Xbox remote-play protocol using **your own** account and **your own** console on **your own** LAN. It ships no Microsoft code and no credentials.
 
-No licence file is included yet — treat the code as "all rights reserved" until one is added.
-Third-party components keep their own licences (see `third_party/`): OpenXR loader (Apache-2.0),
-mbedTLS (Apache-2.0), libdatachannel (MPL-2.0), Opus (BSD-3-Clause), nlohmann/json (MIT),
-ffnvcodec headers (MIT).
+No licence file is included yet — treat the code as "all rights reserved" until one is added. Third-party components keep their own licences (see `third_party/`): OpenXR loader (Apache-2.0), mbedTLS (Apache-2.0), libdatachannel (MPL-2.0), Opus (BSD-3-Clause), nlohmann/json (MIT), ffnvcodec headers (MIT).

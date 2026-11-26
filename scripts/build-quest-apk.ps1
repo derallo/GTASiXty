@@ -43,6 +43,19 @@ if (-not (Test-Path -LiteralPath $Keystore)) {
     if ($LASTEXITCODE -ne 0) { throw "keytool failed" }
 }
 
+# Build the native OpenXR hand-tracking shim first (it lands in src/main/jniLibs). The app degrades
+# gracefully when the .so is absent, so a missing NDK is only a warning.
+$HandTrackerScript = Join-Path $PSScriptRoot "build-hand-tracker.ps1"
+if (Test-Path -LiteralPath $HandTrackerScript) {
+    Write-Host "[Quest APK] Building native hand tracker shim..."
+    try {
+        & $HandTrackerScript
+        if ($LASTEXITCODE -ne 0) { throw "build-hand-tracker.ps1 exited $LASTEXITCODE" }
+    } catch {
+        Write-Warning "[Quest APK] Native hand tracker unavailable ($($_.Exception.Message)); GTA hands will fall back to the SDK body-tracking path."
+    }
+}
+
 $Task = if ($Configuration -eq "Release") { "assembleRelease" } else { "assembleDebug" }
 $OutBuild = Join-Path $Root "build"
 New-Item -ItemType Directory -Force -Path $OutBuild | Out-Null

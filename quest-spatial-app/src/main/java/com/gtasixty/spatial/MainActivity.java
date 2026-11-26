@@ -69,6 +69,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "GTA60";
     private static final String TAG_PERF = "GTA60-Perf";
     private static final String ACTION_STOP_STREAM = "com.gtasixty.spatial.STOP_STREAM";
+    private static final String ACTION_SET_DISPLAY = "com.gtasixty.spatial.SET_DISPLAY";
     // Empty means "nothing configured yet" - the app then scans the LAN instead of dialling a
     // hardcoded address.
     private static final String DEFAULT_PC_HOST = "";
@@ -88,10 +89,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // VIDEO_CONFIG payload: u32 width, u32 height, u8 codec, then the Annex-B parameter sets.
     // The codec byte must match gta60::media::VideoCodec on the PC side.
     private static final int VIDEO_CONFIG_HEADER_BYTES = 9;
-    private static final int CODEC_H264 = 0;
-    private static final int CODEC_HEVC = 1;
+    private static final int CODEC_H264 = CaptureProtocolHelper.CODEC_H264;
+    private static final int CODEC_HEVC = CaptureProtocolHelper.CODEC_HEVC;
+    private static final int CODEC_AV1 = CaptureProtocolHelper.CODEC_AV1;
     private static final String MIME_AVC = "video/avc";
     private static final String MIME_HEVC = "video/hevc";
+    private static final String MIME_AV1 = "video/av01";
 
     private static final int FLAG_IDR = 0x01;
     private static final int FLAG_GENERATED = 0x02;
@@ -108,7 +111,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int[] RES_WIDTHS = {1920, 2560, 3840};
     private static final int[] RES_HEIGHTS = {1080, 1440, 2160};
     private static final String[] RES_LABELS = {"1080p", "1440p", "4K"};
-    private static final int[] BITRATE_OPTIONS = {30, 50, 80, 120};
+    private static final int[] BITRATE_OPTIONS = {30, 50, 80, 100, 120, 160, 200};
 
     private SurfaceView surfaceView;
     private LinearLayout hudBar;
@@ -122,6 +125,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Button resBtn;
     private Button fpsBtn;
     private Button bitrateBtn;
+    private Button captureCodecBtn;
     private Button enhanceBtn;
     private Button lookBtn;
     private Button captureHzBtn;
@@ -156,6 +160,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         }
     };
+    private final BroadcastReceiver setDisplayReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && ACTION_SET_DISPLAY.equals(intent.getAction())) {
+                handleSetDisplayBroadcast(intent);
+            }
+        }
+    };
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor();
 
@@ -182,10 +194,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // User stream settings persisted in SharedPreferences
     private int resIdx = 1; // default 1440p
     private int cfgFps = 60;
-    private int bitrateIdx = 1; // default 50 Mbps
+    private int bitrateIdx = 2; // default 80 Mbps (capture can step up to 100/120/160/200)
+    private int customBitrateMbps = 0;
+    private int captureCodecChoice = CaptureProtocolHelper.CAPTURE_CODEC_HEVC_8;
     private int captureEnhanceMode = CaptureGlRenderer.MODE_FG60_SR;
     private int captureLookMode = CaptureGlRenderer.LOOK_NORMAL;
     private int captureRefreshHz = 120;
+    private final SpatialDisplayBridge.UiListener spatialUiListener = this::onSpatialSettingsUpdated;
+
+    private void onSpatialSettingsUpdated(SpatialDisplayBridge.DisplaySettings settings) {
+        if (settings == null) return;
+        final CaptureGlRenderer gl = captureGl;
+        if (gl != null) {
+            gl.setTaaEnabled(settings.taaEnabled);
+            gl.setComputeFlowEnabled(settings.computeFlowEnabled);
+        }
+        if (usbCapture != null) {
+            usbCapture.setTaaEnabled(settings.taaEnabled);
+            usbCapture.setComputeFlowEnabled(settings.computeFlowEnabled);
+        }
+        Log.i(TAG, String.format("Spatial settings applied: scale=%s taa=%s computeFlow=%s",
+                SpatialDisplayBridge.panelScaleLabel(settings.panelScale),
+                settings.taaEnabled,
+                settings.computeFlowEnabled));
+        if (this.streamWidth > 0 && this.streamHeight > 0 && this.surfaceView != null) {
+            final int[] dims = CaptureProtocolHelper.computeSurfaceDimensions(
+                    this.streamWidth,
+                    this.streamHeight,
+                    SpatialDisplayBridge.panelPxW(settings.panelScale),
+                    SpatialDisplayBridge.panelPxH(settings.panelScale));
+            uiHandler.post(() -> {
+                if (this.surfaceView != null) {
+                    this.surfaceView.getHolder().setFixedSize(dims[0], dims[1]);
+                    adjustSurfaceAspect(this.streamWidth, this.streamHeight);
+                }
+            });
+        }
+    }
 
     // Telemetry counters
     private volatile int streamWidth = 0;
@@ -208,13 +253,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(false);
+        }
 
         final IntentFilter stopFilter = new IntentFilter(ACTION_STOP_STREAM);
+        final IntentFilter setDisplayFilter = new IntentFilter(ACTION_SET_DISPLAY);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(stopStreamReceiver, stopFilter, Context.RECEIVER_EXPORTED);
+            registerReceiver(setDisplayReceiver, setDisplayFilter, Context.RECEIVER_EXPORTED);
         } else {
             @SuppressWarnings("deprecation")
             final Intent ignored = registerReceiver(stopStreamReceiver, stopFilter);
+            @SuppressWarnings("deprecation")
+            final Intent ignored2 = registerReceiver(setDisplayReceiver, setDisplayFilter);
         }
 
         SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
@@ -242,12 +294,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         resIdx = Math.max(0, Math.min(RES_LABELS.length - 1, prefs.getInt("resIdx", 1)));
         cfgFps = prefs.getInt("cfgFps", 60) == 90 ? 90 : 60;
-        bitrateIdx = Math.max(0, Math.min(BITRATE_OPTIONS.length - 1, prefs.getInt("bitrateIdx", 1)));
+        bitrateIdx = Math.max(0, Math.min(BITRATE_OPTIONS.length - 1, prefs.getInt("bitrateIdx", 2)));
         keepAlive = prefs.getBoolean("keepAlive", true);
         if (!prefs.contains("prefs_v3")) {
-            bitrateIdx = 1;
+            bitrateIdx = 2;
             prefs.edit().putBoolean("prefs_v3", true).putInt("bitrateIdx", bitrateIdx).apply();
         }
+        captureCodecChoice = Math.max(0, Math.min(CaptureProtocolHelper.CAPTURE_CODEC_COUNT - 1,
+                prefs.getInt("captureCodecChoice", CaptureProtocolHelper.CAPTURE_CODEC_HEVC_8)));
         captureEnhanceMode = Math.max(0, Math.min(ENHANCE_LABELS.length - 1,
                 prefs.getInt("captureEnhanceMode", CaptureGlRenderer.MODE_FG60_SR)));
         captureLookMode = Math.max(0, Math.min(LOOK_LABELS.length - 1,
@@ -256,6 +310,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.parseColor("#0B0E14"));
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if ((r - l) != (or - ol) || (b - t) != (ob - ot)) {
+                if (streamWidth > 0 && streamHeight > 0) {
+                    adjustSurfaceAspect(streamWidth, streamHeight);
+                }
+            }
+        });
 
         surfaceView = new SurfaceView(this);
         FrameLayout.LayoutParams svParams = new FrameLayout.LayoutParams(
@@ -336,7 +397,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         wakeBtn.setOnClickListener(v -> wakePc());
         row1.addView(wakeBtn);
 
-        modeBtn = makeButton(captureMode ? "Mode: Capture" : (directMode ? "Mode: Direct" : "Mode: PC"), "#0F766E");
+        modeBtn = makeButton(captureMode ? "Mode: Capture" : (directMode ? "Mode: XRemote" : "Mode: PC"), "#0F766E");
         modeBtn.setOnClickListener(v -> {
             // PC -> Direct -> Capture -> PC. Direct's own HUD continues the cycle, because this bar
             // is hidden while Direct is showing.
@@ -403,12 +464,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         bitrateBtn = makeButton(BITRATE_OPTIONS[bitrateIdx] + " Mbps", "#1E293B");
         bitrateBtn.setOnClickListener(v -> {
+            customBitrateMbps = 0;
             bitrateIdx = (bitrateIdx + 1) % BITRATE_OPTIONS.length;
             bitrateBtn.setText(BITRATE_OPTIONS[bitrateIdx] + " Mbps");
             saveStreamPrefs();
             if (streaming.get()) sendClientConfig();
         });
         row2.addView(bitrateBtn);
+
+        captureCodecBtn = makeButton("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice], "#0F766E");
+        captureCodecBtn.setOnClickListener(v -> {
+            captureCodecChoice = (captureCodecChoice + 1) % CaptureProtocolHelper.CAPTURE_CODEC_COUNT;
+            captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureCodecChoice", captureCodecChoice).apply();
+            if (streaming.get() && captureMode && !captureUsbMode) {
+                sendClientConfig();
+            }
+            setStatus("Capture codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+        });
+        row2.addView(captureCodecBtn);
 
         holdBtn = makeButton("Hold: " + (keepAlive ? "On" : "Off"), "#1E293B");
         holdBtn.setOnClickListener(v -> {
@@ -435,13 +510,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (gl != null) gl.setEnhanceMode(captureEnhanceMode);
             if (usbCapture != null) usbCapture.setEnhanceMode(captureEnhanceMode);
             if (streamWidth > 0 && streamHeight > 0) {
-                boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
-                final int outW = sr ? Math.min(2560, Math.max(streamWidth, 2560)) : Math.min(2560, streamWidth);
-                final int outH = sr ? Math.min(1440, Math.max(streamHeight, 1440)) : Math.min(1440, streamHeight);
-                surfaceView.getHolder().setFixedSize(outW, outH);
+                final SpatialDisplayBridge.DisplaySettings ds = SpatialDisplayBridge.getSettings();
+                final int[] dims = CaptureProtocolHelper.computeSurfaceDimensions(
+                        streamWidth,
+                        streamHeight,
+                        SpatialDisplayBridge.panelPxW(ds.panelScale),
+                        SpatialDisplayBridge.panelPxH(ds.panelScale));
+                surfaceView.getHolder().setFixedSize(dims[0], dims[1]);
             }
             if ((captureEnhanceMode == CaptureGlRenderer.MODE_FG90
                     || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR) && captureRefreshHz != 90) {
@@ -456,6 +531,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 prefs.edit().putInt("captureRefreshHz", 120).apply();
                 applyDisplayRefreshRate(120);
             }
+            applySurfaceFrameRate(effectiveSurfaceFrameRate(targetFps));
             setStatus("Capture GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
         });
         row2.addView(enhanceBtn);
@@ -511,6 +587,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         direct = new DirectController(this, root);
         updater = new AppUpdater(this);
         SpatialDisplayBridge.load(this);
+        SpatialDisplayBridge.addUiListener(spatialUiListener);
         displayControls = new DisplayControlsView(
                 this,
                 null,
@@ -536,6 +613,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
 
         setContentView(root);
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsetsController wic = getWindow().getInsetsController();
+            if (wic != null) {
+                wic.hide(android.view.WindowInsets.Type.systemBars());
+                wic.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        }
         updateHudForMode();
         scheduleTelemetryTick();
         learnPcMac();
@@ -669,13 +754,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ? (captureUsbMode ? "Capture USB" : "Capture LAN")
                 : "PC Mode";
         final String msg =
-                "GTA-Sixty supports Capture (LAN or USB-C), PC Mode, and Direct Mode:\n\n"
-                + "\u2022 Mode: Cycles Capture \u2192 PC \u2192 Direct.\n"
+                "GTA-Sixty supports Capture (LAN or USB-C), PC Mode, and XRemote Mode:\n\n"
+                + "\u2022 Mode: Cycles Capture \u2192 PC \u2192 XRemote.\n"
                 + "  - Capture (Src: LAN): Streams HDMI from your Linux capture box (192.168.68.90) or PC running GTA-Sixty.exe --capture.\n"
                 + "  - Capture (Src: USB): Plugs an HDMI-to-USB-C capture card straight into Quest 3 (close Meta Quest HDMI Link first, then tap Start USB).\n"
                 + "  - PC: Xbox remote play through your Windows PC (D3D12 optical-flow + NVENC).\n"
-                + "  - Direct: Quest connects straight to your Xbox via your Microsoft account (no IP needed).\n\n"
-                + "\u2022 LAN / Net Check: LAN scans UDP 7661 to auto-find servers on your network. Net Check tests Quest Wi-Fi, subnet match, UDP 7661 discovery, TCP 7660 reachability, USB-C UVC devices, and Xbox Direct status.\n\n"
+                + "  - XRemote: Quest connects straight to your Xbox via your Microsoft account (no IP needed).\n\n"
+                + "\u2022 LAN / Net Check: LAN scans UDP 7661 to auto-find servers on your network. Net Check tests Quest Wi-Fi, subnet match, UDP 7661 discovery, TCP 7660 reachability, USB-C UVC devices, and XRemote status.\n\n"
                 + "\u2022 Host IP / USB-C: Enter a server IP (blank = auto-scan), or tap USB-C for 127.0.0.1 over ADB reverse.\n\n"
                 + "\u2022 Window Handle & Display: Grab the bottom handle bar with Trigger or Grip/Pinch to move the screen (push thumbstick up/down while holding Trigger to adjust depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Backdrop.\n\n"
                 + "\u2022 Recenter / Hide HUD: Recenter snaps the screen in front of you; Hide HUD hides the bar (tap video to show it again).\n\n"
@@ -706,7 +791,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final String curField = hostInput != null ? hostInput.getText().toString().trim() : "";
         final String modeLabel = captureMode
                 ? (captureUsbMode ? "Capture USB" : "Capture LAN")
-                : (directMode ? "Direct" : "PC");
+                : (directMode ? "XRemote" : "PC");
         final boolean signedIn = direct != null && direct.isSignedIn();
         NetworkDiagnosticsHelper.show(
                 this,
@@ -832,7 +917,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         directMode = true;
         captureMode = false;
         persistTransportMode();
-        modeBtn.setText("Mode: Direct");
+        modeBtn.setText("Mode: XRemote");
         hudBar.setVisibility(View.GONE);
         surfaceView.setVisibility(View.GONE);
         direct.show();
@@ -855,7 +940,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (usbBtn != null) usbBtn.setVisibility(pcVis);
         if (resBtn != null) resBtn.setVisibility(pcVis);
         if (fpsBtn != null) fpsBtn.setVisibility(pcVis);
-        if (bitrateBtn != null) bitrateBtn.setVisibility(pcVis);
+        if (bitrateBtn != null) bitrateBtn.setVisibility(netCapVis);
+        if (captureCodecBtn != null) {
+            captureCodecBtn.setVisibility(lanCap ? View.VISIBLE : View.GONE);
+            captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+        }
         if (holdBtn != null) holdBtn.setVisibility(pcVis);
         if (enhanceBtn != null) enhanceBtn.setVisibility(capVis);
         if (lookBtn != null) lookBtn.setVisibility(capVis);
@@ -1033,16 +1122,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 streamWidth = width;
                 streamHeight = height;
                 targetFps = fps;
-                final boolean sr = (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
-                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
-                final int outW = sr ? Math.min(2560, Math.max(width, 2560)) : Math.min(2560, width);
-                final int outH = sr ? Math.min(1440, Math.max(height, 1440)) : Math.min(1440, height);
+                final SpatialDisplayBridge.DisplaySettings ds = SpatialDisplayBridge.getSettings();
+                final int[] dims = CaptureProtocolHelper.computeSurfaceDimensions(
+                        width,
+                        height,
+                        SpatialDisplayBridge.panelPxW(ds.panelScale),
+                        SpatialDisplayBridge.panelPxH(ds.panelScale));
+                final int outW = dims[0];
+                final int outH = dims[1];
                 uiHandler.post(() -> {
                     surfaceView.getHolder().setFixedSize(outW, outH);
                     adjustSurfaceAspect(width, height);
-                    applySurfaceFrameRate(fps);
+                    applySurfaceFrameRate(effectiveSurfaceFrameRate(fps));
                 });
                 setStatus(String.format("USB %dx%d @ %d fps (%s -> %dx%d)",
                         width, height, fps, ENHANCE_LABELS[captureEnhanceMode], outW, outH));
@@ -1309,21 +1400,132 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    private int activeBitrateMbps() {
+        return customBitrateMbps > 0 ? customBitrateMbps : BITRATE_OPTIONS[bitrateIdx];
+    }
+
+    private void handleSetDisplayBroadcast(Intent intent) {
+        boolean sendCfg = false;
+        if (intent.hasExtra("bitrate")) {
+            int br = intent.getIntExtra("bitrate", activeBitrateMbps());
+            if (br >= 10 && br <= 250) {
+                int matched = -1;
+                for (int i = 0; i < BITRATE_OPTIONS.length; i++) {
+                    if (BITRATE_OPTIONS[i] == br) {
+                        matched = i;
+                        break;
+                    }
+                }
+                if (matched >= 0) {
+                    bitrateIdx = matched;
+                    customBitrateMbps = 0;
+                    saveStreamPrefs();
+                } else {
+                    customBitrateMbps = br;
+                }
+                if (bitrateBtn != null) bitrateBtn.setText(br + " Mbps");
+                sendCfg = true;
+                Log.i(TAG, "Broadcast set bitrate=" + br + " Mbps");
+            }
+        }
+        int nextCodec = -1;
+        if (intent.hasExtra("codecChoice")) {
+            nextCodec = intent.getIntExtra("codecChoice", captureCodecChoice);
+        } else if (intent.hasExtra("codec")) {
+            String cs = intent.getStringExtra("codec");
+            if (cs != null) {
+                if ("hevc".equalsIgnoreCase(cs) || "h265".equalsIgnoreCase(cs)) {
+                    nextCodec = CaptureProtocolHelper.CAPTURE_CODEC_HEVC_8;
+                } else if ("hevc10".equalsIgnoreCase(cs) || "hevc-10".equalsIgnoreCase(cs)
+                        || "hevc10b".equalsIgnoreCase(cs)) {
+                    nextCodec = CaptureProtocolHelper.CAPTURE_CODEC_HEVC_10;
+                } else if ("av1".equalsIgnoreCase(cs)) {
+                    nextCodec = CaptureProtocolHelper.CAPTURE_CODEC_AV1;
+                } else if ("h264".equalsIgnoreCase(cs) || "avc".equalsIgnoreCase(cs)) {
+                    nextCodec = CaptureProtocolHelper.CAPTURE_CODEC_H264;
+                }
+            }
+        }
+        if (nextCodec >= 0 && nextCodec < CaptureProtocolHelper.CAPTURE_CODEC_COUNT) {
+            captureCodecChoice = nextCodec;
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureCodecChoice", captureCodecChoice).apply();
+            if (captureCodecBtn != null) {
+                captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+            }
+            if (captureMode && !captureUsbMode) sendCfg = true;
+            Log.i(TAG, "Broadcast set codec=" + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+        }
+        if (sendCfg && streaming.get()) {
+            sendClientConfig();
+        }
+        if (intent.hasExtra("enhance")) {
+            int enh = intent.getIntExtra("enhance", captureEnhanceMode);
+            if (enh >= 0 && enh < ENHANCE_LABELS.length) {
+                captureEnhanceMode = enh;
+                getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                        .putInt("captureEnhanceMode", captureEnhanceMode).apply();
+                if (enhanceBtn != null) enhanceBtn.setText("GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+                CaptureGlRenderer gl = captureGl;
+                if (gl != null) gl.setEnhanceMode(captureEnhanceMode);
+                if (usbCapture != null) usbCapture.setEnhanceMode(captureEnhanceMode);
+                if (streamWidth > 0 && streamHeight > 0 && surfaceView != null) {
+                    final SpatialDisplayBridge.DisplaySettings ds = SpatialDisplayBridge.getSettings();
+                    final int[] dims = CaptureProtocolHelper.computeSurfaceDimensions(
+                            streamWidth,
+                            streamHeight,
+                            SpatialDisplayBridge.panelPxW(ds.panelScale),
+                            SpatialDisplayBridge.panelPxH(ds.panelScale));
+                    surfaceView.getHolder().setFixedSize(dims[0], dims[1]);
+                }
+                if ((captureEnhanceMode == CaptureGlRenderer.MODE_FG90
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR) && captureRefreshHz != 90) {
+                    captureRefreshHz = 90;
+                    if (captureHzBtn != null) captureHzBtn.setText("90 Hz");
+                    getSharedPreferences("gta60", MODE_PRIVATE).edit().putInt("captureRefreshHz", 90).apply();
+                    applyDisplayRefreshRate(90);
+                } else if ((captureEnhanceMode == CaptureGlRenderer.MODE_FG120
+                        || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR) && captureRefreshHz != 120) {
+                    captureRefreshHz = 120;
+                    if (captureHzBtn != null) captureHzBtn.setText("120 Hz");
+                    getSharedPreferences("gta60", MODE_PRIVATE).edit().putInt("captureRefreshHz", 120).apply();
+                    applyDisplayRefreshRate(120);
+                }
+                applySurfaceFrameRate(effectiveSurfaceFrameRate(targetFps));
+                Log.i(TAG, "Broadcast set enhance=" + ENHANCE_LABELS[captureEnhanceMode]);
+            }
+        }
+        if (intent.hasExtra("startStream")) {
+            boolean wantStart = intent.getBooleanExtra("startStream", false);
+            if (wantStart && !streaming.get() && !isUsbCaptureRunning()) {
+                startStreamClicked();
+            } else if (!wantStart && (streaming.get() || isUsbCaptureRunning())) {
+                disconnect();
+            }
+        }
+        if (intent.hasExtra("recordMp4")) {
+            String recPath = intent.getStringExtra("recordMp4");
+            int recSec = intent.getIntExtra("recordSec", 12);
+            CaptureGlRenderer gl = captureGl;
+            if (gl != null && recPath != null && !recPath.isEmpty()) {
+                gl.startRecording(recPath, recSec);
+            } else {
+                Log.w(TAG, "recordMp4 ignored: captureGl unavailable or empty path");
+            }
+        }
+    }
+
     private byte[] buildClientConfigPayload() {
         int w = RES_WIDTHS[resIdx];
         int h = RES_HEIGHTS[resIdx];
-        int mbps = BITRATE_OPTIONS[bitrateIdx];
-        ByteBuffer bb = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-        bb.putInt(w);
-        bb.putInt(h);
-        bb.putShort((short) cfgFps);
-        bb.putShort((short) mbps);
-        return bb.array();
+        int mbps = activeBitrateMbps();
+        Integer capCodec = (captureMode && !captureUsbMode) ? captureCodecChoice : null;
+        return CaptureProtocolHelper.buildClientConfigPayload(w, h, cfgFps, mbps, capCodec);
     }
 
     private void sendClientConfig() {
-        Log.i(TAG, String.format("Sending config: %dx%d @ %dfps %d Mbps",
-                RES_WIDTHS[resIdx], RES_HEIGHTS[resIdx], cfgFps, BITRATE_OPTIONS[bitrateIdx]));
+        Log.i(TAG, String.format("Sending config: %dx%d @ %dfps %d Mbps (codecChoice=%d)",
+                RES_WIDTHS[resIdx], RES_HEIGHTS[resIdx], cfgFps, activeBitrateMbps(), captureCodecChoice));
         sendControlPacket(TYPE_CLIENT_CONFIG, buildClientConfigPayload());
     }
 
@@ -1407,10 +1609,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     streamWidth = w;
                     streamHeight = h;
                     targetFps = meta > 0 ? meta : 60;
-                    final String mime = (codecId == CODEC_HEVC) ? MIME_HEVC : MIME_AVC;
+                    final String mime = CaptureProtocolHelper.mimeForCodec(codecId);
                     Log.i(TAG, String.format("Received VIDEO_CONFIG %dx%d @ %dfps codec=%s csd=%dB",
                             w, h, targetFps, mime, csd.length));
-                    setupDecoder(w, h, csd, mime);
+                    setupDecoder(w, h, csd, mime, codecId);
                 } else if (type == TYPE_VIDEO_AU && size > 0) {
                     final long ptsUs = tsMs * 1000L;
                     if (captureGl != null) {
@@ -1524,7 +1726,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return false;
     }
 
-    private void setupDecoder(int width, int height, byte[] spsPps, String mime) {
+    private void setupDecoder(int width, int height, byte[] spsPps, String mime, int codecId) {
         releaseCodec();
         Surface surf = awaitActiveSurface();
         if (surf == null || !surf.isValid()) {
@@ -1535,18 +1737,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         try {
             Surface decodeSurf = surf;
-            final boolean useSuperRes = captureMode && (captureEnhanceMode == CaptureGlRenderer.MODE_SUPERRES
-                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR
-                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG90_SR
-                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR);
-            final int outW = useSuperRes ? Math.min(2560, Math.max(width, 2560)) : Math.min(2560, width);
-            final int outH = useSuperRes ? Math.min(1440, Math.max(height, 1440)) : Math.min(1440, height);
+            final SpatialDisplayBridge.DisplaySettings ds = SpatialDisplayBridge.getSettings();
+            final int[] dims = captureMode
+                    ? CaptureProtocolHelper.computeSurfaceDimensions(
+                            width,
+                            height,
+                            SpatialDisplayBridge.panelPxW(ds.panelScale),
+                            SpatialDisplayBridge.panelPxH(ds.panelScale))
+                    : new int[]{Math.min(2560, width), Math.min(1440, height)};
+            final int outW = dims[0];
+            final int outH = dims[1];
 
             if (captureMode) {
                 clearDuplicateFlags();
                 CaptureGlRenderer gl = new CaptureGlRenderer(
-                        surf, width, height, captureEnhanceMode, captureLookMode,
+                        this, surf, width, height, captureEnhanceMode, captureLookMode,
+                        false, false,
                         generated -> {
+                            statRendered++;
                             if (generated) statGenFrames++;
                         });
                 Surface glSurf = gl.getDecoderSurface();
@@ -1560,7 +1768,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 decodeSurf = glSurf;
             }
 
-            final List<byte[]> csd = splitNalUnits(spsPps);
+            final CaptureProtocolHelper.PreparedCsd prep = CaptureProtocolHelper.prepareDecoderCsd(codecId, spsPps);
+            final List<byte[]> csd = prep.units;
             MediaCodec mc = MediaCodec.createDecoderByType(mime);
             MediaFormat fmt = buildDecoderFormat(mime, width, height, csd);
 
@@ -1576,14 +1785,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mc.start();
             firstFrameRendered = false;
 
-            int cfgIdx = mc.dequeueInputBuffer(30000);
-            if (cfgIdx >= 0) {
-                ByteBuffer cfgBuf = mc.getInputBuffer(cfgIdx);
-                if (cfgBuf != null) {
-                    cfgBuf.clear();
-                    int n = Math.min(spsPps.length, cfgBuf.remaining());
-                    cfgBuf.put(spsPps, 0, n);
-                    mc.queueInputBuffer(cfgIdx, 0, n, 0L, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+            if (prep.queueConfigBufferAfterStart && spsPps != null && spsPps.length > 0) {
+                int cfgIdx = mc.dequeueInputBuffer(30000);
+                if (cfgIdx >= 0) {
+                    ByteBuffer cfgBuf = mc.getInputBuffer(cfgIdx);
+                    if (cfgBuf != null) {
+                        cfgBuf.clear();
+                        int n = Math.min(spsPps.length, cfgBuf.remaining());
+                        cfgBuf.put(spsPps, 0, n);
+                        mc.queueInputBuffer(cfgIdx, 0, n, 0L, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+                    }
                 }
             }
 
@@ -1597,7 +1808,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             uiHandler.post(() -> {
                 surfaceView.getHolder().setFixedSize(outW, outH);
                 adjustSurfaceAspect(width, height);
-                applySurfaceFrameRate(targetFps);
+                applySurfaceFrameRate(effectiveSurfaceFrameRate(targetFps));
             });
             Log.i(TAG, String.format("MediaCodec started (%s) %dx%d %s csdUnits=%d csd0=%dB out=%dx%d",
                     mc.getName(), width, height, mime, csd.size(), csd.isEmpty() ? 0 : csd.get(0).length,
@@ -1621,6 +1832,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * buffer for two refresh intervals instead of presenting it the moment it is decoded. Declaring
      * FIXED_SOURCE at the true rate removes that extra presentation interval and the duplicated holds.
      */
+    private int effectiveSurfaceFrameRate(int streamFps) {
+        if (captureMode) {
+            if (CaptureCadenceController.isFg120(captureEnhanceMode)) return 120;
+            if (CaptureCadenceController.isFg90(captureEnhanceMode)) return 90;
+        }
+        return streamFps > 0 ? streamFps : 60;
+    }
+
     private void applySurfaceFrameRate(int fps) {
         if (fps <= 0) return;
         Surface s = activeSurface;
@@ -1643,13 +1862,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         float targetAspect = (float) w / (float) h;
         float parentAspect = (float) pw / (float) ph;
-        int outW = pw, outH = ph;
-        if (parentAspect > targetAspect) {
-            outW = Math.round(ph * targetAspect);
+        FrameLayout.LayoutParams lp;
+        if (Math.abs(parentAspect - targetAspect) < 0.01f) {
+            lp = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    Gravity.CENTER);
         } else {
-            outH = Math.round(pw / targetAspect);
+            int outW = pw, outH = ph;
+            if (parentAspect > targetAspect) {
+                outW = Math.round(ph * targetAspect);
+            } else {
+                outH = Math.round(pw / targetAspect);
+            }
+            lp = new FrameLayout.LayoutParams(outW, outH, Gravity.CENTER);
         }
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(outW, outH, Gravity.CENTER);
         surfaceView.setLayoutParams(lp);
     }
 
@@ -1721,13 +1948,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         firstFrameRendered = true;
                         Log.i(TAG, String.format("First video frame rendered (%dx%d)", streamWidth, streamHeight));
                     }
-                    statRendered++;
                     final long presentedPtsUs = info.presentationTimeUs;
                     final CaptureGlRenderer gl = captureGl;
                     if (gl != null) {
                         gl.onDecodedFrame(consumeDuplicateFlag(presentedPtsUs));
                         mc.releaseOutputBuffer(outIdx, true);
                     } else {
+                        statRendered++;
                         mc.releaseOutputBuffer(outIdx, System.nanoTime()); // immediate SurfaceFlinger present
                     }
                     reportRenderedFrame(presentedPtsUs);
@@ -2352,7 +2579,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     double recvFps = f / dt;
                     double renFps = r / dt;
                     double mbps = (b * 8.0) / (dt * 1e6);
-                    long genPct = f > 0 ? Math.round((g * 100.0) / f) : 0;
+                    long genPct = r > 0 ? Math.round((g * 100.0) / r) : 0;
                     final boolean usbCap = captureMode && captureUsbMode && isUsbCaptureRunning();
                     final String hudMsg = usbCap
                             ? String.format("USB %dx%d @ %.1f fps (Gen %d%%) | GPU: %s",
@@ -2397,6 +2624,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             activeSurface = holder.getSurface();
             surfaceLock.notifyAll();
         }
+        final View parent = (View) surfaceView.getParent();
+        Log.i(TAG, String.format("Geom: surface=%dx%d view=%dx%d parent=%dx%d",
+                width, height, surfaceView.getWidth(), surfaceView.getHeight(),
+                parent != null ? parent.getWidth() : -1,
+                parent != null ? parent.getHeight() : -1));
         if (streamWidth > 0 && streamHeight > 0) {
             adjustSurfaceAspect(streamWidth, streamHeight);
         }
@@ -2435,10 +2667,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     protected void onDestroy() {
+        SpatialDisplayBridge.removeUiListener(spatialUiListener);
         SpatialDisplayBridge.registerStopStreamSink(null);
         SpatialDisplayBridge.registerGamepadSink(null);
         try {
             unregisterReceiver(stopStreamReceiver);
+        } catch (Exception ignored) {
+        }
+        try {
+            unregisterReceiver(setDisplayReceiver);
         } catch (Exception ignored) {
         }
         disconnect();

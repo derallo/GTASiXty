@@ -58,10 +58,10 @@ uint32_t roundedFps(UINT32 num, UINT32 den) {
 
 // Uncompressed always beats MJPEG: a card that compresses on the wire is the ceiling this mode
 // exists to get past. Within uncompressed, 1440p beats 1080p, then NV12 beats YUY2, then ~60 fps.
-int scoreFormat(uint32_t w, uint32_t h, uint32_t fps, const GUID& subtype) {
-    if (w < 1280 || h < 720 || w > 2560 || h > 1440) return -1;
+int scoreFormat(uint32_t w, uint32_t h, uint32_t fps, const GUID& subtype, const CaptureLimits& limits) {
+    if (w < limits.minWidth || h < limits.minHeight || w > limits.maxWidth || h > limits.maxHeight) return -1;
     if ((w & 1u) != 0 || (h & 1u) != 0) return -1;
-    if (fps < 24 || fps > 120) return -1;
+    if (fps < 24 || fps > limits.maxFps) return -1;
     int family = 0;
     int fmt = 0;
     if (subtype == MFVideoFormat_NV12) {
@@ -79,6 +79,7 @@ int scoreFormat(uint32_t w, uint32_t h, uint32_t fps, const GUID& subtype) {
     int res = 1000 + static_cast<int>(h);
     if (w == 2560 && h == 1440) res = 3000;
     else if (w == 1920 && h == 1080) res = 2000;
+    else if (w == 3840 && h == 2160) res = 4000;
     int rate = 50;
     if (fps >= 59 && fps <= 61) rate = 500;
     else if (fps >= 50 && fps <= 90) rate = 200;
@@ -123,6 +124,7 @@ void freeActivates(IMFActivate** devices, UINT32 count) {
 
 struct MfCaptureSource::Impl {
     bool mfStarted = false;
+    CaptureLimits limits{};
     ComPtr<IMFMediaSource> source;
     ComPtr<IMFSourceReader> reader;
     ComPtr<IMFMediaType> videoType;
@@ -198,8 +200,11 @@ struct MfCaptureSource::Impl {
         uint32_t w = 0, h = 0, fps = 0;
         GUID subtype{};
         if (!currentVideo(w, h, subtype, fps)) return false;
-        if ((w & 1u) || (h & 1u) || w > 2560 || h > 1440 || w < 1280 || h < 720) {
-            log::info("capture", std::format("driver settled on {}x{}, which is outside 720p-1440p", w, h));
+        if ((w & 1u) || (h & 1u) || w > limits.maxWidth || h > limits.maxHeight || w < limits.minWidth ||
+            h < limits.minHeight) {
+            log::info("capture", std::format("driver settled on {}x{}, which is outside {}x{}-{}x{}", w, h,
+                                             limits.minWidth, limits.minHeight, limits.maxWidth,
+                                             limits.maxHeight));
             return false;
         }
         const bool nv12 = subtype == MFVideoFormat_NV12;
@@ -516,7 +521,7 @@ struct MfCaptureSource::Impl {
                 if (FAILED(hr) || !c.type) break;
                 if (!readTypeSize(c.type.Get(), c.width, c.height, c.fpsNum, c.fpsDen, c.subtype)) continue;
                 c.fps = roundedFps(c.fpsNum, c.fpsDen);
-                c.score = scoreFormat(c.width, c.height, c.fps, c.subtype);
+                c.score = scoreFormat(c.width, c.height, c.fps, c.subtype, limits);
                 log::info("capture", std::format("  native {}x{} @ {} {} score {}", c.width, c.height, c.fps,
                                                  subtypeName(c.subtype), c.score));
                 if (c.score >= 0) candidates.push_back(std::move(c));
@@ -524,8 +529,9 @@ struct MfCaptureSource::Impl {
             std::sort(candidates.begin(), candidates.end(),
                       [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
             if (candidates.empty()) {
-                log::warn("capture", std::format("skipping '{}': no 720p-1440p NV12, YUY2, or MJPEG mode",
-                                                 log::narrow(item.name)));
+                log::warn("capture", std::format("skipping '{}': no {}x{}-{}x{} NV12, YUY2, or MJPEG mode",
+                                                 log::narrow(item.name), limits.minWidth, limits.minHeight,
+                                                 limits.maxWidth, limits.maxHeight));
                 reader.Reset();
                 source->Shutdown();
                 source.Reset();
@@ -627,6 +633,16 @@ MfCaptureSource::~MfCaptureSource() { close(); }
 
 bool MfCaptureSource::open(const std::wstring& deviceNameSubstring) {
     p_ = std::make_unique<Impl>();
+    if (!p_->open(deviceNameSubstring)) {
+        p_->close();
+        return false;
+    }
+    return true;
+}
+
+bool MfCaptureSource::open(const std::wstring& deviceNameSubstring, const CaptureLimits& limits) {
+    p_ = std::make_unique<Impl>();
+    p_->limits = limits;
     if (!p_->open(deviceNameSubstring)) {
         p_->close();
         return false;

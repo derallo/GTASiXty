@@ -15,8 +15,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * Shared state and bridge between the Meta Spatial SDK host ({@link SpatialMainActivity}) and the
  * embedded 2D panel UI ({@link MainActivity} / {@link DirectController} / {@link DisplayControlsView}).
  *
- * <p>Persists curve, tilt, vertical height offset, locked-16:9 width, room depth, and backdrop mode
- * in {@code SharedPreferences("gta60_spatial")}, synchronizes corner-drag resizes back to the UI,
+ * <p>Persists curve, tilt, vertical height offset, locked-16:9 width, room depth, backdrop mode,
+ * supersampled panel resolution, foliage TAA, and GLES 3.1 compute-flow toggles in
+ * {@code SharedPreferences("gta60_spatial")}, synchronizes corner-drag resizes back to the UI,
  * forwards launch extras, and routes hardware gamepad events.
  */
 public final class SpatialDisplayBridge {
@@ -24,6 +25,13 @@ public final class SpatialDisplayBridge {
     static final int BACKDROP_PASSTHROUGH = 0;
     static final int BACKDROP_DIM = 1;
     static final int BACKDROP_DARK = 2;
+    static final int BACKDROP_JIMMYS_ROOM = 3;
+    static final int BACKDROP_COUNT = 4;
+
+    static final int PANEL_SCALE_1440P = CaptureProtocolHelper.PANEL_SCALE_1440P;
+    static final int PANEL_SCALE_1800P = CaptureProtocolHelper.PANEL_SCALE_1800P;
+    static final int PANEL_SCALE_2160P = CaptureProtocolHelper.PANEL_SCALE_2160P;
+    static final int DEFAULT_PANEL_SCALE = CaptureProtocolHelper.DEFAULT_PANEL_SCALE;
 
     static final float ASPECT_RATIO = 16.0f / 9.0f;
     static final float MIN_WIDTH_M = 1.0f;
@@ -55,6 +63,28 @@ public final class SpatialDisplayBridge {
     private static final String KEY_WIDTH_M = "spatialWidthM";
     private static final String KEY_DIST_M = "spatialDistanceM";
     private static final String KEY_BACKDROP = "spatialBackdrop";
+    private static final String KEY_PANEL_SCALE = "spatialPanelScale";
+    private static final String KEY_TAA_ENABLED = "spatialTaaEnabled";
+    private static final String KEY_COMPUTE_FLOW = "spatialComputeFlow";
+    private static final String KEY_GTA_HANDS = "spatialGtaHandsEnabled";
+    private static final String KEY_GTA_HANDS_CTRL_UP = "spatialGtaHandsCtrlUpM";
+    private static final String KEY_GTA_HANDS_CTRL_BACK = "spatialGtaHandsCtrlBackM";
+
+    static int panelPxW(int panelScale) {
+        return CaptureProtocolHelper.panelPxW(panelScale);
+    }
+
+    static int panelPxH(int panelScale) {
+        return CaptureProtocolHelper.panelPxH(panelScale);
+    }
+
+    static int panelDpi(int panelScale) {
+        return CaptureProtocolHelper.panelDpi(panelScale);
+    }
+
+    static String panelScaleLabel(int panelScale) {
+        return CaptureProtocolHelper.panelScaleLabel(panelScale);
+    }
 
     static float cylinderArcDegrees(int curvePct) {
         if (curvePct <= 0) return 0f;
@@ -75,6 +105,14 @@ public final class SpatialDisplayBridge {
         public float widthMeters;
         public float distanceMeters;
         public int backdropMode;
+        public int panelScale;
+        public boolean taaEnabled;
+        public boolean computeFlowEnabled;
+        /** Draw GTA V hands + the auto-spawning 3D Xbox controller from Quest hand tracking. */
+        public boolean gtaHandsEnabled;
+        /** Fine-tune nudge for the virtual controller, in controller-local metres. */
+        public float gtaHandsCtrlUpM;
+        public float gtaHandsCtrlBackM;
 
         DisplaySettings() {
             this.curvePct = DEFAULT_CURVE_PCT;
@@ -83,6 +121,12 @@ public final class SpatialDisplayBridge {
             this.widthMeters = DEFAULT_WIDTH_M;
             this.distanceMeters = DEFAULT_DIST_M;
             this.backdropMode = DEFAULT_BACKDROP;
+            this.panelScale = DEFAULT_PANEL_SCALE;
+            this.taaEnabled = true;
+            this.computeFlowEnabled = true;
+            this.gtaHandsEnabled = true;
+            this.gtaHandsCtrlUpM = 0.0f;
+            this.gtaHandsCtrlBackM = 0.0f;
         }
 
         DisplaySettings(DisplaySettings other) {
@@ -92,6 +136,12 @@ public final class SpatialDisplayBridge {
             this.widthMeters = other.widthMeters;
             this.distanceMeters = other.distanceMeters;
             this.backdropMode = other.backdropMode;
+            this.panelScale = other.panelScale;
+            this.taaEnabled = other.taaEnabled;
+            this.computeFlowEnabled = other.computeFlowEnabled;
+            this.gtaHandsEnabled = other.gtaHandsEnabled;
+            this.gtaHandsCtrlUpM = other.gtaHandsCtrlUpM;
+            this.gtaHandsCtrlBackM = other.gtaHandsCtrlBackM;
             clamp();
         }
 
@@ -101,9 +151,14 @@ public final class SpatialDisplayBridge {
             heightOffsetM = Math.max(MIN_HEIGHT_M, Math.min(MAX_HEIGHT_M, heightOffsetM));
             widthMeters = Math.max(MIN_WIDTH_M, Math.min(MAX_WIDTH_M, widthMeters));
             distanceMeters = Math.max(MIN_DIST_M, Math.min(MAX_DIST_M, distanceMeters));
-            if (backdropMode < BACKDROP_PASSTHROUGH || backdropMode > BACKDROP_DARK) {
+            if (backdropMode < BACKDROP_PASSTHROUGH || backdropMode > BACKDROP_JIMMYS_ROOM) {
                 backdropMode = DEFAULT_BACKDROP;
             }
+            if (panelScale < PANEL_SCALE_1440P || panelScale > PANEL_SCALE_2160P) {
+                panelScale = DEFAULT_PANEL_SCALE;
+            }
+            gtaHandsCtrlUpM = Math.max(-0.10f, Math.min(0.10f, gtaHandsCtrlUpM));
+            gtaHandsCtrlBackM = Math.max(-0.10f, Math.min(0.10f, gtaHandsCtrlBackM));
         }
 
         float heightMeters() {
@@ -124,6 +179,8 @@ public final class SpatialDisplayBridge {
                     return "Dim";
                 case BACKDROP_DARK:
                     return "Dark";
+                case BACKDROP_JIMMYS_ROOM:
+                    return "Jimmy's Room";
                 default:
                     return "Passthrough";
             }
@@ -169,6 +226,12 @@ public final class SpatialDisplayBridge {
                 CURRENT.widthMeters = prefs.getFloat(KEY_WIDTH_M, DEFAULT_WIDTH_M);
                 CURRENT.distanceMeters = prefs.getFloat(KEY_DIST_M, DEFAULT_DIST_M);
                 CURRENT.backdropMode = prefs.getInt(KEY_BACKDROP, DEFAULT_BACKDROP);
+                CURRENT.panelScale = prefs.getInt(KEY_PANEL_SCALE, DEFAULT_PANEL_SCALE);
+                CURRENT.taaEnabled = prefs.getBoolean(KEY_TAA_ENABLED, true);
+                CURRENT.computeFlowEnabled = prefs.getBoolean(KEY_COMPUTE_FLOW, true);
+                CURRENT.gtaHandsEnabled = prefs.getBoolean(KEY_GTA_HANDS, true);
+                CURRENT.gtaHandsCtrlUpM = prefs.getFloat(KEY_GTA_HANDS_CTRL_UP, 0.0f);
+                CURRENT.gtaHandsCtrlBackM = prefs.getFloat(KEY_GTA_HANDS_CTRL_BACK, 0.0f);
                 CURRENT.clamp();
                 loaded = true;
             }
@@ -193,6 +256,12 @@ public final class SpatialDisplayBridge {
             CURRENT.widthMeters = copy.widthMeters;
             CURRENT.distanceMeters = copy.distanceMeters;
             CURRENT.backdropMode = copy.backdropMode;
+            CURRENT.panelScale = copy.panelScale;
+            CURRENT.taaEnabled = copy.taaEnabled;
+            CURRENT.computeFlowEnabled = copy.computeFlowEnabled;
+            CURRENT.gtaHandsEnabled = copy.gtaHandsEnabled;
+            CURRENT.gtaHandsCtrlUpM = copy.gtaHandsCtrlUpM;
+            CURRENT.gtaHandsCtrlBackM = copy.gtaHandsCtrlBackM;
         }
         save(context, copy);
         notifySpatial(copy);
@@ -220,6 +289,12 @@ public final class SpatialDisplayBridge {
                 .putFloat(KEY_WIDTH_M, s.widthMeters)
                 .putFloat(KEY_DIST_M, s.distanceMeters)
                 .putInt(KEY_BACKDROP, s.backdropMode)
+                .putInt(KEY_PANEL_SCALE, s.panelScale)
+                .putBoolean(KEY_TAA_ENABLED, s.taaEnabled)
+                .putBoolean(KEY_COMPUTE_FLOW, s.computeFlowEnabled)
+                .putBoolean(KEY_GTA_HANDS, s.gtaHandsEnabled)
+                .putFloat(KEY_GTA_HANDS_CTRL_UP, s.gtaHandsCtrlUpM)
+                .putFloat(KEY_GTA_HANDS_CTRL_BACK, s.gtaHandsCtrlBackM)
                 .apply();
     }
 

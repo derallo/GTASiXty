@@ -410,7 +410,7 @@ final class XboxDirect {
             }
         }
         throw new IOException("the console is still holding another streaming session "
-                + "(exclusive operation). Stop the PC streamer, then retry direct mode.", last);
+                + "(exclusive operation). Stop the PC streamer, then retry XRemote mode.", last);
     }
 
     private static boolean exclusive(String message) {

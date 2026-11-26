@@ -1,6 +1,6 @@
 {
   "versionCode": 6,
   "versionName": "2.1",
-  "apkUrl": "",
-  "notes": "Promoted Spatial app to main GTA-Sixty (com.gtasixty.spatial), fixed bottom window drag handle (Trigger + Grip/Pinch + thumbstick depth), added built-in Network & Device Check diagnostics, and added direct USB-C UVC capture."
+  "apkUrl": "https://github.com/derallo/GTASiXty/releases/download/v2.1/GTA-Sixty-Quest3.apk",
+  "notes": "GTA-Sixty v2.1: Spatial MR app (com.gtasixty.spatial) with Jimmy's Room 3D VR environment, 3-phase Adreno 740 upscaling (SGSR1 12-tap + RCAS + SGSR2-lite temporal accumulation) & optical-flow frame generation (FG60/FG90/FG120), direct USB-C UVC capture, bottom window drag handle, and built-in Net Check diagnostics."
 }

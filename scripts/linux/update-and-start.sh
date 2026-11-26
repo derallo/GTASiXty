@@ -30,7 +30,7 @@ if [[ ! -x "$BIN" || "$OLD_HEAD" != "$NEW_HEAD" ]]; then
         cp -f "$BIN" "$BAK"
     fi
 
-    if cmake -B "$BUILD_DIR" -S "$SRC_DIR" && cmake --build "$BUILD_DIR" -j"$(nproc)" && "$BIN" --selftest "${SELFTEST_ARGS[@]}"; then
+    if cmake -B "$BUILD_DIR" -S "$SRC_DIR" -DCMAKE_BUILD_TYPE=Release && cmake --build "$BUILD_DIR" -j"$(nproc)" && "$BIN" --selftest "${SELFTEST_ARGS[@]}"; then
         echo "[gta60-update] build and selftest passed"
     else
         echo "[gta60-update] build or selftest FAILED!" >&2

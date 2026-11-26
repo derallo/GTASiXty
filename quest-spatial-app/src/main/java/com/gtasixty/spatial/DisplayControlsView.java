@@ -47,8 +47,17 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
     private SeekBar sizeBar;
     private SeekBar depthBar;
     private SeekBar heightBar;
+    private View curveBox;
+    private View tiltBox;
+    private View sizeBox;
+    private TextView noteBox;
 
     private Button backdropBtn;
+    private Button panelScaleBtn;
+    private Button taaBtn;
+    private Button flowBtn;
+    private Button handsBtn;
+    private TextView handsNote;
 
     private boolean updatingUi = false;
     private boolean draggingCurve = false;
@@ -113,7 +122,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
 
         backdropBtn = makeButton("Backdrop: Passthrough", "#0F766E", v -> {
             notifyInteraction();
-            applyChange(s -> s.backdropMode = (s.backdropMode + 1) % 3);
+            applyChange(s -> s.backdropMode = (s.backdropMode + 1) % SpatialDisplayBridge.BACKDROP_COUNT);
         });
         header.addView(backdropBtn);
 
@@ -154,7 +163,53 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
         presetsRow.addView(makeButton("25%", "#0369A1", v -> setCurvePreset(25)));
         presetsRow.addView(makeButton("50%", "#0369A1", v -> setCurvePreset(50)));
         presetsRow.addView(makeButton("80%", "#0369A1", v -> setCurvePreset(80)));
+
+        panelScaleBtn = makeButton("Res: 1800p SR", "#0F766E", v -> {
+            notifyInteraction();
+            applyChange(s -> s.panelScale = (s.panelScale + 1) % 3);
+        });
+        presetsRow.addView(panelScaleBtn);
+
+        taaBtn = makeButton("TAA: On", "#0F766E", v -> {
+            notifyInteraction();
+            applyChange(s -> s.taaEnabled = !s.taaEnabled);
+        });
+        presetsRow.addView(taaBtn);
+
+        flowBtn = makeButton("Flow: Compute", "#0F766E", v -> {
+            notifyInteraction();
+            applyChange(s -> s.computeFlowEnabled = !s.computeFlowEnabled);
+        });
+        presetsRow.addView(flowBtn);
+
         card.addView(presetsRow);
+
+        // GTA Hands row: the toggle plus a one-line explainer, kept on its own row so the presets row
+        // above it does not overflow the 680 dp card.
+        final LinearLayout handsRow = new LinearLayout(getContext());
+        handsRow.setOrientation(LinearLayout.HORIZONTAL);
+        handsRow.setGravity(Gravity.CENTER_VERTICAL);
+        final LinearLayout.LayoutParams handsRowLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        handsRowLp.topMargin = dp(8);
+        handsRow.setLayoutParams(handsRowLp);
+
+        handsBtn = makeButton("GTA Hands: On", "#7C3AED", v -> {
+            notifyInteraction();
+            applyChange(s -> s.gtaHandsEnabled = !s.gtaHandsEnabled);
+        });
+        handsRow.addView(handsBtn);
+
+        handsNote = new TextView(getContext());
+        handsNote.setText("GTA V hands + auto-spawning Xbox pad. Put the Touch controllers down and\n"
+                + "turn hand tracking on; hold your real pad with both hands for ~0.25 s.");
+        handsNote.setTextColor(Color.parseColor("#94A3B8"));
+        handsNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        final LinearLayout.LayoutParams handsNoteLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        handsNoteLp.leftMargin = dp(8);
+        handsRow.addView(handsNote, handsNoteLp);
+        card.addView(handsRow);
 
         // Row 1: Curve + Tilt
         final LinearLayout row1 = makePairRow();
@@ -167,6 +222,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
                 () -> stepCurve(10));
         curveLabel = curveRefs.label;
         curveBar = curveRefs.bar;
+        curveBox = curveRefs.container;
         curveBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
@@ -213,6 +269,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
                 () -> stepTilt(5.0f));
         tiltLabel = tiltRefs.label;
         tiltBar = tiltRefs.bar;
+        tiltBox = tiltRefs.container;
         row1.addView(tiltRefs.container);
         card.addView(row1);
 
@@ -227,6 +284,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
                 () -> stepWidth(0.2f));
         sizeLabel = sizeRefs.label;
         sizeBar = sizeRefs.bar;
+        sizeBox = sizeRefs.container;
         row2.addView(sizeRefs.container);
 
         final SliderRefs depthRefs = createSliderBlock(
@@ -254,7 +312,7 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
         heightBar = heightRefs.bar;
         row3.addView(heightRefs.container);
 
-        final TextView noteBox = new TextView(getContext());
+        noteBox = new TextView(getContext());
         noteBox.setText("Tip: Tilt downward/upward and adjust Height for reclined or couch play.\n"
                 + "Grab the bottom handle bar with Trigger or Grip/Pinch to move (thumbstick adjusts depth).\n"
                 + "When flat (0%), drag corners to resize 16:9. Tap Recenter if you redraw your boundary.");
@@ -448,8 +506,48 @@ final class DisplayControlsView extends FrameLayout implements SpatialDisplayBri
                 heightLabel.setText(String.format(Locale.US, "Height: %+.2f m", s.heightOffsetM));
             }
 
+            final boolean inRoom = (s.backdropMode == SpatialDisplayBridge.BACKDROP_JIMMYS_ROOM);
+            if (curveBox != null) curveBox.setAlpha(inRoom ? 0.42f : 1.0f);
+            if (tiltBox != null) tiltBox.setAlpha(inRoom ? 0.42f : 1.0f);
+            if (sizeBox != null) sizeBox.setAlpha(inRoom ? 0.42f : 1.0f);
+            if (curveBar != null) curveBar.setEnabled(!inRoom);
+            if (tiltBar != null) tiltBar.setEnabled(!inRoom);
+            if (sizeBar != null) sizeBar.setEnabled(!inRoom);
+            if (sizeLabel != null && inRoom) {
+                sizeLabel.setText("Screen Size: Locked to Jimmy's TV (2.10 m)");
+            }
+            if (depthLabel != null && inRoom) {
+                float tvDist = 2.42f + Math.max(-1.10f, Math.min(1.15f, s.distanceMeters - SpatialDisplayBridge.DEFAULT_DIST_M));
+                depthLabel.setText(String.format(Locale.US, "Seat Distance to TV: %.2f m", tvDist));
+            }
+            if (noteBox != null) {
+                if (inRoom) {
+                    noteBox.setText("Jimmy\'s Room: Display is locked inside Jimmy\'s TV bezel.\n"
+                            + "Use Seat Distance (Room Depth) and Height to slide closer/further or adjust eye level.\n"
+                            + "GTA Hands: put the Touch controllers down (hand tracking on) and hold your real Xbox\n"
+                            + "pad with both hands for ~0.25 s and a 3D pad spawns between them.\n"
+                            + "Tap Recenter to align Jimmy\'s room & TV to where you are sitting.");
+                } else {
+                    noteBox.setText("Tip: Tilt downward/upward and adjust Height for reclined or couch play.\n"
+                            + "Grab the bottom handle bar with Trigger or Grip/Pinch to move (thumbstick adjusts depth).\n"
+                            + "When flat (0%), drag corners to resize 16:9. Tap Recenter if you redraw your boundary.");
+                }
+            }
             if (backdropBtn != null) {
                 backdropBtn.setText("Backdrop: " + s.backdropLabel());
+            }
+            if (panelScaleBtn != null) {
+                panelScaleBtn.setText("Res: " + SpatialDisplayBridge.panelScaleLabel(s.panelScale));
+            }
+            if (taaBtn != null) {
+                taaBtn.setText("TAA: " + (s.taaEnabled ? "On" : "Off"));
+            }
+            if (flowBtn != null) {
+                flowBtn.setText("Flow: " + (s.computeFlowEnabled ? "Compute" : "Frag"));
+            }
+            if (handsBtn != null) {
+                handsBtn.setText("GTA Hands: " + (s.gtaHandsEnabled ? "On" : "Off"));
+                handsBtn.setBackgroundColor(Color.parseColor(s.gtaHandsEnabled ? "#7C3AED" : "#334155"));
             }
         } finally {
             updatingUi = false;

@@ -5,11 +5,13 @@
 
 #include "gta60/Log.h"
 #include "gta60/media/SyntheticGameSource.h"
+#include "gta60/media/WasapiPcmRender.h"
 #include "gta60/nvof/NvOfSession.h"
 #include "gta60/pipeline/ContentDedup.h"
 #include "gta60/pipeline/D3D12Context.h"
 #include "gta60/pipeline/EnhancementPipeline.h"
 #include "gta60/pipeline/PictureCompare.h"
+#include "gta60/pipeline/TvCadenceGate.h"
 #include "gta60/sink/NvencD3D12Encoder.h"
 #include "gta60/sink/QuestStreamServer.h"
 #include "gta60/xbox/Account.h"
@@ -18,12 +20,14 @@
 #include "gta60/xr/OpenXrQuadSink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace gta60;
@@ -485,6 +489,198 @@ bool test6_NvencD3D12HardwareEncodeAndQuestServer() {
            runNvencQuestServerCase(media::VideoCodec::HEVC);
 }
 
+// TV mode's cadence gate. The console scans out a fixed 60 Hz grid whatever the game renders, so
+// the gate has to (a) drop the repeats, (b) read the real content rate, and (c) choose a multiplier
+// that lands on the *display's* refresh - which is why the decision is a ratio and not the Quest
+// path's fixed 34/46 fps band.
+bool test7_TvCadenceGate() {
+    constexpr uint32_t w = 1920, h = 1080;
+    media::SyntheticGameSource paired(w, h, true);   // duplicated pairs, like a 30 fps game
+    media::SyntheticGameSource unique(w, h, false);  // a different picture every tick
+
+    auto feed = [](pipeline::TvCadenceGate& gate, media::SyntheticGameSource& src, uint32_t ticks,
+                   uint32_t stride, int64_t& nowMs, uint32_t& kept, uint32_t& dropped) {
+        for (uint32_t i = 0; i < ticks; ++i) {
+            const auto frame = src.generateContainerFrame(static_cast<uint64_t>(i) * stride);
+            const auto d = gate.observe(frame.yPlane.data(), frame.width, frame.height, frame.stride, nowMs);
+            if (d.keep) {
+                ++kept;
+            } else {
+                ++dropped;
+            }
+            nowMs += 16; // ~60 Hz scanout
+        }
+    };
+
+    // 1. 30 fps content on a 60 Hz panel: half the frames are repeats, content reads ~30 fps, and
+    //    frame generation must engage at 2x.
+    {
+        pipeline::TvCadenceGate gate;
+        gate.setRefresh(60);
+        gate.reset();
+        int64_t nowMs = 0;
+        uint32_t kept = 0, dropped = 0;
+        feed(gate, paired, 150, 1, nowMs, kept, dropped);
+        CHECK(dropped > 50, "repeat frames must be dropped");
+        CHECK(std::abs(gate.contentFps() - 31.25) < 3.0, "content rate must read as ~30 fps");
+        CHECK(gate.frameGenActive(), "30 fps content on a 60 Hz panel must enable frame generation");
+        CHECK(gate.multiplier() == 2, "30 -> 60 fps is a 2x multiplier");
+        CHECK(gate.refreshHz() == 60, "refresh should be what was set");
+
+        // 2. 60 fps content on the same panel: no repeats, no reason to interpolate.
+        gate.reset();
+        kept = dropped = 0;
+        feed(gate, unique, 150, 2, nowMs, kept, dropped);
+        CHECK(gate.contentFps() > 55.0, "60 fps content must read as ~60 fps");
+        CHECK(!gate.frameGenActive(), "60 fps content on a 60 Hz panel must not be doubled");
+        CHECK(gate.multiplier() == 1, "no frame generation means a 1x multiplier");
+    }
+
+    // 3. The same 60 fps content on a 120 Hz panel *should* double, and 30 fps content should ask
+    //    for 4x - clamped to 3, because the pipeline only carries three outputs per source frame.
+    {
+        pipeline::TvCadenceGate gate;
+        gate.setRefresh(120);
+        gate.reset();
+        int64_t nowMs = 0;
+        uint32_t kept = 0, dropped = 0;
+        feed(gate, unique, 150, 2, nowMs, kept, dropped);
+        CHECK(gate.frameGenActive(), "60 fps content on a 120 Hz panel must enable frame generation");
+        CHECK(gate.multiplier() == 2, "60 -> 120 fps is a 2x multiplier");
+
+        gate.reset();
+        kept = dropped = 0;
+        feed(gate, paired, 150, 1, nowMs, kept, dropped);
+        CHECK(gate.multiplier() == 3, "30 fps content on 120 Hz would want 4x, clamped to 3");
+    }
+
+    // 4. A frozen picture must not freeze the display: the starvation guard forwards at least one
+    //    frame every ~50 ms even though every frame is identical.
+    {
+        pipeline::TvCadenceGate gate;
+        gate.setRefresh(60);
+        gate.reset();
+        const auto frozen = unique.generateContainerFrame(10);
+        int64_t nowMs = 0;
+        uint32_t kept = 0;
+        for (int i = 0; i < 40; ++i) { // 640 ms
+            const auto d = gate.observe(frozen.yPlane.data(), frozen.width, frozen.height, frozen.stride, nowMs);
+            if (d.keep) ++kept;
+            nowMs += 16;
+        }
+        CHECK(kept >= 6, "a static scene must still be forwarded about every 50 ms");
+    }
+
+    // 5. --no-fg must be honoured.
+    {
+        pipeline::TvCadenceGate gate;
+        pipeline::TvCadenceGate::Config cfg;
+        cfg.allowFrameGen = false;
+        gate.configure(cfg);
+        gate.setRefresh(120);
+        gate.reset();
+        int64_t nowMs = 0;
+        uint32_t kept = 0, dropped = 0;
+        feed(gate, paired, 150, 1, nowMs, kept, dropped);
+        CHECK(!gate.frameGenActive(), "frame generation must stay off when disabled");
+        CHECK(gate.multiplier() == 1, "disabled frame generation must report 1x");
+    }
+
+    std::printf("[PASS] Test7_TvCadenceGate (drops repeats, display-relative FG, starvation guard)\n");
+    return true;
+}
+
+// The exact pipeline configuration TV mode uses: 1440p capture card -> 4K BGRA for the swap chain,
+// with the compute flow that measured cheaper than NVOFA on this GPU.
+bool test8_TvPipelineUpscale4k() {
+    pipeline::D3D12Context d3d;
+    CHECK(d3d.initialize(), "D3D12Context initialize failed");
+
+    constexpr uint32_t inW = 2560, inH = 1440;
+    constexpr uint32_t outW = 3840, outH = 2160;
+    media::SyntheticGameSource src(inW, inH, false);
+    const auto f0 = src.generateContainerFrame(0);
+    const auto f1 = src.generateContainerFrame(2);
+
+    pipeline::PipelineConfig cfg{};
+    cfg.inputWidth = inW;
+    cfg.inputHeight = inH;
+    cfg.outputWidth = outW;
+    cfg.outputHeight = outH;
+    cfg.targetFps = 120;   // a 4K120 panel: three output slots
+    cfg.useNvofa = false;  // TV mode's default flow (measured 2.1x cheaper than NVOFA here)
+    cfg.outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM; // must match the swap chain, or the copy fails
+    cfg.rcasSharpness = 0.15f;
+
+    pipeline::EnhancementPipeline pipe;
+    CHECK(pipe.initialize(d3d, cfg), "EnhancementPipeline initialize failed");
+
+    pipeline::ProcessedFrameBatch b0, b1;
+    CHECK(pipe.processUniqueFrame(f0, b0, 1, true), "first frame failed");
+    CHECK(b0.frames.size() == 1, "the first frame is real only");
+    const D3D12_RESOURCE_DESC d0 = b0.frames[0]->GetDesc();
+    CHECK(d0.Width == outW && d0.Height == outH, "output must be 4K");
+    CHECK(d0.Format == DXGI_FORMAT_B8G8R8A8_UNORM, "output must be BGRA8 for the swap chain copy");
+
+    CHECK(pipe.processUniqueFrame(f1, b1, 2, true), "second frame failed");
+    CHECK(b1.frames.size() == 2 && b1.isGenerated[0] && !b1.isGenerated[1],
+          "frame generation must emit [interpolated, real]");
+    for (ID3D12Resource* tex : b1.frames) {
+        const D3D12_RESOURCE_DESC d = tex->GetDesc();
+        CHECK(d.Width == outW && d.Height == outH && d.Format == DXGI_FORMAT_B8G8R8A8_UNORM,
+              "every generated output must be 4K BGRA8");
+    }
+
+    // Both frames must carry real picture data, and the generated one must differ from the real one.
+    std::vector<uint8_t> gen, real;
+    uint32_t genPitch = 0, realPitch = 0;
+    CHECK(d3d.readbackTexture2D(b1.frames[0], gen, genPitch), "generated readback failed");
+    CHECK(d3d.readbackTexture2D(b1.frames[1], real, realPitch), "real readback failed");
+    uint64_t nonBlank = 0, difference = 0;
+    for (uint32_t y = 0; y < outH; y += 16) {
+        const uint8_t* g = gen.data() + static_cast<size_t>(y) * genPitch;
+        const uint8_t* r = real.data() + static_cast<size_t>(y) * realPitch;
+        for (uint32_t x = 0; x < outW * 4; x += 32) {
+            nonBlank += r[x];
+            difference += static_cast<uint64_t>(std::abs(int(g[x]) - int(r[x])));
+        }
+    }
+    CHECK(nonBlank > 0, "the 4K real frame must contain picture data");
+    CHECK(difference > 10000, "the interpolated frame must differ from the real one");
+
+    std::printf("[PASS] Test8_TvPipelineUpscale4k (gpu=%.2f ms upscale+fg=%.2f ms)\n",
+                b1.timings.totalGpuMs, b1.timings.frameGenAndUpscaleMs);
+    pipe.shutdown();
+    d3d.shutdown();
+    return true;
+}
+
+// TV mode plays the card's PCM on the television's HDMI endpoint, so this covers the S16 push path
+// (and the format conversion into whatever the mixer runs).
+bool test9_WasapiPcmStereoRender() {
+    media::WasapiPcmRender render;
+    if (!render.start(L"", 30)) {
+        std::printf("[PASS] Test9_WasapiPcmStereoRender (skipped: no WASAPI render endpoint)\n");
+        return true;
+    }
+    std::vector<int16_t> block(480 * 2, 0); // 10 ms of silence
+    for (int i = 0; i < 12; ++i) {
+        render.pushStereo16(block.data(), block.size() / 2);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto stats = render.consumeStats();
+    const std::string name = render.deviceName();
+    CHECK(render.active(), "the endpoint must stay active while pushing");
+    CHECK(!name.empty(), "the endpoint should report a friendly name");
+    CHECK(stats.framesPushed > 0, "WASAPI must accept PCM (framesPushed > 0)");
+    render.stop();
+    CHECK(!render.active(), "stop must release the endpoint");
+    std::printf("[PASS] Test9_WasapiPcmStereoRender (device='%s' pushed=%llu dropped=%llu)\n", name.c_str(),
+                static_cast<unsigned long long>(stats.framesPushed),
+                static_cast<unsigned long long>(stats.framesDropped));
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -496,10 +692,13 @@ int main() {
     ok &= test4_FrameGenAndFsrUpscale();
     ok &= test5_OpenXrLoaderAndRuntimeProbe();
     ok &= test6_NvencD3D12HardwareEncodeAndQuestServer();
+    ok &= test7_TvCadenceGate();
+    ok &= test8_TvPipelineUpscale4k();
+    ok &= test9_WasapiPcmStereoRender();
     CoUninitialize();
 
     if (ok) {
-        std::printf("\nALL 6 TESTS PASSED.\n");
+        std::printf("\nALL 9 TESTS PASSED.\n");
         return 0;
     }
     std::fprintf(stderr, "\nONE OR MORE TESTS FAILED.\n");

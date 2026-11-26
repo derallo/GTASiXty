@@ -236,6 +236,28 @@ bool Gt60Server::start(uint16_t tcpPort, uint16_t udpDiscoveryPort,
                     ::sendto(p_->udpFd, reply, static_cast<size_t>(len), 0,
                              reinterpret_cast<sockaddr*>(&from), fromLen);
                 }
+            } else if (std::strncmp(buf, "GTA60_DUMP|", 11) == 0) {
+                const char* rest = buf + 11;
+                const char* bar = std::strchr(rest, '|');
+                int sec = 15;
+                std::string path;
+                if (bar) {
+                    sec = std::atoi(rest);
+                    path.assign(bar + 1);
+                } else {
+                    path.assign(rest);
+                }
+                while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) {
+                    path.pop_back();
+                }
+                if (sec < 1) sec = 1;
+                if (sec > 120) sec = 120;
+                if (!path.empty() && p_->cbs.onDumpRequested) {
+                    p_->cbs.onDumpRequested(sec, path);
+                    const char* ack = "GTA60_DUMP_ACK";
+                    ::sendto(p_->udpFd, ack, std::strlen(ack), 0,
+                             reinterpret_cast<sockaddr*>(&from), fromLen);
+                }
             }
         }
     });
@@ -268,6 +290,8 @@ bool Gt60Server::start(uint16_t tcpPort, uint16_t udpDiscoveryPort,
 
             int one = 1;
             ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            int dscp = 0xB8; // DSCP EF (46) for WMM low-latency Wi-Fi QoS
+            ::setsockopt(c, IPPROTO_IP, IP_TOS, &dscp, sizeof(dscp));
             int sndBuf = 2 * 1024 * 1024;
             ::setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf));
 
@@ -296,6 +320,17 @@ bool Gt60Server::start(uint16_t tcpPort, uint16_t udpDiscoveryPort,
 
                 if (hdr.type == kTypeClientIdr && p_->cbs.onIdrRequested) {
                     p_->cbs.onIdrRequested();
+                } else if (hdr.type == kTypeClientConfig && p_->cbs.onConfigRequested && payload.size() >= 12) {
+                    ClientStreamConfig cfg{};
+                    std::memcpy(&cfg.width, payload.data() + 0, 4);
+                    std::memcpy(&cfg.height, payload.data() + 4, 4);
+                    std::memcpy(&cfg.fps, payload.data() + 8, 2);
+                    std::memcpy(&cfg.bitrateMbps, payload.data() + 10, 2);
+                    if (payload.size() >= 14) {
+                        cfg.codecWire = payload[12];
+                        cfg.flags = payload[13];
+                    }
+                    p_->cbs.onConfigRequested(cfg);
                 }
             }
 
@@ -329,15 +364,26 @@ void Gt60Server::stop() {
 }
 
 void Gt60Server::setVideoConfig(uint32_t width, uint32_t height, uint32_t fps, const std::vector<uint8_t>& csd) {
+    VideoCodec currentCodec = VideoCodec::HEVC;
+    {
+        std::lock_guard lk(p_->cfgMtx);
+        currentCodec = p_->codec;
+    }
+    setVideoConfig(width, height, fps, currentCodec, csd);
+}
+
+void Gt60Server::setVideoConfig(uint32_t width, uint32_t height, uint32_t fps,
+                                VideoCodec codec, const std::vector<uint8_t>& csd) {
     {
         std::lock_guard lk(p_->cfgMtx);
         p_->width = width;
         p_->height = height;
         p_->fps = fps;
+        p_->codec = codec;
         p_->csd = csd;
     }
     if (!csd.empty()) {
-        auto cfgPkt = makeVideoConfigPayload(width, height, p_->codec, csd);
+        auto cfgPkt = makeVideoConfigPayload(width, height, codec, csd);
         p_->enqueue(kTypeVideoConfig, 0, static_cast<uint16_t>(fps), 0, cfgPkt.data(), cfgPkt.size());
     }
 }

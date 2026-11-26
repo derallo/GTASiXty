@@ -144,7 +144,7 @@ final class DirectController {
         public void run() {
             if (!streaming || pageStreaming) return;
             failStart("The console did not start the stream (session collision or stuck console). "
-                    + "Press Start direct to retry.");
+                    + "Press Start XRemote to retry.");
         }
     };
 
@@ -190,8 +190,8 @@ final class DirectController {
         }
         updateButtons();
         setStatus(xbox.signedIn()
-                ? "Direct: ready \u2014 tap Console or Start direct (finds Xbox via account, no IP needed)"
-                : "Direct: tap Sign in (finds your Xbox automatically \u2014 no IP needed)");
+                ? "XRemote: ready \u2014 tap Console or Start XRemote (finds Xbox via account, no IP needed)"
+                : "XRemote: tap Sign in (finds your Xbox automatically \u2014 no IP needed)");
     }
 
     void hide() {
@@ -446,7 +446,7 @@ final class DirectController {
                     why += " - the console is stuck in a failed streaming start; restart the Xbox "
                             + "(Guide > Restart console) and try again.";
                 }
-                fail("Direct start failed: " + why);
+                fail("XRemote start failed: " + why);
             }
         });
     }
@@ -509,7 +509,7 @@ final class DirectController {
             if (!visible) return;
             if (bar != null) bar.setVisibility(View.VISIBLE);
             updateButtons();
-            setStatus("Direct: idle");
+            setStatus("XRemote: idle");
         });
     }
 
@@ -609,7 +609,7 @@ final class DirectController {
      */
     private void fixPad() {
         if (!streaming || webView == null || !pageLoaded) {
-            setStatus("Start a direct stream first");
+            setStatus("Start an XRemote stream first");
             return;
         }
         refreshLocalPad("fix pad");
@@ -666,7 +666,7 @@ final class DirectController {
         row.setGravity(Gravity.CENTER_VERTICAL);
 
         final TextView title = new TextView(activity);
-        title.setText("Direct");
+        title.setText("XRemote");
         title.setTextColor(Color.parseColor("#F97316"));
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
@@ -677,7 +677,7 @@ final class DirectController {
         row.addView(signInBtn);
         consoleBtn = button("Console", "#334155", v -> chooseConsole());
         row.addView(consoleBtn);
-        startBtn = button("Start direct", "#16A34A", v -> start());
+        startBtn = button("Start XRemote", "#16A34A", v -> start());
         row.addView(startBtn);
         stopBtn = button("Stop", "#475569", v -> stop());
         row.addView(stopBtn);
@@ -751,11 +751,11 @@ final class DirectController {
 
     private void showHelp() {
         final String msg =
-                "Direct Mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC needed).\n\n"
-                + "\u2022 Finding your Xbox (No IP needed): Direct mode discovers your console automatically through your Microsoft account \u2014 you do NOT enter an IP address. (Only PC and Capture LAN modes use an IP.)\n\n"
+                "XRemote mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC needed).\n\n"
+                + "\u2022 Finding your Xbox (No IP needed): XRemote mode discovers your console automatically through your Microsoft account \u2014 you do NOT enter an IP address. (Only PC and Capture LAN modes use an IP.)\n\n"
                 + "\u2022 Sign in: Signs into your Microsoft/Xbox account using a device code.\n\n"
                 + "\u2022 Console: Lists consoles on your account and lets you pick which Xbox to stream from.\n\n"
-                + "\u2022 Start direct / Stop: Starts or cleanly stops the direct WebRTC stream and releases the console session.\n\n"
+                + "\u2022 Start XRemote / Stop: Starts or cleanly stops the XRemote WebRTC stream and releases the console session.\n\n"
                 + "\u2022 Fix pad: If your controller is paired to the Xbox and stops working in-game, this releases the Quest's virtual pad so your Xbox controller keeps Player 1. If your controller is paired to the Quest, it re-announces the pad to wake up a resumed game.\n\n"
                 + "\u2022 Enhance (Adreno 740 GPU):\n"
                 + "  - Off: Raw decoded video.\n"
@@ -781,7 +781,7 @@ final class DirectController {
         sv.addView(tv);
 
         new AlertDialog.Builder(activity)
-                .setTitle("Direct Mode Help")
+                .setTitle("XRemote Mode Help")
                 .setView(sv)
                 .setNeutralButton("Run Network Check", (d, w) -> {
                     if (activity instanceof MainActivity) {
@@ -1040,7 +1040,7 @@ final class DirectController {
                 handler.removeCallbacks(startWatchdog);
                 runOnUi(() -> {
                     updateButtons();
-                    setStatus("Direct: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("XRemote: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     handler.removeCallbacks(keepaliveTick);
                     handler.postDelayed(keepaliveTick, 30000);
                     scheduleAutoHideHud(5000);
@@ -1089,7 +1089,7 @@ final class DirectController {
                     final String mode = p.length >= 8 ? (" [" + p[7] + "]") : "";
                     final String gpu = p.length >= 9 ? (" gpu " + p[8] + "ms)") : (p.length >= 7 ? ")" : "");
                     final String bwe = p.length >= 10 ? (", bwe " + p[9] + " Mbps") : "";
-                    final String text = "Direct:" + res + uniq + mode + gpu + ", " + p[2] + " Mbps" + bwe + ", jb " + p[3] + " ms" + rtt;
+                    final String text = "XRemote:" + res + uniq + mode + gpu + ", " + p[2] + " Mbps" + bwe + ", jb " + p[3] + " ms" + rtt;
                     Log.i(TAG, text);
                     // Only repaint the Android status TextView when the top HUD bar is visible.
                     runOnUi(() -> {
@@ -1100,7 +1100,7 @@ final class DirectController {
                 }
             } else if ("streaming".equals(state)) {
                 runOnUi(() -> {
-                    setStatus("Direct: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("XRemote: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     updateButtons();
                     scheduleAutoHideHud(5000);
                 });
@@ -1155,7 +1155,7 @@ final class DirectController {
                 streaming = false;
                 ensurePadTicker(false);
                 updateButtons();
-                fail(message == null ? "Direct stream error" : message);
+                fail(message == null ? "XRemote stream error" : message);
             });
         }
 

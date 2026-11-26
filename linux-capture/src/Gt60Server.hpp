@@ -12,11 +12,22 @@ namespace gta60_linux {
 enum class VideoCodec : uint8_t {
     H264 = 0,
     HEVC = 1,
+    AV1 = 2,
 };
 
 inline const char* videoCodecName(VideoCodec c) {
+    if (c == VideoCodec::AV1) return "AV1";
     return c == VideoCodec::HEVC ? "HEVC" : "H264";
 }
+
+struct ClientStreamConfig {
+    uint32_t width = 2560;
+    uint32_t height = 1440;
+    uint16_t fps = 60;
+    uint16_t bitrateMbps = 100;
+    uint8_t codecWire = 0xFF; // 0=H264, 1=HEVC, 2=AV1, 0xFF=keep current
+    uint8_t flags = 0;        // bit0 (0x01) = 10-bit (Main10 / AV1-10b), bit7 (0x80) = flags valid
+};
 
 class Gt60Server {
 public:
@@ -36,6 +47,8 @@ public:
     struct Callbacks {
         std::function<void()> onClientConnected;
         std::function<void()> onIdrRequested;
+        std::function<void(const ClientStreamConfig&)> onConfigRequested;
+        std::function<void(int seconds, const std::string& path)> onDumpRequested;
     };
 
     Gt60Server();
@@ -49,6 +62,7 @@ public:
     void stop();
 
     void setVideoConfig(uint32_t width, uint32_t height, uint32_t fps, const std::vector<uint8_t>& csd);
+    void setVideoConfig(uint32_t width, uint32_t height, uint32_t fps, VideoCodec codec, const std::vector<uint8_t>& csd);
     void sendVideoAccessUnit(const uint8_t* data, size_t size, uint32_t timestampMs,
                              bool isIdr, bool isDuplicate = false);
     void sendAudioPcm(const int16_t* interleavedStereo, size_t frameCount, uint32_t timestampMs);

@@ -113,12 +113,14 @@ add_library(gta60_core STATIC
   src/media/MfH264Decoder.cpp
   src/media/MfCaptureSource.cpp
   src/media/OpusWasapiAudio.cpp
+  src/media/WasapiPcmRender.cpp
   src/media/SyntheticGameSource.cpp
   src/nvof/NvOfSession.cpp
   src/pipeline/D3D12Context.cpp
   src/pipeline/EnhancementPipeline.cpp
   src/sink/NvencD3D12Encoder.cpp
   src/sink/QuestStreamServer.cpp
+  src/sink/TvDisplaySink.cpp
   src/xr/OpenXrQuadSink.cpp
 )
 add_dependencies(gta60_core gta60_shaders)

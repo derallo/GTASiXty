@@ -8,8 +8,11 @@
 #include "gta60/pipeline/D3D12Context.h"
 #include "gta60/pipeline/EnhancementPipeline.h"
 #include "gta60/pipeline/PictureCompare.h"
+#include "gta60/pipeline/TvCadenceGate.h"
 #include "gta60/sink/NvencD3D12Encoder.h"
 #include "gta60/sink/QuestStreamServer.h"
+#include "gta60/sink/TvDisplaySink.h"
+#include "gta60/media/WasapiPcmRender.h"
 #include "gta60/xbox/Account.h"
 #include "gta60/xbox/Https.h"
 #include "gta60/xbox/Protocol.h"
@@ -37,6 +40,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -58,7 +62,19 @@ BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
 }
 
 struct CliOptions {
-    enum class Mode { Help, Login, ListConsoles, StopSession, Connect, SyntheticDemo, Agent, Capture };
+    enum class Mode {
+        Help,
+        Login,
+        ListConsoles,
+        StopSession,
+        Connect,
+        SyntheticDemo,
+        Agent,
+        Capture,
+        Tv,       // capture card -> GPU enhance -> 4K display (no console session, no Quest)
+        TvBench,  // same pipeline, no window: measures the 4K enhancement cost
+        TvList    // list displays (and the capture card, if one is plugged in)
+    };
     Mode mode = Mode::Help;
     std::string serverId = "auto";
     // --stop-session: terminate a session by id. The console allows one streaming session at a time,
@@ -112,6 +128,36 @@ struct CliOptions {
     float dedupMad = 1.0f;
     // Substring of the capture device's friendly name. Empty picks the first video capture device.
     std::string captureDevice;
+
+    // ---- TV mode ----
+    // Output: the television, at 4K by default. The display's own mode list decides what is possible
+    // and the mode is restored when the process exits.
+    uint32_t tvWidth = 3840;
+    uint32_t tvHeight = 2160;
+    uint32_t tvRefreshHz = 0; // 0 = highest the panel offers at that size (120 on a 4K120 TV)
+    std::string tvDisplay;    // friendly-name substring or display index; empty = primary
+    bool tvWindowed = false;
+    uint32_t tvWindowWidth = 1280;
+    uint32_t tvWindowHeight = 720;
+    bool tvSetMode = true;
+    bool tvTearing = false;   // Present(0) + ALLOW_TEARING: lowest latency, can tear
+    bool tvShowCursor = false;
+    // RCAS strength on this path. The source is uncompressed HDMI rather than a ~20 Mbps console
+    // encode, so sharpening has no quantization noise to amplify and can run harder than the Quest
+    // default of 0.25 without the grain that made that path drop to 0.05-0.12.
+    float tvSharpness = 0.15f;
+    bool sharpnessSet = false;
+    std::string tvAudioDevice; // endpoint friendly-name substring; empty = system default
+    bool tvAudio = true;
+    uint32_t tvAudioDelayMs = 0;
+    bool tvSynthetic = false;  // synthetic 60 Hz game frames instead of the card (smoke tests)
+    uint32_t tvInputWidth = 2560; // synthetic source size only; the card dictates the real one
+    uint32_t tvInputHeight = 1440;
+    // Flow backend for frame generation. Measured on the 3080 Ti at 1440p->4K (--tv-bench): the
+    // D3D12 compute flow costs 1.18 ms per frame against NVOFA's 4.59 ms, because Ampere's optical
+    // flow engine plus its fence round trip does not scale like the compute pass does. TV mode
+    // therefore defaults to the compute flow; --tv-nvofa asks for the hardware engine instead.
+    bool tvNvofa = false;
 };
 
 void printUsage() {
@@ -125,7 +171,12 @@ void printUsage() {
         "  GTA-Sixty.exe --synthetic-demo [options]\n"
         "  GTA-Sixty.exe --agent     (listen on UDP 7662 so the headset can start a stream)\n"
         "  GTA-Sixty.exe --capture [--capture-device <name>] [--bitrate <Mbps>] [--codec h264|hevc]\n"
-        "                            HDMI capture card -> NVENC -> Quest. Does not open Xbox remote play.\n\n"
+        "                            HDMI capture card -> NVENC -> Quest. Does not open Xbox remote play.\n"
+        "  GTA-Sixty.exe --tv [--tv-resolution 4k] [--tv-display <name>] [--tv-refresh 120]\n"
+        "                            HDMI capture card -> EASU/RCAS + optional frame gen -> the TV, at 4K.\n"
+        "                            Standalone: no console session, no Quest, no encoder, no network.\n"
+        "  GTA-Sixty.exe --tv-list    Displays (with modes) and the capture card's native formats\n"
+        "  GTA-Sixty.exe --tv-bench   Run the 4K enhancement pipeline without a window and time it\n\n"
         "Options:\n"
         "  --fps <60|90>             Output frame rate (2x or 3x from 30 FPS) [default: 60]\n"
         "  --upscale <1080p|1440p|4k> Target output resolution [default: 1440p]\n"
@@ -151,7 +202,60 @@ void printUsage() {
         "  --run-seconds <N>         Stop cleanly after N seconds of streaming (0 = until Ctrl+C) [default: 0]\n"
         "  --frames <N>              Frame count for --synthetic-demo (0 = run until Ctrl+C) [default: 180]\n"
         "  --capture                 Capture-card mode: Media Foundation -> NVENC -> Quest TCP 7660\n"
-        "  --capture-device <text>   Friendly-name substring of the capture card (default: first device)\n");
+        "  --capture-device <text>   Friendly-name substring of the capture card (default: first device)\n"
+        "  --tv                      TV mode: capture card -> EASU/RCAS (+ optional FG) -> display at 4K\n"
+        "  --tv-resolution <size>    TV output size: 1080p, 1440p, 4k or WxH [default: 4k]\n"
+        "  --tv-refresh <Hz>         TV refresh to request (0 = highest the panel offers) [default: 0]\n"
+        "  --tv-display <text>       Display friendly-name substring or index (0-based) [default: primary]\n"
+        "  --tv-tearing              Present without vsync (lowest latency, may tear; needs FG off)\n"
+        "  --tv-window               Windowed instead of fullscreen (smoke tests; no mode change)\n"
+        "  --tv-window-size <WxH>    Window client size for --tv-window [default: 1280x720]\n"
+        "  --tv-keep-mode            Never change the display mode, use whatever it is set to\n"
+        "  --tv-sharpness <0..2>     RCAS for this path; lower = stronger [default: 0.15]\n"
+        "  --tv-audio <text>         Audio endpoint substring, e.g. the TV's HDMI output [default: system]\n"
+        "  --tv-no-audio             Video only\n"
+        "  --tv-audio-delay <ms>     Delay audio to line it up with the video path [default: 0]\n"
+        "  --tv-synthetic            Use synthetic 60 Hz game frames instead of the capture card\n"
+        "  --tv-input <size>         Synthetic source size: 1080p, 1440p, 4k or WxH [default: 1440p]\n"
+        "  --tv-nvofa                Use the hardware optical-flow engine for frame generation. Measured\n"
+        "                            2.1x slower than the compute flow here, so it is opt-in [default: compute]\n"
+        "  --tv-list                 List displays, their modes, and the capture card's formats\n"
+        "  --tv-bench                Time the 4K enhancement pipeline (no window, no card needed)\n");
+}
+
+bool parseSizeToken(const std::string& v, uint32_t& w, uint32_t& h) {
+    if (v == "1080p" || v == "1080") {
+        w = 1920;
+        h = 1080;
+        return true;
+    }
+    if (v == "1440p" || v == "1440") {
+        w = 2560;
+        h = 1440;
+        return true;
+    }
+    if (v == "4k" || v == "2160p" || v == "2160" || v == "uhd") {
+        w = 3840;
+        h = 2160;
+        return true;
+    }
+    if (v == "720p" || v == "720") {
+        w = 1280;
+        h = 720;
+        return true;
+    }
+    const auto x = v.find('x');
+    if (x == std::string::npos || x == 0) return false;
+    try {
+        const auto uw = std::stoul(v.substr(0, x));
+        const auto uh = std::stoul(v.substr(x + 1));
+        if (uw < 320 || uh < 200 || uw > 7680 || uh > 4320) return false;
+        w = static_cast<uint32_t>(uw);
+        h = static_cast<uint32_t>(uh);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool parseArgs(int argc, char** argv, CliOptions& opts) {
@@ -182,6 +286,52 @@ bool parseArgs(int argc, char** argv, CliOptions& opts) {
         } else if (a == "--capture") {
             opts.mode = CliOptions::Mode::Capture;
             opts.questServer = true;
+        } else if (a == "--tv") {
+            opts.mode = CliOptions::Mode::Tv;
+        } else if (a == "--tv-list") {
+            opts.mode = CliOptions::Mode::TvList;
+        } else if (a == "--tv-bench") {
+            opts.mode = CliOptions::Mode::TvBench;
+        } else if (a == "--tv-resolution") {
+            std::string v;
+            if (!nextVal(v) || !parseSizeToken(v, opts.tvWidth, opts.tvHeight)) return false;
+        } else if (a == "--tv-refresh") {
+            std::string v;
+            if (!nextVal(v)) return false;
+            opts.tvRefreshHz = static_cast<uint32_t>(std::stoul(v));
+        } else if (a == "--tv-display") {
+            if (!nextVal(opts.tvDisplay)) return false;
+        } else if (a == "--tv-window") {
+            opts.tvWindowed = true;
+        } else if (a == "--tv-window-size") {
+            std::string v;
+            if (!nextVal(v) || !parseSizeToken(v, opts.tvWindowWidth, opts.tvWindowHeight)) return false;
+            opts.tvWindowed = true;
+        } else if (a == "--tv-keep-mode") {
+            opts.tvSetMode = false;
+        } else if (a == "--tv-tearing") {
+            opts.tvTearing = true;
+        } else if (a == "--tv-show-cursor") {
+            opts.tvShowCursor = true;
+        } else if (a == "--tv-sharpness") {
+            std::string v;
+            if (!nextVal(v)) return false;
+            opts.tvSharpness = std::clamp(std::stof(v), 0.0f, 2.0f);
+        } else if (a == "--tv-audio") {
+            if (!nextVal(opts.tvAudioDevice)) return false;
+        } else if (a == "--tv-no-audio") {
+            opts.tvAudio = false;
+        } else if (a == "--tv-audio-delay") {
+            std::string v;
+            if (!nextVal(v)) return false;
+            opts.tvAudioDelayMs = static_cast<uint32_t>(std::stoul(v));
+        } else if (a == "--tv-synthetic") {
+            opts.tvSynthetic = true;
+        } else if (a == "--tv-input") {
+            std::string v;
+            if (!nextVal(v) || !parseSizeToken(v, opts.tvInputWidth, opts.tvInputHeight)) return false;
+        } else if (a == "--tv-nvofa") {
+            opts.tvNvofa = true;
         } else if (a == "--capture-device") {
             if (!nextVal(opts.captureDevice)) return false;
         } else if (a == "--fps") {
@@ -249,6 +399,7 @@ bool parseArgs(int argc, char** argv, CliOptions& opts) {
             std::string v;
             if (!nextVal(v)) return false;
             opts.rcasSharpness = std::clamp(std::stof(v), 0.0f, 2.0f);
+            opts.sharpnessSet = true;
         } else if (a == "--dedup-mad") {
             std::string v;
             if (!nextVal(v)) return false;
@@ -720,6 +871,377 @@ int runCapture(const CliOptions& opts) {
     nvenc.shutdown();
     cap.close();
     d3d.shutdown();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// TV mode: capture card -> GPU enhancement (EASU upscale + RCAS sharpen, optional motion-compensated
+// frame generation) -> the television, at 4K.
+//
+// Standalone by design. There is no xhome session, so the console's single remote-play slot stays
+// free and the controller stays paired to the console; there is no encoder, no decoder and no
+// network peer, so the per-frame budget is a fraction of the Quest path's. What it keeps from the
+// Quest pipeline is the part that turned out to matter: duplicate-frame detection on the real game
+// signal, FSR1 EASU/RCAS, and NVOFA frame generation - just pointed at a display instead of a
+// 20 Mbps H.264 stream.
+// ---------------------------------------------------------------------------------------------
+
+int runTvList(const CliOptions& opts) {
+    sink::TvDisplaySink::listDisplays();
+    std::printf("capture devices (uncompressed up to 4K is what this mode wants):\n");
+    media::MfCaptureSource capture;
+    media::CaptureLimits limits;
+    limits.maxWidth = 3840;
+    limits.maxHeight = 2160;
+    if (capture.open(log::widen(opts.captureDevice), limits)) {
+        const auto& f = capture.format();
+        char name[512] = {};
+        WideCharToMultiByte(CP_UTF8, 0, f.deviceName.c_str(), -1, name, sizeof(name) - 1, nullptr, nullptr);
+        std::printf("  selected: %s  %ux%u @ %u fps  %s  audio=%s\n", name, f.width, f.height, f.fps,
+                    f.subtype.c_str(), f.audio ? "yes" : "no");
+        capture.close();
+    } else {
+        std::printf("  (none opened - the log above lists whatever the card advertises)\n");
+    }
+    return 0;
+}
+
+// Times the enhancement pipeline at the requested output size without creating a window, so the 4K
+// cost can be measured on any machine and compared against the frame budget.
+int runTvBench(const CliOptions& opts) {
+    const float sharpness = opts.sharpnessSet ? opts.rcasSharpness : opts.tvSharpness;
+    const uint32_t inW = opts.tvInputWidth;
+    const uint32_t inH = opts.tvInputHeight;
+    const uint32_t outW = opts.tvWidth;
+    const uint32_t outH = opts.tvHeight;
+
+    pipeline::D3D12Context d3d;
+    if (!d3d.initialize()) {
+        log::error("tv-bench", "D3D12 initialization failed");
+        return 1;
+    }
+    media::SyntheticGameSource synth(inW, inH, true);
+
+    std::printf("TV-mode enhancement cost on %s: %ux%u -> %ux%u, RCAS %.2f, flow=%s\n",
+                log::narrow(d3d.adapterName()).c_str(), inW, inH, outW, outH, sharpness,
+                opts.tvNvofa ? "NVOFA" : "compute");
+    std::printf("%-14s %9s %8s %8s %9s %9s %9s %9s\n", "mode", "total ms", "upload", "nvofa", "refine+fill",
+                "fg+scale", "input fps", "output fps");
+
+    for (const uint32_t mult : {1u, 2u}) {
+        pipeline::PipelineConfig pcfg;
+        pcfg.inputWidth = inW;
+        pcfg.inputHeight = inH;
+        pcfg.outputWidth = outW;
+        pcfg.outputHeight = outH;
+        pcfg.targetFps = mult > 1 ? 120 : 60; // only sizes the output-slot ring
+        pcfg.useNvofa = opts.tvNvofa;
+        pcfg.outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        pcfg.rcasSharpness = sharpness;
+
+        pipeline::EnhancementPipeline pipe;
+        if (!pipe.initialize(d3d, pcfg)) {
+            log::error("tv-bench", "pipeline initialization failed");
+            d3d.shutdown();
+            return 1;
+        }
+
+        // Pre-build the source frames: synthesising 4K NV12 on the CPU costs milliseconds and must not
+        // land inside the measurement (it is test scaffolding, not part of the real per-frame path).
+        std::vector<media::DecodedNv12Frame> pool;
+        for (uint32_t i = 0; i < 4; ++i) pool.push_back(synth.generateContainerFrame(2ull * i));
+
+        auto run = [&](uint32_t i) {
+            pipeline::ProcessedFrameBatch batch;
+            const auto& frame = pool[i % pool.size()];
+            return pipe.processUniqueFrame(frame, batch, mult, true) ? batch.timings : pipeline::StageTimings{};
+        };
+        for (uint32_t i = 0; i < 5; ++i) run(i); // warm up: shader/PSO residency, VRAM commit
+
+        constexpr uint32_t kFrames = 60;
+        double total = 0, upload = 0, nvofa = 0, refine = 0, scale = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            const auto t = run(i + 5);
+            total += t.totalGpuMs;
+            upload += t.nv12UploadAndConvertMs;
+            nvofa += t.opticalFlowMs;
+            refine += t.flowRefineAndFillMs;
+            scale += t.frameGenAndUpscaleMs;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double wallMs = std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+        const double outFps = 1000.0 / wallMs * (mult > 1 ? 2.0 : 1.0);
+        std::printf("%-14s %9.2f %8.2f %8.2f %9.2f %9.2f %9.1f %9.1f\n", mult > 1 ? "upscale + FG" : "upscale",
+                    wallMs, upload / kFrames, nvofa / kFrames, refine / kFrames, scale / kFrames,
+                    1000.0 / wallMs, outFps);
+        std::printf("               (GPU stage sum %.2f ms)\n", total / kFrames);
+
+        pipe.shutdown();
+    }
+    d3d.shutdown();
+    std::printf("\nBudget: 4K60 = 16.67 ms per frame, 4K120 = 8.33 ms. This table excludes capture\n"
+                "card latency and display latency; see TV_MODE.md for the full budget.\n");
+    return 0;
+}
+
+int runTvMode(const CliOptions& opts) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    const float sharpness = opts.sharpnessSet ? opts.rcasSharpness : opts.tvSharpness;
+
+    // ---- source -------------------------------------------------------------------------------
+    media::MfCaptureSource capture;
+    std::unique_ptr<media::SyntheticGameSource> synth;
+    uint32_t inW = opts.tvInputWidth;
+    uint32_t inH = opts.tvInputHeight;
+    uint32_t srcFps = 60;
+    if (opts.tvSynthetic) {
+        synth = std::make_unique<media::SyntheticGameSource>(inW, inH, true);
+        log::info("tv", std::format("synthetic source {}x{} @ 60 Hz with duplicated pairs (a 30 fps game "
+                                    "on a 60 Hz scanout)", inW, inH));
+    } else {
+        media::CaptureLimits limits;
+        limits.maxWidth = std::max<uint32_t>(opts.tvWidth, 3840);
+        limits.maxHeight = std::max<uint32_t>(opts.tvHeight, 2160);
+        if (!capture.open(log::widen(opts.captureDevice), limits)) return 1;
+        const auto& fmt = capture.format();
+        inW = fmt.width;
+        inH = fmt.height;
+        srcFps = fmt.fps ? fmt.fps : 60;
+        log::info("tv", std::format("capture '{}' {}x{} @ {} fps {} audio={}",
+                                    log::narrow(fmt.deviceName), inW, inH, srcFps, fmt.subtype, fmt.audio));
+    }
+
+    // ---- output -------------------------------------------------------------------------------
+    pipeline::D3D12Context d3d;
+    if (!d3d.initialize()) {
+        log::error("tv", "D3D12 initialization failed");
+        return 1;
+    }
+
+    sink::TvDisplaySink display;
+    sink::TvDisplayConfig dcfg;
+    dcfg.width = opts.tvWidth;
+    dcfg.height = opts.tvHeight;
+    dcfg.refreshHz = opts.tvRefreshHz;
+    dcfg.displayMatch = opts.tvDisplay;
+    dcfg.windowed = opts.tvWindowed;
+    dcfg.windowWidth = opts.tvWindowWidth;
+    dcfg.windowHeight = opts.tvWindowHeight;
+    // A windowed run exists to check the plumbing, so it must not reconfigure the desktop.
+    dcfg.setDisplayMode = opts.tvSetMode && !opts.tvWindowed;
+    dcfg.hideCursor = !opts.tvShowCursor;
+    if (!display.create(d3d, dcfg)) {
+        d3d.shutdown();
+        return 1;
+    }
+    const auto displayInfo = display.info();
+    const uint32_t outW = displayInfo.width;
+    const uint32_t outH = displayInfo.height;
+    const uint32_t refreshHz = displayInfo.refreshHz ? displayInfo.refreshHz : 60;
+
+    // ---- enhancement --------------------------------------------------------------------------
+    pipeline::PipelineConfig pcfg;
+    pcfg.inputWidth = inW;
+    pcfg.inputHeight = inH;
+    pcfg.outputWidth = outW;
+    pcfg.outputHeight = outH;
+    pcfg.targetFps = refreshHz; // sizes the output-slot ring: >= 90 Hz gets three slots
+    pcfg.useNvofa = opts.tvNvofa;
+    // The swap chain is B8G8R8A8_UNORM, so the pipeline writes it directly and the present is one
+    // CopyResource - no format conversion pass anywhere on this path.
+    pcfg.outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pcfg.rcasSharpness = sharpness;
+    pcfg.hudProtect = true;
+
+    pipeline::EnhancementPipeline pipe;
+    if (!pipe.initialize(d3d, pcfg)) {
+        log::error("tv", "enhancement pipeline initialization failed");
+        display.shutdown();
+        d3d.shutdown();
+        return 1;
+    }
+
+    pipeline::TvCadenceGate gate;
+    pipeline::TvCadenceGate::Config gcfg;
+    gcfg.dedupMad = opts.dedupMad;
+    gcfg.allowFrameGen = opts.allowFrameGen;
+    gcfg.maxMultiplier = refreshHz >= 90 ? 3u : 2u;
+    gate.configure(gcfg);
+    gate.setRefresh(refreshHz);
+    gate.reset();
+
+    log::info("tv", std::format("TV mode: {}x{} -> {}x{} @ {} Hz, RCAS {:.2f}, flow={}, frame gen={}, audio={}",
+                                inW, inH, outW, outH, refreshHz, sharpness,
+                                pipe.usingHardwareNvof() ? "NVOFA" : "compute",
+                                opts.allowFrameGen ? "auto" : "off",
+                                opts.tvAudio && !opts.tvSynthetic ? "on" : "off"));
+
+    // ---- audio --------------------------------------------------------------------------------
+    media::WasapiPcmRender audio;
+    if (opts.tvAudio && !opts.tvSynthetic) {
+        if (audio.start(log::widen(opts.tvAudioDevice), 30)) {
+            if (opts.tvAudioDelayMs > 0) {
+                audio.setStartupDelayMs(opts.tvAudioDelayMs);
+                log::info("tv", std::format("audio delayed {} ms to line up with the video path", opts.tvAudioDelayMs));
+            }
+        } else {
+            log::warn("tv", "audio endpoint unavailable; carrying on with video only");
+        }
+    }
+
+    // ---- loop ---------------------------------------------------------------------------------
+    const auto origin = std::chrono::steady_clock::now();
+    const auto deadline = opts.runSeconds > 0 ? origin + std::chrono::seconds(opts.runSeconds)
+                                              : std::chrono::steady_clock::time_point::max();
+    auto lastLog = origin;
+    auto nextSynthTick = origin;
+    const auto synthPeriod = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / 60.0));
+
+    bool tearingNoticeLogged = false;
+    uint64_t totalRead = 0, totalPresented = 0, totalDropped = 0;
+    uint64_t winRead = 0, winKept = 0, winDropped = 0, winPresented = 0, winLate = 0;
+    double winGpu = 0, winUpload = 0, winFlow = 0, winScale = 0, winPipe = 0;
+    uint64_t winGpuCount = 0, winPipeCount = 0;
+    uint64_t synthIndex = 0;
+    const double framePeriodMs = 1000.0 / static_cast<double>(refreshHz);
+
+    while (!g_stopRequested.load() && std::chrono::steady_clock::now() < deadline) {
+        if (!display.pumpMessages()) {
+            log::info("tv", "window closed");
+            break;
+        }
+
+        media::CaptureRead sample;
+        media::DecodedNv12Frame synthFrame;
+        const media::DecodedNv12Frame* frame = nullptr;
+        if (synth) {
+            nextSynthTick += synthPeriod;
+            std::this_thread::sleep_until(nextSynthTick);
+            synthFrame = synth->generateContainerFrame(synthIndex++);
+            frame = &synthFrame;
+        } else {
+            if (!capture.read(sample)) {
+                log::error("tv", "capture read failed");
+                break;
+            }
+            if (sample.audio && audio.active() && !sample.pcm.empty()) {
+                audio.pushStereo16(sample.pcm.data(), sample.pcm.size() / 2);
+            }
+            if (sample.video) frame = &sample.frame;
+        }
+        if (!frame) continue;
+
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - origin).count();
+        ++winRead;
+        ++totalRead;
+
+        if (frame->width != pcfg.inputWidth || frame->height != pcfg.inputHeight) {
+            log::info("tv", std::format("capture format changed to {}x{}; rebuilding the pipeline",
+                                        frame->width, frame->height));
+            auto next = pcfg;
+            next.inputWidth = frame->width;
+            next.inputHeight = frame->height;
+            if (!pipe.initialize(d3d, next)) {
+                log::error("tv", "pipeline rebuild failed");
+                break;
+            }
+            pcfg = next;
+            gate.reset();
+        }
+
+        const auto decision = gate.observe(frame->yPlane.data(), frame->width, frame->height,
+                                           frame->stride, nowMs);
+        if (!decision.keep) {
+            ++winDropped;
+            ++totalDropped;
+            continue;
+        }
+        ++winKept;
+
+        // Frame generation needs vblank pacing: two presents back to back without a wait would show
+        // only the second one. Everything else may present immediately when the user asked for it.
+        const bool vsync = !opts.tvTearing || decision.fgActive;
+        if (opts.tvTearing && decision.fgActive && !tearingNoticeLogged) {
+            tearingNoticeLogged = true;
+            log::info("tv", "frame generation is active: presenting with vsync so both frames land");
+        }
+        if (!opts.tvTearing) tearingNoticeLogged = false;
+
+        pipeline::ProcessedFrameBatch batch;
+        if (!pipe.processUniqueFrame(*frame, batch, decision.multiplier, true)) {
+            log::warn("tv", "pipeline rejected a frame");
+            continue;
+        }
+        winGpu += batch.timings.totalGpuMs;
+        winUpload += batch.timings.nv12UploadAndConvertMs;
+        winFlow += batch.timings.opticalFlowMs + batch.timings.flowRefineAndFillMs;
+        winScale += batch.timings.frameGenAndUpscaleMs;
+        ++winGpuCount;
+
+        bool closed = false;
+        for (size_t k = 0; k < batch.frames.size(); ++k) {
+            const auto before = std::chrono::steady_clock::now();
+            if (!display.present(d3d, batch.frames[k], vsync)) {
+                closed = true;
+                break;
+            }
+            const double presentMs = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - before).count();
+            if (presentMs > framePeriodMs * 1.5) ++winLate;
+            ++winPresented;
+            ++totalPresented;
+            if (!display.pumpMessages()) {
+                closed = true;
+                break;
+            }
+        }
+        winPipe += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
+        ++winPipeCount;
+
+        // A frame that could not be presented is a lost refresh; nothing can be done about it now,
+        // but the count is what tells an operator the GPU is over budget.
+        if (closed) {
+            log::info("tv", "display closed");
+            break;
+        }
+
+        if (now - lastLog >= std::chrono::seconds(2)) {
+            const double secs = std::chrono::duration<double>(now - lastLog).count();
+            const auto dstats = display.consumeStats();
+            const auto astats = audio.consumeStats();
+            const double dupPct = (winKept + winDropped) > 0
+                                      ? 100.0 * double(winDropped) / double(winKept + winDropped)
+                                      : 0.0;
+            log::info("tv", std::format(
+                "in={:.1f} uniq={:.1f} dup={:.0f}% out={:.1f} fps fg={} gpu={:.2f}ms "
+                "(up {:.2f} flow {:.2f} scale {:.2f}) present={:.1f}/{:.1f}ms late={} pipe={:.1f}ms audioDrop={}",
+                double(winRead) / secs, double(winKept) / secs, dupPct, double(winPresented) / secs,
+                decision.fgActive ? std::format("{}x", decision.multiplier) : std::string("off"),
+                winGpuCount ? winGpu / double(winGpuCount) : 0.0,
+                winGpuCount ? winUpload / double(winGpuCount) : 0.0,
+                winGpuCount ? winFlow / double(winGpuCount) : 0.0,
+                winGpuCount ? winScale / double(winGpuCount) : 0.0,
+                dstats.presented ? dstats.presentMsSum / double(dstats.presented) : 0.0,
+                dstats.presentMsMax, winLate,
+                winPipeCount ? winPipe / double(winPipeCount) : 0.0,
+                astats.framesDropped));
+            lastLog = now;
+            winRead = winKept = winDropped = winPresented = winLate = 0;
+            winGpu = winUpload = winFlow = winScale = winPipe = 0.0;
+            winGpuCount = winPipeCount = 0;
+        }
+    }
+
+    log::info("tv", std::format("TV mode stopped: {} frames read, {} presented, {} duplicate skips",
+                                totalRead, totalPresented, totalDropped));
+    audio.stop();
+    pipe.shutdown();
+    display.shutdown();
+    d3d.shutdown();
+    capture.close();
     return 0;
 }
 
@@ -1971,6 +2493,15 @@ int main(int argc, char** argv) {
             break;
         case CliOptions::Mode::Capture:
             rc = runCapture(opts);
+            break;
+        case CliOptions::Mode::Tv:
+            rc = runTvMode(opts);
+            break;
+        case CliOptions::Mode::TvBench:
+            rc = runTvBench(opts);
+            break;
+        case CliOptions::Mode::TvList:
+            rc = runTvList(opts);
             break;
         case CliOptions::Mode::Help:
             printUsage();

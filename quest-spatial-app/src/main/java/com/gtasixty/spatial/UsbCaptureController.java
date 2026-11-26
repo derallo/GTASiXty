@@ -140,6 +140,16 @@ final class UsbCaptureController {
         if (gl != null) gl.setLookMode(look);
     }
 
+    void setTaaEnabled(boolean enabled) {
+        CaptureGlRenderer gl = captureGl;
+        if (gl != null) gl.setTaaEnabled(enabled);
+    }
+
+    void setComputeFlowEnabled(boolean enabled) {
+        CaptureGlRenderer gl = captureGl;
+        if (gl != null) gl.setComputeFlowEnabled(enabled);
+    }
+
     void start(Surface outputSurface, int enhanceMode, int lookMode) {
         if (outputSurface == null || !outputSurface.isValid()) {
             deliverError("Cannot start USB capture: display surface unavailable.");
@@ -339,6 +349,7 @@ final class UsbCaptureController {
             int maxPayload = neg[1];
 
             CaptureGlRenderer gl = new CaptureGlRenderer(
+                    context,
                     outputSurface,
                     mode.width,
                     mode.height,

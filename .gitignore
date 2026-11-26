@@ -1,10 +1,14 @@
 # Build output
 build/
+# Native OpenXR hand tracker (rebuilt by scripts/build-hand-tracker.ps1 from
+# quest-spatial-app/src/main/cpp/hand_tracker_jni.cpp + the vendored Khronos headers)
+quest-spatial-app/src/main/jniLibs/
 out/
 cmake-build-*/
 .gradle/
 .kotlin/
 local.properties
+tools/
 
 # Downloaded / built third-party dependencies (restored by scripts/build.ps1)
 third_party/mbedtls-3.6.2/
@@ -19,6 +23,7 @@ third_party/build-mbedtls.cmd
 # Local logs and captures (may contain private screen content, LAN addressing, MACs)
 *.log
 *.csv
+*.mkv
 *.png
 *.jpg
 *.jpeg
@@ -41,3 +46,7 @@ tokens.bin
 *.suo
 Thumbs.db
 Desktop.ini
+
+# Python bytecode from the asset/preview generators
+__pycache__/
+*.pyc

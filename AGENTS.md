@@ -1,5 +1,10 @@
 # GTA60Frames / GTASiXty — Project Knowledge for Antigravity
 
+## Contributor & Agent Rule — Merge Into This Project
+**IMPORTANT:** If you (or another developer / AI agent) are adding features, fixing bugs, building new VR environments, tuning shaders/upscaling, or extending Quest/Linux/Windows support, **please work in and merge directly into this project (`GTASiXty`) instead of creating another separate project or standalone app.**
+- Keep everything unified inside this repository (`quest-spatial-app/` for the single `com.gtasixty.spatial` Quest 3 APK, `linux-capture/` for the Linux VA-API capture server, `src/` & `include/` for the Windows streamer).
+- See also [agents/README.md](agents/README.md) for quick contributor/agent merge guidelines.
+
 ## Overview
 Streams Xbox gameplay to Meta Quest 3 at up to 1440p60/120fps over LAN using the custom **GT60** protocol:
 - **TCP 7660**: 16-byte little-endian `Gt60Header` (`magic = 0x30365447` `"GT60"`) carrying `VideoConfig` (`0x01`), `VideoAccessUnit` (`0x02`; `flags`: `0x01=IDR`, `0x02=Generated`, `0x04=Duplicate` [experimental]), `AudioPcm` (`0x03`, 48 kHz stereo S16LE), and client backchannel (`0x81` IDR, `0x82` Gamepad, `0x83` Config, `0x84` Rendered echo).

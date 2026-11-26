@@ -130,7 +130,7 @@ final class NetworkDiagnosticsHelper {
         final ScrollView sv = new ScrollView(activity);
         final TextView tv = new TextView(activity);
         tv.setText("Running network & device diagnostics...\n\n"
-                + "Scanning Wi-Fi, LAN (UDP 7661), host TCP 7660, USB-C capture cards, and Xbox Direct status.");
+                + "Scanning Wi-Fi, LAN (UDP 7661), host TCP 7660, USB-C capture cards, and XRemote status.");
         tv.setTextColor(Color.WHITE);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         tv.setTypeface(Typeface.MONOSPACE);
@@ -246,13 +246,13 @@ final class NetworkDiagnosticsHelper {
             inspectUsbCaptureDevices(activity, report);
 
             // 6. Xbox Direct mode status
-            report.append("\n=== 6. XBOX DIRECT MODE ===\n");
+            report.append("\n=== 6. XREMOTE MODE ===\n");
             if (xboxSignedIn) {
                 report.append("[OK] Microsoft/Xbox account is signed in.\n");
             } else {
-                report.append("[INFO] Not signed in for Direct mode (switch to Mode: Direct -> Sign in).\n");
+                report.append("[INFO] Not signed in for XRemote mode (switch to Mode: XRemote -> Sign in).\n");
             }
-            report.append("       Direct mode locates your Xbox via your account (no IP required).\n");
+            report.append("       XRemote mode locates your Xbox via your account (no IP required).\n");
 
             // 7. Actionable recommendations
             if (!tips.isEmpty()) {
@@ -408,8 +408,8 @@ final class NetworkDiagnosticsHelper {
                 + "   \u2022 Tap LAN to auto-discover your Windows PC (UDP 7661), or enter its IP (127.0.0.1 over ADB USB-C).\n"
                 + "   \u2022 Run GTA-Sixty.exe --agent (scripts\\install-autostart.ps1) so Quest can wake/start it on UDP 7662.\n"
                 + "   \u2022 If TCP 7660 times out, allow GTA-Sixty.exe through Windows Firewall.\n\n"
-                + "4. Direct Mode (Quest \u2194 Xbox, No PC)\n"
-                + "   \u2022 No IP address is needed. Sign in to your Microsoft account, pick your Xbox, and tap Start direct.\n"
+                + "4. XRemote Mode (Quest \u2194 Xbox, No PC)\n"
+                + "   \u2022 No IP address is needed. Sign in to your Microsoft account, pick your Xbox, and tap Start XRemote.\n"
                 + "   \u2022 Requires Remote features enabled on the Xbox and both devices on the same LAN.\n\n"
                 + "Window Handle Tip:\n"
                 + "   \u2022 Grab the white/cyan bar below the screen using either Trigger or Grip/Pinch to move it.\n"

@@ -16,12 +16,27 @@
          third-party apps whose background processes we clear before streaming. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
+    <!-- Quest 3 optical hand tracking: drives the GTA V hands + auto-spawning Xbox controller.
+         XR_EXT_hand_tracking also gives us all 26 joints/validity flags/radii via
+         src/main/cpp/hand_tracker_jni.cpp, which works even while Meta's translucent hand meshes are
+         hidden (avatarSystem.setShowHands(false)).
+
+         DO NOT add com.oculus.permission.BODY_TRACKING or oculus.software.body_tracking here.
+         Declaring body tracking is what Horizon OS keys off to put the app in *body* tracking mode,
+         and in that mode the runtime never delivers XR_EXT_hand_tracking joints (every
+         xrLocateHandJointsEXT call returns isActive=false with all-invalid joints, in every reference
+         space). Removing them is what makes hand tracking activate. -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+
     <uses-feature
         android:name="android.hardware.vr.headtracking"
         android:required="true"
         android:version="1" />
     <uses-feature
         android:name="com.oculus.feature.PASSTHROUGH"
+        android:required="false" />
+    <uses-feature
+        android:name="oculus.software.handtracking"
         android:required="false" />
     <uses-feature
         android:name="android.hardware.camera.external"
@@ -42,6 +57,14 @@
         <meta-data
             android:name="com.oculus.vr.focusaware"
             android:value="true" />
+        <!-- HIGH frequency = 60 Hz hand joint updates from the runtime (needed for 120 Hz hands
+             with no visible lag behind the real controller). -->
+        <meta-data
+            android:name="com.oculus.handtracking.frequency"
+            android:value="HIGH" />
+        <meta-data
+            android:name="com.oculus.handtracking.version"
+            android:value="V2.0" />
 
         <activity
             android:name=".SpatialMainActivity"
