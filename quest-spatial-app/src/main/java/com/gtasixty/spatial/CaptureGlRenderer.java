@@ -170,6 +170,7 @@ final class CaptureGlRenderer {
     // Qualcomm decoders hand us a surface taller than the stream, leaving a flat strip at the
     // top of the texture. Sample only the image region so the picture fills the panel.
     private static final float DECODER_IMAGE_V_SCALE = 0.9625f;
+    private volatile float decoderImageVScale = DECODER_IMAGE_V_SCALE;
 
     private int progYuy2Copy = 0;
     private int uYuy2Tex = -1;
@@ -452,6 +453,10 @@ final class CaptureGlRenderer {
 
     void setComputeFlowEnabled(boolean enabled) {
         this.computeFlowEnabled = enabled;
+    }
+
+    void setDecoderImageVScale(float vScale) {
+        this.decoderImageVScale = Math.max(0.5f, Math.min(1.0f, vScale));
     }
 
     void startRecording(String mp4Path, int durationSec) {
@@ -1024,7 +1029,7 @@ final class CaptureGlRenderer {
                 GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
                 GLES30.glUniform1i(uOesCopyTex, 0);
                 GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
-        GLES30.glUniform1f(uOesCopyVScale, DECODER_IMAGE_V_SCALE);
+                GLES30.glUniform1f(uOesCopyVScale, decoderImageVScale);
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
             }
             EGL14.eglSwapBuffers(eglDisplay, eglSurface);
@@ -1478,7 +1483,7 @@ final class CaptureGlRenderer {
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
         GLES30.glUniform1i(uOesCopyTex, 0);
         GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
-        GLES30.glUniform1f(uOesCopyVScale, DECODER_IMAGE_V_SCALE);
+        GLES30.glUniform1f(uOesCopyVScale, decoderImageVScale);
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
 
         tinyCurrBuf.clear();
@@ -1534,7 +1539,7 @@ final class CaptureGlRenderer {
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId);
         GLES30.glUniform1i(uOesCopyTex, 0);
         GLES30.glUniformMatrix4fv(uOesCopyStMatrix, 1, false, stMatrix, 0);
-        GLES30.glUniform1f(uOesCopyVScale, DECODER_IMAGE_V_SCALE);
+        GLES30.glUniform1f(uOesCopyVScale, decoderImageVScale);
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4);
     }
 

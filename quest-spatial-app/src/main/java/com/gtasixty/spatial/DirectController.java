@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.CombinedVibration;
@@ -27,10 +29,13 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import com.gtasixty.spatial.voice.JimmyVoiceModule;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -77,14 +82,32 @@ final class DirectController {
     private WebView webView;
     private LinearLayout bar;
     private TextView status;
+    private TextView hoverHintText;
+    private HoverHintHelper hoverHints;
+    private Button modeBtn;
+    private Button platformBtn;
     private Button signInBtn;
     private Button consoleBtn;
-    private Button startBtn;
-    private Button stopBtn;
+    private Button startStopBtn;
     private Button enhanceBtn;
     private Button lookBtn;
     private Button hzBtn;
     private Button padBtn;
+    private Button updateBtn;
+    private CheckBox autoHideCheck;
+    private boolean syncingAutoHideCheck = false;
+    private String availableUpdateVersion = "";
+    private final SpatialDisplayBridge.UiListener spatialUiListener = settings -> {
+        if (settings == null || autoHideCheck == null) return;
+        syncingAutoHideCheck = true;
+        try {
+            if (autoHideCheck.isChecked() != settings.autoHideMenuOnController) {
+                autoHideCheck.setChecked(settings.autoHideMenuOnController);
+            }
+        } finally {
+            syncingAutoHideCheck = false;
+        }
+    };
 
     private volatile boolean visible;
     private volatile boolean streaming;
@@ -153,7 +176,7 @@ final class DirectController {
         this.root = root;
         this.xbox = new XboxDirect(activity);
         this.prefs = activity.getSharedPreferences("gta60", Context.MODE_PRIVATE);
-        this.enhanceMode = Math.max(0, Math.min(ENHANCE_LABELS.length - 1, prefs.getInt("directEnhanceMode", 4)));
+        this.enhanceMode = CaptureProtocolHelper.normalizeDirectEnhanceMode(prefs.getInt("directEnhanceMode", 4));
         this.lookMode = Math.max(0, Math.min(LOOK_LABELS.length - 1, prefs.getInt("directLookMode", 0)));
         this.refreshHz = prefs.getInt("directRefreshHz", 120) == 90 ? 90 : 120;
         this.inputManager = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
@@ -171,14 +194,32 @@ final class DirectController {
         return visible;
     }
 
+    boolean isStreaming() {
+        return streaming;
+    }
+
     boolean isSignedIn() {
         return xbox.signedIn();
+    }
+
+    void hideHud() {
+        handler.removeCallbacks(autoHideHudTick);
+        if (bar != null) bar.setVisibility(View.GONE);
+    }
+
+    void setAvailableUpdateBadge(String versionName) {
+        availableUpdateVersion = versionName == null ? "" : versionName;
+        if (updateBtn != null && !availableUpdateVersion.isEmpty()) {
+            updateBtn.setText("Update (v" + availableUpdateVersion + ")");
+            updateBtn.setBackgroundColor(Color.parseColor("#D97706"));
+        }
     }
 
     void show() {
         if (visible) return;
         visible = true;
         stopped = false;
+        SpatialDisplayBridge.addUiListener(spatialUiListener);
         refreshLocalPad("show");
         webView.setVisibility(View.VISIBLE);
         bar.setVisibility(View.VISIBLE);
@@ -189,18 +230,61 @@ final class DirectController {
             webView.evaluateJavascript("GTA60Direct.setEnhance(" + enhanceMode + ");GTA60Direct.setLook(" + lookMode + ")", null);
         }
         updateButtons();
-        setStatus(xbox.signedIn()
-                ? "XRemote: ready \u2014 tap Console or Start XRemote (finds Xbox via account, no IP needed)"
-                : "XRemote: tap Sign in (finds your Xbox automatically \u2014 no IP needed)");
+        if (xbox.signedIn()) {
+            if (selected != null) {
+                setStatus("Xbox Wi-Fi: ready (" + selected.name + ") \u2014 tap Start to play");
+            } else {
+                setStatus("Xbox Wi-Fi: finding your Xbox on your account / local Wi-Fi...");
+                autoDiscoverConsole();
+            }
+        } else {
+            setStatus("Xbox Wi-Fi: tap Sign in to find your Xbox automatically (no IP needed)");
+        }
     }
 
     void hide() {
         if (!visible) return;
         visible = false;
+        SpatialDisplayBridge.removeUiListener(spatialUiListener);
         handler.removeCallbacks(autoHideHudTick);
         stop();
         if (webView != null) webView.setVisibility(View.GONE);
         if (bar != null) bar.setVisibility(View.GONE);
+    }
+
+    private void autoDiscoverConsole() {
+        if (!xbox.signedIn() || streaming || busy.get()) return;
+        io.execute(() -> {
+            try {
+                final List<XboxDirect.Console> consoles = xbox.consoles();
+                if (consoles.isEmpty()) {
+                    runOnUi(() -> {
+                        if (visible && !streaming) {
+                            setStatus("Xbox Wi-Fi: no console found yet \u2014 enable Remote features on Xbox, then tap Xbox");
+                        }
+                    });
+                    return;
+                }
+                XboxDirect.Console pick = consoles.get(0);
+                for (XboxDirect.Console c : consoles) {
+                    if ("On".equalsIgnoreCase(c.powerState)) {
+                        pick = c;
+                        break;
+                    }
+                }
+                final XboxDirect.Console chosen = pick;
+                runOnUi(() -> {
+                    if (!visible) return;
+                    if (selected == null) selected = chosen;
+                    updateButtons();
+                    if (!streaming) {
+                        setStatus("Xbox Wi-Fi: found " + selected.name + " \u2014 tap Start to play");
+                    }
+                });
+            } catch (Exception e) {
+                Log.d(TAG, "Auto console discovery skipped: " + e.getMessage());
+            }
+        });
     }
 
     void onActivityPause() {
@@ -223,6 +307,7 @@ final class DirectController {
     }
 
     void destroy() {
+        SpatialDisplayBridge.removeUiListener(spatialUiListener);
         handler.removeCallbacks(autoHideHudTick);
         visible = false;
         if (inputManager != null) {
@@ -254,9 +339,22 @@ final class DirectController {
     }
 
     void setEnhanceMode(int mode) {
-        enhanceMode = Math.max(0, Math.min(ENHANCE_LABELS.length - 1, mode));
+        enhanceMode = CaptureProtocolHelper.normalizeDirectEnhanceMode(mode);
         prefs.edit().putInt("directEnhanceMode", enhanceMode).apply();
-        if (enhanceBtn != null) enhanceBtn.setText(ENHANCE_LABELS[enhanceMode]);
+        if (enhanceBtn != null) {
+            enhanceBtn.setText("Enhance: " + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode));
+        }
+        if (CaptureCadenceController.isFg90(enhanceMode) && refreshHz != 90) {
+            refreshHz = 90;
+            prefs.edit().putInt("directRefreshHz", 90).apply();
+            if (hzBtn != null) hzBtn.setText("90 Hz");
+            applyRefreshRate();
+        } else if (!CaptureCadenceController.isFg90(enhanceMode) && refreshHz != 120) {
+            refreshHz = 120;
+            prefs.edit().putInt("directRefreshHz", 120).apply();
+            if (hzBtn != null) hzBtn.setText("120 Hz");
+            applyRefreshRate();
+        }
         if (webView != null && pageLoaded) {
             webView.evaluateJavascript("GTA60Direct.setEnhance(" + enhanceMode + ")", null);
         }
@@ -277,8 +375,13 @@ final class DirectController {
         if (!visible || bar == null) return;
         final boolean show = bar.getVisibility() != View.VISIBLE;
         bar.setVisibility(show ? View.VISIBLE : View.GONE);
-        if (show && streaming) {
-            scheduleAutoHideHud(8000);
+        if (show) {
+            if (activity instanceof MainActivity) {
+                ((MainActivity) activity).notifyMenuOpenedOrInteracted();
+            }
+            if (streaming) {
+                scheduleAutoHideHud(8000);
+            }
         } else {
             handler.removeCallbacks(autoHideHudTick);
         }
@@ -658,42 +761,149 @@ final class DirectController {
         bar = new LinearLayout(activity);
         bar.setOrientation(LinearLayout.VERTICAL);
         bar.setBackgroundColor(Color.parseColor("#E6111622"));
-        final int pad = dp(6);
+        final int pad = dp(8);
         bar.setPadding(pad, pad, pad, pad);
 
-        final LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
+        hoverHintText = new TextView(activity);
+        hoverHintText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hoverHints = new HoverHintHelper(hoverHintText,
+                "Point at any option to see what it does \u2022 Tap video anytime to show/hide menu");
+
+        // Row 1: Connect, Play & View
+        final LinearLayout row1 = new LinearLayout(activity);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setGravity(Gravity.CENTER_VERTICAL);
 
         final TextView title = new TextView(activity);
-        title.setText("XRemote");
-        title.setTextColor(Color.parseColor("#F97316"));
+        title.setText("GTA-Sixty");
+        title.setTextColor(Color.parseColor("#22C55E"));
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         title.setPadding(0, 0, dp(10), 0);
-        row.addView(title);
+        row1.addView(title);
+
+        platformBtn = button(ConsolePlatform.toggleButtonLabel(ConsolePlatform.XBOX),
+                ConsolePlatform.accentHex(ConsolePlatform.XBOX), v -> {
+                    if (activity instanceof MainActivity) ((MainActivity) activity).toggleConsolePlatform();
+                });
+        hoverHints.attach(platformBtn,
+                "Console: Switch between Xbox (Wi-Fi / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
+        row1.addView(platformBtn);
+
+        modeBtn = button("Mode: Xbox Wi-Fi \u25BE", "#0F766E", v -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).showModePicker();
+        });
+        hoverHints.attach(modeBtn,
+                "Mode: Switch between Xbox Wi-Fi (Direct, recommended), Capture Card (LAN/USB-C), or PC Relay.");
+        row1.addView(modeBtn);
 
         signInBtn = button("Sign in", "#7C3AED", v -> signIn());
-        row.addView(signInBtn);
-        consoleBtn = button("Console", "#334155", v -> chooseConsole());
-        row.addView(consoleBtn);
-        startBtn = button("Start XRemote", "#16A34A", v -> start());
-        row.addView(startBtn);
-        stopBtn = button("Stop", "#475569", v -> stop());
-        row.addView(stopBtn);
+        hoverHints.attach(signInBtn,
+                "Sign in: Link your Microsoft/Xbox account once so Quest finds your Xbox automatically over Wi-Fi.");
+        row1.addView(signInBtn);
 
-        padBtn = button("Fix pad", "#B45309", v -> fixPad());
-        row.addView(padBtn);
+        consoleBtn = button("Xbox", "#334155", v -> chooseConsole());
+        hoverHints.attach(consoleBtn,
+                "Xbox: Pick which Xbox console on your account to stream from (auto-selected when found).");
+        row1.addView(consoleBtn);
 
-        enhanceBtn = button(ENHANCE_LABELS[enhanceMode], "#0284C7", v -> {
-            setEnhanceMode((enhanceMode + 1) % ENHANCE_LABELS.length);
+        startStopBtn = button("Start", "#16A34A", v -> {
+            if (streaming || busy.get()) stop();
+            else start();
         });
-        row.addView(enhanceBtn);
+        hoverHints.attach(startStopBtn,
+                "Start / Stop: Connect directly to your Xbox over Wi-Fi, or cleanly end the stream.");
+        row1.addView(startStopBtn);
+
+        padBtn = button("Fix Pad", "#B45309", v -> fixPad());
+        hoverHints.attach(padBtn,
+                "Fix Pad: If your controller stops responding in-game, re-sync or release the Quest virtual pad.");
+        row1.addView(padBtn);
+
+        final View row1Spacer = new View(activity);
+        row1.addView(row1Spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
+
+        final Button jimmyBtn = JimmyVoiceModule.createTopBarButton(activity, () -> {
+            if (streaming) scheduleAutoHideHud(8000);
+        });
+        hoverHints.attach(jimmyBtn, JimmyVoiceModule.TOP_BAR_HINT);
+        row1.addView(jimmyBtn);
+
+        final Button displayBtn = button("Display", "#0284C7", v -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).toggleDisplayControls();
+            if (streaming) scheduleAutoHideHud(8000);
+        });
+        hoverHints.attach(displayBtn,
+                "Display: Adjust Screen Size, Depth, Height, Tilt, Curve, Backdrop (Jimmy's Room), and GTA Hands.");
+        row1.addView(displayBtn);
+
+        final Button recenterBtn = button("Recenter", "#2563EB", v -> {
+            setStatus("Look where you want the screen \u2014 recentering in 1.5s...");
+            SpatialDisplayBridge.requestRecenter();
+            if (streaming) scheduleAutoHideHud(8000);
+        });
+        hoverHints.attach(recenterBtn,
+                "Recenter: Snap the screen directly in front of where you are looking (1.5s delay so you can look forward).");
+        row1.addView(recenterBtn);
+
+        final Button netCheckBtn = button("Net Check", "#0369A1", v -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).openNetworkDiagnostics();
+        });
+        hoverHints.attach(netCheckBtn,
+                "Net Check: Test Quest Wi-Fi, Xbox Live reachability, LAN servers, and USB capture card status.");
+        row1.addView(netCheckBtn);
+
+        final Button adbBtn = button("Wi-Fi ADB", "#2563EB", v -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).openWirelessAdbHelper();
+        });
+        hoverHints.attach(adbBtn,
+                "Wi-Fi ADB: View Quest Wi-Fi IP and open Android Developer Options for wireless debugging.");
+        row1.addView(adbBtn);
+
+        updateBtn = button("Update", "#1E293B", v -> {
+            if (activity instanceof MainActivity) ((MainActivity) activity).checkForUpdates();
+        });
+        if (!availableUpdateVersion.isEmpty()) {
+            setAvailableUpdateBadge(availableUpdateVersion);
+        }
+        hoverHints.attach(updateBtn,
+                "Update: Check GitHub for newer GTA-Sixty versions and recent enhancements.");
+        row1.addView(updateBtn);
+
+        final Button hideBtn = button("Hide Menu", "#475569", v -> toggleHud());
+        hoverHints.attach(hideBtn,
+                "Hide Menu: Hide this top menu bar (tap anywhere on the video to bring it back).");
+        row1.addView(hideBtn);
+
+        final Button helpBtn = button("?", "#334155", v -> showHelp());
+        hoverHints.attach(helpBtn,
+                "Help: View full setup tips for Xbox Wi-Fi, controllers, and display controls.");
+        row1.addView(helpBtn);
+
+        bar.addView(row1);
+
+        // Row 2: Picture, Auto-hide & Tools
+        final LinearLayout row2 = new LinearLayout(activity);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER_VERTICAL);
+        final LinearLayout.LayoutParams r2Lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        r2Lp.topMargin = dp(6);
+        row2.setLayoutParams(r2Lp);
+
+        enhanceBtn = button("Enhance: " + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode), "#0284C7", v -> {
+            setEnhanceMode(CaptureProtocolHelper.nextDirectEnhanceMode(enhanceMode));
+        });
+        hoverHints.attach(enhanceBtn,
+                "Enhance: Cycle Off (raw video), 60+ (60 fps frame gen + SuperRes), or 90+ (90 fps frame gen + SuperRes).");
+        row2.addView(enhanceBtn);
 
         lookBtn = button(LOOK_LABELS[lookMode], "#0F766E", v -> {
             setLookMode((lookMode + 1) % LOOK_LABELS.length);
         });
-        row.addView(lookBtn);
+        hoverHints.attach(lookBtn,
+                "Look: Cycle color presets \u2014 Normal, Vivid (punchy contrast), or Night (brighter dark areas).");
+        row2.addView(lookBtn);
 
         hzBtn = button(refreshHz + " Hz", "#1E293B", v -> {
             refreshHz = (refreshHz == 120) ? 90 : 120;
@@ -702,40 +912,50 @@ final class DirectController {
             applyRefreshRate();
             if (streaming) scheduleAutoHideHud(8000);
         });
-        row.addView(hzBtn);
+        hoverHints.attach(hzBtn,
+                "Refresh Rate: Switch headset refresh between 120 Hz (best for 60+/30 fps) and 90 Hz.");
+        row2.addView(hzBtn);
 
-        row.addView(button("Display", "#0284C7", v -> {
-            if (activity instanceof MainActivity) ((MainActivity) activity).toggleDisplayControls();
+        autoHideCheck = new CheckBox(activity);
+        autoHideCheck.setText("Auto-hide menu");
+        autoHideCheck.setTextColor(Color.parseColor("#E2E8F0"));
+        autoHideCheck.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        autoHideCheck.setButtonTintList(ColorStateList.valueOf(Color.parseColor("#22D3EE")));
+        autoHideCheck.setChecked(SpatialDisplayBridge.getSettings().autoHideMenuOnController);
+        final LinearLayout.LayoutParams chkLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chkLp.leftMargin = dp(6);
+        chkLp.rightMargin = dp(6);
+        autoHideCheck.setLayoutParams(chkLp);
+        autoHideCheck.setOnCheckedChangeListener((btn, isChecked) -> {
+            if (syncingAutoHideCheck) return;
+            final SpatialDisplayBridge.DisplaySettings s = SpatialDisplayBridge.getSettings();
+            s.autoHideMenuOnController = isChecked;
+            SpatialDisplayBridge.applyFromUi(activity, s);
             if (streaming) scheduleAutoHideHud(8000);
-        }));
+        });
+        hoverHints.attach(autoHideCheck,
+                "Auto-hide menu: Automatically hide menus 6 seconds after your virtual Xbox controller appears.");
+        row2.addView(autoHideCheck);
 
-        row.addView(button("Recenter", "#2563EB", v -> {
-            SpatialDisplayBridge.requestRecenter();
-            if (streaming) scheduleAutoHideHud(8000);
-        }));
+        bar.addView(row2);
 
-        row.addView(button("Wi-Fi ADB", "#2563EB", v -> {
-            if (activity instanceof MainActivity) ((MainActivity) activity).openWirelessAdbHelper();
-        }));
+        // Row 3: Hover description strip
+        final LinearLayout hintBox = new LinearLayout(activity);
+        hintBox.setOrientation(LinearLayout.HORIZONTAL);
+        final GradientDrawable hintBg = new GradientDrawable();
+        hintBg.setColor(Color.parseColor("#B30B1324"));
+        hintBg.setCornerRadius(dp(6));
+        hintBox.setBackground(hintBg);
+        hintBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        final LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintLp.topMargin = dp(6);
+        hintBox.setLayoutParams(hintLp);
+        hintBox.addView(hoverHintText);
+        bar.addView(hintBox);
 
-        row.addView(button("Hide HUD", "#475569", v -> toggleHud()));
-
-        row.addView(button("Capture", "#0F766E", v -> activity.runOnUiThread(() -> {
-            if (activity instanceof MainActivity) ((MainActivity) activity).enterCaptureMode();
-        })));
-
-        row.addView(button("PC mode", "#334155", v -> activity.runOnUiThread(() -> {
-            if (activity instanceof MainActivity) ((MainActivity) activity).exitDirectMode();
-        })));
-
-        row.addView(button("Update", "#1E293B", v -> {
-            if (activity instanceof MainActivity) ((MainActivity) activity).checkForUpdates();
-        }));
-
-        row.addView(button("?", "#334155", v -> showHelp()));
-
-        bar.addView(row);
-
+        // Row 4: Status / Telemetry
         status = new TextView(activity);
         status.setTextColor(Color.WHITE);
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
@@ -751,25 +971,18 @@ final class DirectController {
 
     private void showHelp() {
         final String msg =
-                "XRemote mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC needed).\n\n"
-                + "\u2022 Finding your Xbox (No IP needed): XRemote mode discovers your console automatically through your Microsoft account \u2014 you do NOT enter an IP address. (Only PC and Capture LAN modes use an IP.)\n\n"
-                + "\u2022 Sign in: Signs into your Microsoft/Xbox account using a device code.\n\n"
-                + "\u2022 Console: Lists consoles on your account and lets you pick which Xbox to stream from.\n\n"
-                + "\u2022 Start XRemote / Stop: Starts or cleanly stops the XRemote WebRTC stream and releases the console session.\n\n"
-                + "\u2022 Fix pad: If your controller is paired to the Xbox and stops working in-game, this releases the Quest's virtual pad so your Xbox controller keeps Player 1. If your controller is paired to the Quest, it re-announces the pad to wake up a resumed game.\n\n"
-                + "\u2022 Enhance (Adreno 740 GPU):\n"
+                "Xbox Wi-Fi mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC or IP needed).\n\n"
+                + "\u2022 Auto Console Discovery: Sign in once with your Microsoft/Xbox account and GTA-Sixty finds your Xbox automatically.\n\n"
+                + "\u2022 Start / Stop: Starts or cleanly ends your Xbox Wi-Fi stream and releases the console session.\n\n"
+                + "\u2022 Fix Pad: If your controller stops responding in-game, releases or re-syncs the Quest virtual pad so Player 1 works.\n\n"
+                + "\u2022 Enhance (Quest GPU):\n"
                 + "  - Off: Raw decoded video.\n"
-                + "  - RCAS: AMD FidelityFX Contrast-Adaptive Sharpening.\n"
-                + "  - SuperRes: Edge-Adaptive Spatial Upscaling (2560x1440) + RCAS.\n"
-                + "  - FG 60: 30\u219260 fps optical-flow frame generation (auto-bypasses on native 60 fps games) + RCAS.\n"
-                + "  - FG60+SR: Frame generation + SuperRes + RCAS.\n\n"
-                + "\u2022 Look: Color grading preset (Normal, Vivid, or Night for dark scenes).\n\n"
-                + "\u2022 Window Handle & Display: Grab the bottom handle bar with Trigger or Grip/Pinch to move the screen (push thumbstick up/down while holding Trigger to adjust depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Backdrop.\n\n"
-                + "\u2022 120 Hz / 90 Hz: Display refresh rate. 120 Hz divides both 60 fps (2:2) and 30 fps (4:4) evenly with zero judder.\n\n"
-                + "\u2022 Wi-Fi ADB: Opens Developer Options to check wireless debugging.\n\n"
-                + "\u2022 Hide HUD: Hides this menu bar. Tap anywhere on the video to bring it back.\n\n"
-                + "\u2022 Capture / PC mode: Switch to HDMI capture (LAN or USB-C) or PC relay.\n\n"
-                + "\u2022 Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK and launches the installer (also checks automatically every 3 hours).";
+                + "  - 60+: 60 fps optical-flow frame generation + SuperRes sharpening.\n\n"
+                + "\u2022 Look & Hz: Choose Normal/Vivid/Night color looks and 120 Hz or 90 Hz refresh.\n\n"
+                + "\u2022 Auto-hide menu: Automatically hides the settings menu 3 seconds after the 3D Xbox controller appears.\n\n"
+                + "\u2022 Display & Handle: Grab the bottom handle bar to move the screen (thumbstick adjusts depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Jimmy's Room.\n\n"
+                + "\u2022 Mode: Switch anytime to Capture Card (HDMI via LAN or USB-C) or PC Relay.\n\n"
+                + "\u2022 Updates: Checks GitHub automatically every time you open GTA-Sixty and shows what's new.";
 
         final android.widget.ScrollView sv = new android.widget.ScrollView(activity);
         final TextView tv = new TextView(activity);
@@ -781,7 +994,7 @@ final class DirectController {
         sv.addView(tv);
 
         new AlertDialog.Builder(activity)
-                .setTitle("XRemote Mode Help")
+                .setTitle("Xbox Wi-Fi Mode Help")
                 .setView(sv)
                 .setNeutralButton("Run Network Check", (d, w) -> {
                     if (activity instanceof MainActivity) {
@@ -879,7 +1092,8 @@ final class DirectController {
                             dialog.dismiss();
                             signingIn = false;
                             updateButtons();
-                            setStatus("Signed in" + (xbox.accountHint().isEmpty() ? "" : " (" + xbox.accountHint() + ")"));
+                            setStatus("Signed in" + (xbox.accountHint().isEmpty() ? "" : " (" + xbox.accountHint() + ")") + " \u2014 finding your Xbox...");
+                            autoDiscoverConsole();
                         });
                         return;
                     }
@@ -910,14 +1124,28 @@ final class DirectController {
         final boolean signedIn = xbox.signedIn();
         signInBtn.setText(signedIn ? "Signed in" : "Sign in");
         signInBtn.setEnabled(!signedIn && !signingIn);
-        consoleBtn.setText(selected == null ? "Console" : "Console: " + selected.name);
+        consoleBtn.setText(selected == null ? "Xbox" : "Xbox: " + selected.name);
         consoleBtn.setEnabled(signedIn && !streaming);
-        startBtn.setEnabled(signedIn && !streaming && !busy.get());
-        stopBtn.setEnabled(streaming || busy.get());
+        if (startStopBtn != null) {
+            final boolean active = streaming || busy.get();
+            startStopBtn.setText(active ? "Stop" : "Start");
+            startStopBtn.setBackgroundColor(Color.parseColor(active ? "#DC2626" : "#16A34A"));
+            startStopBtn.setEnabled(active || signedIn);
+        }
         if (padBtn != null) padBtn.setEnabled(streaming);
-        if (enhanceBtn != null) enhanceBtn.setText(ENHANCE_LABELS[enhanceMode]);
+        if (enhanceBtn != null) {
+            enhanceBtn.setText("Enhance: " + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode));
+        }
         if (lookBtn != null) lookBtn.setText(LOOK_LABELS[lookMode]);
         if (hzBtn != null) hzBtn.setText(refreshHz + " Hz");
+        if (autoHideCheck != null && !syncingAutoHideCheck) {
+            syncingAutoHideCheck = true;
+            try {
+                autoHideCheck.setChecked(SpatialDisplayBridge.getSettings().autoHideMenuOnController);
+            } finally {
+                syncingAutoHideCheck = false;
+            }
+        }
     }
 
     private void setStatus(String text) {
@@ -1040,7 +1268,7 @@ final class DirectController {
                 handler.removeCallbacks(startWatchdog);
                 runOnUi(() -> {
                     updateButtons();
-                    setStatus("XRemote: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("Xbox Wi-Fi: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     handler.removeCallbacks(keepaliveTick);
                     handler.postDelayed(keepaliveTick, 30000);
                     scheduleAutoHideHud(5000);
@@ -1100,7 +1328,7 @@ final class DirectController {
                 }
             } else if ("streaming".equals(state)) {
                 runOnUi(() -> {
-                    setStatus("XRemote: streaming (" + ENHANCE_LABELS[enhanceMode] + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("Xbox Wi-Fi: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     updateButtons();
                     scheduleAutoHideHud(5000);
                 });

@@ -28,7 +28,9 @@
   var MODE_SUPERRES = 2;
   var MODE_FG60 = 3;
   var MODE_FG60_SR = 4;
-  var MODE_NAMES = ['OFF', 'RCAS', 'SUPERRES', 'FG60', 'FG60+SR'];
+  var MODE_FG90 = 5;
+  var MODE_FG90_SR = 6;
+  var MODE_NAMES = ['OFF', 'RCAS', 'SUPERRES', 'FG60', 'FG60+SR', 'FG90', 'FG90+SR'];
 
   // Color look presets:
   //   0 = Normal (unmodified color)
@@ -782,6 +784,7 @@
     + 'uniform sampler2D uPrevTex;\n'
     + 'uniform sampler2D uCurrTex;\n'
     + 'uniform sampler2D uFlowTex;\n'
+    + 'uniform float uAlpha;\n'
     + 'out vec4 fragColor;\n'
     + 'const float MAX_UV = 0.08;\n'
     + 'vec2 decodeFlow(vec2 raw) {\n'
@@ -808,12 +811,12 @@
     + '    fragColor = vec4(c1, 1.0);\n'
     + '    return;\n'
     + '  }\n'
-    + '  vec2 p0 = clamp(vUv + 0.5 * v, vec2(0.001), vec2(0.999));\n'
-    + '  vec2 p1 = clamp(vUv - 0.5 * v, vec2(0.001), vec2(0.999));\n'
+    + '  vec2 p0 = clamp(vUv + uAlpha * v, vec2(0.001), vec2(0.999));\n'
+    + '  vec2 p1 = clamp(vUv - (1.0 - uAlpha) * v, vec2(0.001), vec2(0.999));\n'
     + '  vec3 w0 = texture(uPrevTex, p0).rgb;\n'
     + '  vec3 w1 = texture(uCurrTex, p1).rgb;\n'
     + '  float em = dot(abs(w0 - w1), vec3(0.333333));\n'
-    + '  vec3 warpedMid = mix(w0, w1, 0.5);\n'
+    + '  vec3 warpedMid = mix(w0, w1, uAlpha);\n'
     + '  float fit = smoothstep(0.09, 0.012, em) * smoothstep(0.0, 0.022, es - em);\n'
     + '  float w = clamp(f.a * fit, 0.0, 1.0);\n'
     + '  fragColor = vec4(mix(c1, warpedMid, w), 1.0);\n'
@@ -1016,6 +1019,7 @@
         progWarp.uPrevTex = gl.getUniformLocation(progWarp.prog, 'uPrevTex');
         progWarp.uCurrTex = gl.getUniformLocation(progWarp.prog, 'uCurrTex');
         progWarp.uFlowTex = gl.getUniformLocation(progWarp.prog, 'uFlowTex');
+      progWarp.uAlpha = gl.getUniformLocation(progWarp.prog, 'uAlpha');
 
         progRcas = { prog: linkProgram(VERT_CANVAS, FRAG_RCAS) };
         progRcas.uInputTex = gl.getUniformLocation(progRcas.prog, 'uInputTex');
@@ -1123,7 +1127,7 @@
   }
 
   function superResWanted() {
-    return enhanceMode === MODE_SUPERRES || enhanceMode === MODE_FG60_SR;
+    return enhanceMode === MODE_SUPERRES || enhanceMode === MODE_FG60_SR || enhanceMode === MODE_FG90_SR;
   }
 
   // 1440p already fills the panel 1:1. Inventing a 3200x1800 image from a ~22 Mbps source
@@ -1166,16 +1170,48 @@
     }
   }
 
+  function renderWarpToCanvas(alpha, flowTex) {
+    if (!gl || !glW || !glH) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboMid);
+    gl.viewport(0, 0, glW, glH);
+    gl.useProgram(progWarp.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texRing[prevUniqueSlot]);
+    gl.uniform1i(progWarp.uPrevTex, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, texRing[currUniqueSlot]);
+    gl.uniform1i(progWarp.uCurrTex, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, flowTex);
+    gl.uniform1i(progWarp.uFlowTex, 2);
+    gl.uniform1f(progWarp.uAlpha, alpha);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    renderRcasToCanvas(texMid, true);
+  }
+
   // Hold the warp for two display vsyncs (16.7 ms at 120 Hz, 22.2 ms at 90 Hz), then show
-  // the real frame. requestAnimationFrame lands on a vsync; the timestamp keeps a 60 Hz
-  // WebView callback from stretching the hold to 33 ms.
-  function scheduleRealFrame() {
-    var holdMs = displayHz === 90 ? (2000 / 90) : (2000 / 120);
+  // the real frame. In FG90/FG90+SR mode, step through alpha=2/3 at 1 vsync (~11.1 ms) and
+  // then show the real frame at 2 vsyncs (~22.2 ms).
+  function scheduleRealFrame(isFg90) {
+    var stepMs = isFg90 ? (1000 / 90) : (displayHz === 90 ? (2000 / 90) : (2000 / 120));
     var startAt = nowMs();
+    var didSecondWarp = !isFg90;
     function presentNow() {
       realFrameRafId = 0;
       realFrameTimerId = 0;
       if (!pendingRealFrame || realFramePresented || !pc) return;
+      if (!didSecondWarp) {
+        didSecondWarp = true;
+        renderWarpToCanvas(0.6667, texFlowPrev);
+        startAt = nowMs();
+        if (typeof requestAnimationFrame === 'function') {
+          realFrameRafId = requestAnimationFrame(step);
+        } else {
+          realFrameTimerId = setTimeout(presentNow, stepMs);
+        }
+        return;
+      }
       pendingRealFrame = false;
       realFramePresented = true;
       renderRcasToCanvas(texRing[currUniqueSlot], false);
@@ -1183,7 +1219,7 @@
     function step() {
       realFrameRafId = 0;
       if (!pendingRealFrame || realFramePresented || !pc) return;
-      if (nowMs() - startAt < holdMs - 3) {
+      if (nowMs() - startAt < stepMs - 3) {
         realFrameRafId = requestAnimationFrame(step);
         return;
       }
@@ -1192,7 +1228,7 @@
     if (typeof requestAnimationFrame === 'function') {
       realFrameRafId = requestAnimationFrame(step);
     } else {
-      realFrameTimerId = setTimeout(presentNow, holdMs);
+      realFrameTimerId = setTimeout(presentNow, stepMs);
     }
   }
 
@@ -1399,7 +1435,8 @@
 
       var holdWarp = fgHoldWarps > 0;
       if (holdWarp) fgHoldWarps--;
-      var wantFlow = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR) && fgActiveGate && hasUniqueHistory >= 2 && !holdWarp;
+      var isFg90 = (enhanceMode === MODE_FG90 || enhanceMode === MODE_FG90_SR);
+      var wantFlow = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR || isFg90) && fgActiveGate && hasUniqueHistory >= 2 && !holdWarp;
       if (wantFlow) {
         // Pass 3a: Level-0 Coarse Optical Flow (80x45)
         gl.bindFramebuffer(gl.FRAMEBUFFER, fboFlowCoarse);
@@ -1443,23 +1480,8 @@
         gl.uniform1i(progFlowSmooth.uPrevFlowTex, 2);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-        // Pass 4a: Render smooth-weighted midpoint warp into fboMid (2560x1440)
-        gl.bindFramebuffer(gl.FRAMEBUFFER, fboMid);
-        gl.viewport(0, 0, glW, glH);
-        gl.useProgram(progWarp.prog);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, texRing[prevUniqueSlot]);
-        gl.uniform1i(progWarp.uPrevTex, 0);
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, texRing[currUniqueSlot]);
-        gl.uniform1i(progWarp.uCurrTex, 1);
-        gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, texFlowSmooth);
-        gl.uniform1i(progWarp.uFlowTex, 2);
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-        // Pass 4b: Run true 1-pixel AMD FidelityFX RCAS (+ optional SuperRes) on fboMid -> Canvas
-        renderRcasToCanvas(texMid, true);
+        // Pass 4a + 4b: Render smooth-weighted warp (0.5 for FG60, 1/3 then 2/3 for FG90) + RCAS
+        renderWarpToCanvas(isFg90 ? 0.3333 : 0.5, texFlowSmooth);
 
         var swapFlowTex = texFlowSmooth;
         var swapFlowFbo = fboFlowSmooth;
@@ -1469,7 +1491,7 @@
         fboFlowPrev = swapFlowFbo;
 
         pendingRealFrame = true;
-        scheduleRealFrame();
+        scheduleRealFrame(isFg90);
       } else {
         realFramePresented = true;
         renderRcasToCanvas(texRing[currUniqueSlot], false);
@@ -1828,7 +1850,7 @@
     localIp = (cfg && cfg.localIp) || '';
     localPadPresent = (cfg && cfg.padPresent === true);
     if (cfg && typeof cfg.enhance === 'number') {
-      enhanceMode = Math.max(0, Math.min(4, cfg.enhance | 0));
+      enhanceMode = Math.max(0, Math.min(6, cfg.enhance | 0));
     }
     if (cfg && typeof cfg.look === 'number') {
       lookMode = Math.max(0, Math.min(2, cfg.look | 0));
@@ -2034,7 +2056,7 @@
       var dupRatio = totalAnalyzed > 0 ? (statDupeFrames / totalAnalyzed) : 0;
       var pboActive = statPboReads > 0 ? 1 : 0;
 
-      var isFgMode = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR);
+      var isFgMode = (enhanceMode === MODE_FG60 || enhanceMode === MODE_FG60_SR || enhanceMode === MODE_FG90 || enhanceMode === MODE_FG90_SR);
       if (totalAnalyzed >= 15 && isFgMode) {
         if (dupRatio >= 0.20 && uniqFps <= 46.5) fgActiveGate = true;
         else if (dupRatio < 0.10 && uniqFps >= 50.0) fgActiveGate = false;
@@ -2096,7 +2118,7 @@
   }
 
   function setEnhance(mode) {
-    enhanceMode = Math.max(0, Math.min(4, mode | 0));
+    enhanceMode = Math.max(0, Math.min(6, mode | 0));
     cancelPendingRealFrame();
     hasUniqueHistory = 0;
     consecDupes = 0;

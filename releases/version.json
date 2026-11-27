@@ -2,5 +2,22 @@
   "versionCode": 6,
   "versionName": "2.1",
   "apkUrl": "https://github.com/derallo/GTASiXty/releases/download/v2.1/GTA-Sixty-Quest3.apk",
-  "notes": "GTA-Sixty v2.1: Spatial MR app (com.gtasixty.spatial) with Jimmy's Room 3D VR environment, 3-phase Adreno 740 upscaling (SGSR1 12-tap + RCAS + SGSR2-lite temporal accumulation) & optical-flow frame generation (FG60/FG90/FG120), direct USB-C UVC capture, bottom window drag handle, and built-in Net Check diagnostics."
+  "notes": "GTA-Sixty v2.1: Spatial MR app (com.gtasixty.spatial) with Jimmy's Room 3D VR environment, 3-phase Adreno 740 upscaling (SGSR1 12-tap + RCAS + SGSR2-lite temporal accumulation) & optical-flow frame generation (FG60/FG90/FG120), direct USB-C UVC capture, bottom window drag handle, and built-in Net Check diagnostics.",
+  "history": [
+    {
+      "versionCode": 6,
+      "versionName": "2.1",
+      "notes": "• Jimmy's Room 3D VR environment (Backdrop → Jimmy's Room)\n• Direct USB-C HDMI capture card support on Quest 3\n• 3-phase Adreno 740 upscaling + optical-flow frame generation\n• Bottom window drag handle + built-in Net Check diagnostics"
+    },
+    {
+      "versionCode": 5,
+      "versionName": "2.0",
+      "notes": "• Spatial MR theater app (Curve, Tilt, Height, Screen Size, Room Depth)\n• SUSTAINED_HIGH GPU boost + auto-hiding Quest controllers\n• Foliage-safe optical-flow frame generation & dither-aware sharpening"
+    },
+    {
+      "versionCode": 4,
+      "versionName": "1.4",
+      "notes": "• Xbox Wi-Fi (Direct) mode improvements & monotonic frame pacing\n• ALSA HDMI audio auto-reopen for Linux capture server"
+    }
+  ]
 }

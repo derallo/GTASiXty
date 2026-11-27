@@ -56,6 +56,17 @@ if (Test-Path -LiteralPath $HandTrackerScript) {
     }
 }
 
+$PsChiakiScript = Join-Path $PSScriptRoot "build-ps-chiaki.ps1"
+if (Test-Path -LiteralPath $PsChiakiScript) {
+    Write-Host "[Quest APK] Building native PlayStation Remote Play (libgtaps.so)..."
+    try {
+        & $PsChiakiScript
+        if ($LASTEXITCODE -ne 0) { throw "build-ps-chiaki.ps1 exited $LASTEXITCODE" }
+    } catch {
+        Write-Warning "[Quest APK] Native PlayStation Remote Play unavailable ($($_.Exception.Message)); PS Remote Play mode will be disabled."
+    }
+}
+
 $Task = if ($Configuration -eq "Release") { "assembleRelease" } else { "assembleDebug" }
 $OutBuild = Join-Path $Root "build"
 New-Item -ItemType Directory -Force -Path $OutBuild | Out-Null

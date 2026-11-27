@@ -23,10 +23,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class SpatialDisplayBridge {
 
     static final int BACKDROP_PASSTHROUGH = 0;
-    static final int BACKDROP_DIM = 1;
-    static final int BACKDROP_DARK = 2;
-    static final int BACKDROP_JIMMYS_ROOM = 3;
-    static final int BACKDROP_COUNT = 4;
+    static final int BACKDROP_DARK = 1;
+    static final int BACKDROP_JIMMYS_ROOM = 2;
+    static final int BACKDROP_COUNT = 3;
 
     static final int PANEL_SCALE_1440P = CaptureProtocolHelper.PANEL_SCALE_1440P;
     static final int PANEL_SCALE_1800P = CaptureProtocolHelper.PANEL_SCALE_1800P;
@@ -69,6 +68,7 @@ public final class SpatialDisplayBridge {
     private static final String KEY_GTA_HANDS = "spatialGtaHandsEnabled";
     private static final String KEY_GTA_HANDS_CTRL_UP = "spatialGtaHandsCtrlUpM";
     private static final String KEY_GTA_HANDS_CTRL_BACK = "spatialGtaHandsCtrlBackM";
+    private static final String KEY_AUTO_HIDE_MENU_ON_CTRL = "spatialAutoHideMenuOnCtrl";
 
     static int panelPxW(int panelScale) {
         return CaptureProtocolHelper.panelPxW(panelScale);
@@ -110,6 +110,8 @@ public final class SpatialDisplayBridge {
         public boolean computeFlowEnabled;
         /** Draw GTA V hands + the auto-spawning 3D Xbox controller from Quest hand tracking. */
         public boolean gtaHandsEnabled;
+        /** Auto-hide the HUD / settings menu 3 s after the 3D Xbox controller becomes visible. */
+        public boolean autoHideMenuOnController;
         /** Fine-tune nudge for the virtual controller, in controller-local metres. */
         public float gtaHandsCtrlUpM;
         public float gtaHandsCtrlBackM;
@@ -125,6 +127,7 @@ public final class SpatialDisplayBridge {
             this.taaEnabled = true;
             this.computeFlowEnabled = true;
             this.gtaHandsEnabled = true;
+            this.autoHideMenuOnController = true;
             this.gtaHandsCtrlUpM = 0.0f;
             this.gtaHandsCtrlBackM = 0.0f;
         }
@@ -140,6 +143,7 @@ public final class SpatialDisplayBridge {
             this.taaEnabled = other.taaEnabled;
             this.computeFlowEnabled = other.computeFlowEnabled;
             this.gtaHandsEnabled = other.gtaHandsEnabled;
+            this.autoHideMenuOnController = other.autoHideMenuOnController;
             this.gtaHandsCtrlUpM = other.gtaHandsCtrlUpM;
             this.gtaHandsCtrlBackM = other.gtaHandsCtrlBackM;
             clamp();
@@ -175,8 +179,6 @@ public final class SpatialDisplayBridge {
 
         String backdropLabel() {
             switch (backdropMode) {
-                case BACKDROP_DIM:
-                    return "Dim";
                 case BACKDROP_DARK:
                     return "Dark";
                 case BACKDROP_JIMMYS_ROOM:
@@ -197,6 +199,10 @@ public final class SpatialDisplayBridge {
         void onDisplaySettingsChanged(DisplaySettings settings);
     }
 
+    public interface ControllerVisibilityListener {
+        void onVirtualXboxControllerVisibilityChanged(boolean visible);
+    }
+
     public interface GamepadSink {
         boolean onGamepadKey(KeyEvent event);
         boolean onGamepadMotion(MotionEvent event);
@@ -205,9 +211,12 @@ public final class SpatialDisplayBridge {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
     private static final CopyOnWriteArrayList<UiListener> UI_LISTENERS = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<ControllerVisibilityListener> CTRL_VIS_LISTENERS =
+            new CopyOnWriteArrayList<>();
     private static final DisplaySettings CURRENT = new DisplaySettings();
 
     private static boolean loaded = false;
+    private static volatile boolean virtualXboxControllerVisible = false;
     private static int requestedRefreshHz = 120;
     private static Bundle pendingLaunchExtras = null;
     private static WeakReference<SpatialListener> spatialRef = new WeakReference<>(null);
@@ -230,6 +239,7 @@ public final class SpatialDisplayBridge {
                 CURRENT.taaEnabled = prefs.getBoolean(KEY_TAA_ENABLED, true);
                 CURRENT.computeFlowEnabled = prefs.getBoolean(KEY_COMPUTE_FLOW, true);
                 CURRENT.gtaHandsEnabled = prefs.getBoolean(KEY_GTA_HANDS, true);
+                CURRENT.autoHideMenuOnController = prefs.getBoolean(KEY_AUTO_HIDE_MENU_ON_CTRL, true);
                 CURRENT.gtaHandsCtrlUpM = prefs.getFloat(KEY_GTA_HANDS_CTRL_UP, 0.0f);
                 CURRENT.gtaHandsCtrlBackM = prefs.getFloat(KEY_GTA_HANDS_CTRL_BACK, 0.0f);
                 CURRENT.clamp();
@@ -260,6 +270,7 @@ public final class SpatialDisplayBridge {
             CURRENT.taaEnabled = copy.taaEnabled;
             CURRENT.computeFlowEnabled = copy.computeFlowEnabled;
             CURRENT.gtaHandsEnabled = copy.gtaHandsEnabled;
+            CURRENT.autoHideMenuOnController = copy.autoHideMenuOnController;
             CURRENT.gtaHandsCtrlUpM = copy.gtaHandsCtrlUpM;
             CURRENT.gtaHandsCtrlBackM = copy.gtaHandsCtrlBackM;
         }
@@ -293,6 +304,7 @@ public final class SpatialDisplayBridge {
                 .putBoolean(KEY_TAA_ENABLED, s.taaEnabled)
                 .putBoolean(KEY_COMPUTE_FLOW, s.computeFlowEnabled)
                 .putBoolean(KEY_GTA_HANDS, s.gtaHandsEnabled)
+                .putBoolean(KEY_AUTO_HIDE_MENU_ON_CTRL, s.autoHideMenuOnController)
                 .putFloat(KEY_GTA_HANDS_CTRL_UP, s.gtaHandsCtrlUpM)
                 .putFloat(KEY_GTA_HANDS_CTRL_BACK, s.gtaHandsCtrlBackM)
                 .apply();
@@ -319,6 +331,32 @@ public final class SpatialDisplayBridge {
 
     static void removeUiListener(UiListener listener) {
         UI_LISTENERS.remove(listener);
+    }
+
+    static boolean isVirtualXboxControllerVisible() {
+        return virtualXboxControllerVisible;
+    }
+
+    static void setVirtualXboxControllerVisible(boolean visible) {
+        if (virtualXboxControllerVisible == visible) return;
+        virtualXboxControllerVisible = visible;
+        MAIN.post(() -> {
+            for (ControllerVisibilityListener l : CTRL_VIS_LISTENERS) {
+                l.onVirtualXboxControllerVisibilityChanged(visible);
+            }
+        });
+    }
+
+    static void addControllerVisibilityListener(ControllerVisibilityListener listener) {
+        if (listener != null && !CTRL_VIS_LISTENERS.contains(listener)) {
+            CTRL_VIS_LISTENERS.add(listener);
+            final boolean current = virtualXboxControllerVisible;
+            MAIN.post(() -> listener.onVirtualXboxControllerVisibilityChanged(current));
+        }
+    }
+
+    static void removeControllerVisibilityListener(ControllerVisibilityListener listener) {
+        CTRL_VIS_LISTENERS.remove(listener);
     }
 
     static void requestRecenter() {

@@ -1381,16 +1381,16 @@ class SceneAssembler:
         curtain_ambient_bleed = (0.018 * nd_win / (1.0 + 0.18 * win_dist * win_dist)) * np.array([[1.00, 0.78, 0.58]], dtype=np.float32)
 
         # Keep TV wall alcove moody & cinema-contrast while keeping cabinet/posters/closet clearly legible
-        tv_wall_dim = np.where(all_pos[:, 2:3] > 1.85, 0.88, 1.0)
+        tv_wall_dim = np.where(all_pos[:, 2:3] > 1.85, 0.92, 1.0)
         poster_lift = np.where(is_poster[:, None], 1.25, 1.0)
         base_amb = (
-            (0.048 + 0.024 * hemi_up) * np.array([[0.94, 0.90, 0.98]], dtype=np.float32)
-            + curtain_ambient_bleed * 1.4
+            (0.068 + 0.032 * hemi_up) * np.array([[0.94, 0.90, 0.98]], dtype=np.float32)
+            + curtain_ambient_bleed * 1.5
         ) * ao_curve * tv_wall_dim * poster_lift
 
         # Final linear radiance + specular sheen
         spec_total = (spec_sun + spec_dl + spec_bl + spec_tv) * np.clip(ao * 1.15, 0.25, 1.0)
-        total_lin = base_amb + direct_total * np.clip(0.42 + 0.58 * ao, 0.30, 1.0) + indirect_gi * 1.25 + spec_total
+        total_lin = base_amb + direct_total * np.clip(0.42 + 0.58 * ao, 0.30, 1.0) + indirect_gi * 1.40 + spec_total
 
         # Soft filmic highlight shoulder above 0.68 linear so hotspots roll off smoothly without hard clipping
         over = np.maximum(total_lin - 0.68, 0.0)
@@ -1620,11 +1620,11 @@ def main():
         casts = True
         if stem == "v_44_1_son_deca":
             skip = ("recycle_concrete", "office_shadow")
-            z_bias = 0.004
+            z_bias = 0.012
             subdiv = True
             casts = False
         elif stem == "v_44_s_posters":
-            z_bias = 0.005
+            z_bias = 0.018
             subdiv = True
             casts = False
         elif stem == "v_44_fakewindow6":
@@ -1660,7 +1660,7 @@ def main():
         if stem in ("prop_monitor_01a", "prop_laptop_01a"):
             skip = ("cracked_lcd",)
         elif stem == "v_44_s_posters":
-            z_bias = 0.005
+            z_bias = 0.018
             subdiv = True
             casts = False
         elif stem == "v_res_fashmag1":

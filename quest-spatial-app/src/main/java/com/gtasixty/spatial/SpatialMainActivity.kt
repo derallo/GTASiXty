@@ -26,6 +26,7 @@ import com.meta.spatial.core.Vector2
 import com.meta.spatial.core.Vector3
 import com.meta.spatial.core.Vector4
 import com.meta.spatial.isdk.IsdkBoxCollider
+import com.meta.spatial.isdk.IsdkDefaultCursorSystem
 import com.meta.spatial.isdk.IsdkGrabMovementType
 import com.meta.spatial.isdk.IsdkGrabState
 import com.meta.spatial.isdk.IsdkGrabbable
@@ -70,8 +71,11 @@ import com.meta.spatial.toolkit.UIPanelSettings
 import com.meta.spatial.toolkit.UIPanelShapeOptions
 import com.meta.spatial.toolkit.Visible
 import com.meta.spatial.toolkit.createPanelEntity
+import com.meta.spatial.vr.InputSystem
 import com.meta.spatial.vr.VRFeature
+import com.gtasixty.spatial.voice.JimmySpatialPanel
 import kotlin.math.abs
+import kotlin.math.acos
 
 /**
  * Meta Spatial SDK Passthrough MR host activity for GTA-Sixty.
@@ -93,6 +97,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         private const val PANEL_DP_H = 900f
         private const val MIN_RESHAPE_INTERVAL_MS = 45L
         private const val CONTROLLER_HIDE_IDLE_MS = 5000L
+        private const val USER_RECENTER_DELAY_MS = 1500L
 
         private const val HANDLE_BOTTOM_GAP_M = 0.065f
         private val HANDLE_COLLIDER_SIZE = Vector3(0.56f, 0.14f, 0.08f)
@@ -120,6 +125,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     private var grabHandleMaterial: Material? = null
     private var grabHandleVisualState = -1
     private var handleObserverHandle: IsdkSystem.InteractableObserverHandle? = null
+    private var jimmyPanel: JimmySpatialPanel? = null
     private var sceneReady = false
 
     private var appliedCurvePct = -1
@@ -138,6 +144,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
 
     private var needsInitialRecenter = true
     private var initialRecenterDeadlineMs = 0L
+    private var pendingUserRecenter = false
+    private var userRecenterAtMs = 0L
     private var wasCornerResizing = false
     private var wasGrabbing = false
     private var wasHandleGrabbing = false
@@ -149,6 +157,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     private var triggerDragOffset = Vector3(0f, 0f, 0f)
     private var lastSceneTickMs = 0L
     private var lastViewerPos: Vector3? = null
+    private var lastViewerHorizFwd: Vector3? = null
     private var lastControllerActivityMs = 0L
     private var controllerVisualsVisible = true
 
@@ -157,6 +166,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     private var gtaHands: GtaHandsControllerSystem? = null
     private var gtaHandsInitAttempted = false
     private var avatarHandsVisible = true
+    private var pointerRaysVisible = true
 
     private val reshapeRunnable = Runnable {
         reshapeScheduled = false
@@ -193,6 +203,9 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             if (intent.hasExtra("hands")) updated.gtaHandsEnabled = intent.getBooleanExtra("hands", updated.gtaHandsEnabled)
             if (intent.hasExtra("handsUp")) updated.gtaHandsCtrlUpM = intent.getFloatExtra("handsUp", updated.gtaHandsCtrlUpM)
             if (intent.hasExtra("handsBack")) updated.gtaHandsCtrlBackM = intent.getFloatExtra("handsBack", updated.gtaHandsCtrlBackM)
+            if (intent.hasExtra("autoHideMenu")) {
+                updated.autoHideMenuOnController = intent.getBooleanExtra("autoHideMenu", updated.autoHideMenuOnController)
+            }
             SpatialDisplayBridge.applyFromUi(this@SpatialMainActivity, updated)
             if (intent.getBooleanExtra("recenter", false)) {
                 SpatialDisplayBridge.requestRecenter()
@@ -218,7 +231,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
                         }
                     }
                 }
-            )
+            ),
+            JimmySpatialPanel.createRegistration()
         ).also {
             val inRoom = initial.backdropMode == SpatialDisplayBridge.BACKDROP_JIMMYS_ROOM
             appliedCurvePct = if (inRoom) 0 else initial.curvePct
@@ -364,9 +378,13 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
                 onHandlePointerEvent(event)
             }
 
+        jimmyPanel = JimmySpatialPanel().also { it.createEntity() }
+
         if (startInRoom) {
             computeJimmysRoomAnchor()
             applyJimmysRoomPoses()
+        } else {
+            updateJimmyFloatingPose()
         }
 
         needsInitialRecenter = true
@@ -390,22 +408,41 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         val viewer = scene.getViewerPose()
         val hasRealHead = viewer.t.length() > 0.01f || abs(viewer.q.w - 1f) > 0.001f
 
+        val rawViewerFwd = viewer.forward()
+        val horizViewerFwd = Vector3(rawViewerFwd.x, 0f, rawViewerFwd.z).let {
+            if (it.length() > 1e-4f) it.normalize() else null
+        }
+
         if (needsInitialRecenter) {
             if (hasRealHead || now >= initialRecenterDeadlineMs) {
                 needsInitialRecenter = false
                 lastViewerPos = viewer.t
+                lastViewerHorizFwd = horizViewerFwd
                 recenterPanelNow()
             }
+        } else if (pendingUserRecenter && now >= userRecenterAtMs) {
+            pendingUserRecenter = false
+            lastViewerPos = viewer.t
+            lastViewerHorizFwd = horizViewerFwd
+            recenterPanelNow()
         } else if (hasRealHead && !wasGrabbing && !wasCornerResizing && !wasHandleGrabbing && triggerDragSource == null) {
             val prevPos = lastViewerPos
+            val prevFwd = lastViewerHorizFwd
             lastViewerPos = viewer.t
+            lastViewerHorizFwd = horizViewerFwd
             val headJump = if (prevPos != null) (viewer.t - prevPos).length() else 0f
+            val yawJumpDeg = if (prevFwd != null && horizViewerFwd != null) {
+                val dot = (prevFwd.x * horizViewerFwd.x + prevFwd.z * horizViewerFwd.z).coerceIn(-1f, 1f)
+                Math.toDegrees(acos(dot.toDouble())).toFloat()
+            } else {
+                0f
+            }
             val distToAnchor = (viewer.t - anchorCenter).length()
             val maxReachableDist = maxOf(currentSettings.distanceMeters + 3.5f, 7.5f)
-            if (headJump > 0.85f || distToAnchor > maxReachableDist) {
+            if (headJump > 0.35f || yawJumpDeg > 15.0f || distToAnchor > maxReachableDist) {
                 Log.i(
                     TAG,
-                    "Tracking origin / boundary jump detected (headJump=${headJump}m dist=${distToAnchor}m); auto-recentering"
+                    "Meta-button recenter / origin jump detected (headJump=${headJump}m yawJump=${yawJumpDeg}deg dist=${distToAnchor}m); auto-recentering"
                 )
                 recenterPanelNow()
             }
@@ -422,6 +459,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             triggerDragSource = null
             rayHoveredHandle = false
             updateControllerVisibility()
+            jimmyPanel?.syncVisibility()
             return
         }
 
@@ -541,6 +579,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             val hp = computeGrabHandlePose()
             grabHandleEntity?.setComponent(Transform(hp))
             grabHandleVisualEntity?.setComponent(Transform(hp))
+            updateJimmyFloatingPose()
         } else if (wasGrabbing) {
             wasGrabbing = false
             syncAnchorFromEntity(ent)
@@ -566,6 +605,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
 
         updateControllerVisibility()
         updateGrabHandleVisualState()
+        jimmyPanel?.syncVisibility()
     }
 
     override fun onDisplaySettingsChanged(settings: SpatialDisplayBridge.DisplaySettings) {
@@ -582,6 +622,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             gtaHands?.setEnabled(currentSettings.gtaHandsEnabled)
             if (!currentSettings.gtaHandsEnabled) {
                 syncAvatarHandVisibility()
+                syncPointerRayVisibility()
             }
         }
 
@@ -624,7 +665,9 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
     override fun onRecenterRequested() {
         if (!sceneReady) return
         needsInitialRecenter = false
-        recenterPanelNow()
+        pendingUserRecenter = true
+        userRecenterAtMs = SystemClock.uptimeMillis() + USER_RECENTER_DELAY_MS
+        Log.i(TAG, "Scheduled user recenter in ${USER_RECENTER_DELAY_MS}ms")
     }
 
     override fun onRefreshRateRequested(hz: Int) {
@@ -650,6 +693,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(reshapeRunnable)
+        SpatialDisplayBridge.setVirtualXboxControllerVisible(false)
         gtaHands?.shutdown()
         gtaHands = null
         handTracking = null
@@ -657,6 +701,8 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
             systemManager.tryFindSystem<IsdkSystem>()?.unregisterInteractableObserver(h)
         }
         handleObserverHandle = null
+        jimmyPanel?.destroy()
+        jimmyPanel = null
         SpatialDisplayBridge.setSpatialListener(null)
         try {
             unregisterReceiver(debugReceiver)
@@ -852,6 +898,7 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         val settings = currentSettings
         if (!settings.gtaHandsEnabled) {
             gtaHands?.setEnabled(false)
+            syncPointerRayVisibility()
             return
         }
         if (gtaHands == null) {
@@ -872,6 +919,22 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         )
         system.tick(now, dtSec, viewer)
         syncAvatarHandVisibility()
+        syncPointerRayVisibility()
+    }
+
+    /**
+     * Hides Meta Spatial SDK hand/controller pointer rays & cursors while the virtual Xbox
+     * controller is visible, and restores them as soon as the controller is put away.
+     */
+    private fun syncPointerRayVisibility() {
+        val controllerShown = gtaHands?.isControllerVisible() == true
+        val desired = !controllerShown
+        if (pointerRaysVisible == desired) return
+        pointerRaysVisible = desired
+        SpatialDisplayBridge.setVirtualXboxControllerVisible(controllerShown)
+        systemManager.tryFindSystem<IsdkDefaultCursorSystem>()?.enableInput(desired)
+        systemManager.tryFindSystem<InputSystem>()?.enableInput(desired)
+        Log.i(TAG, "Pointer rays visible=$desired (virtualController=$controllerShown)")
     }
 
     /**
@@ -964,15 +1027,16 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         }
         grabHandleEntity?.setComponent(Visible(false))
         grabHandleVisualEntity?.setComponent(Visible(false))
+        jimmyPanel?.updatePoseJimmysRoom(
+            tvWorldPos,
+            anchorYaw,
+            JIMMYS_ROOM_TV_WIDTH_M,
+            JIMMYS_ROOM_TV_WIDTH_M / SpatialDisplayBridge.ASPECT_RATIO
+        )
     }
 
     private fun applyBackdrop(mode: Int) {
         when (mode) {
-            SpatialDisplayBridge.BACKDROP_DIM -> {
-                jimmysRoomEntity?.setComponent(Visible(false))
-                scene.enablePassthrough(true)
-                scene.setPassthroughLUT(Lut.fromScale(Vector3(0.22f, 0.22f, 0.22f)))
-            }
             SpatialDisplayBridge.BACKDROP_DARK -> {
                 jimmysRoomEntity?.setComponent(Visible(false))
                 scene.enablePassthrough(false)
@@ -1295,6 +1359,18 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         )
     }
 
+    private fun updateJimmyFloatingPose() {
+        val panelW = if (appliedWidthMeters > 0f) appliedWidthMeters else currentSettings.widthMeters
+        val panelH = panelW / SpatialDisplayBridge.ASPECT_RATIO
+        val rot = anchorYaw * Quaternion.fromAxisAngle(Vector3(1f, 0f, 0f), currentSettings.tiltDeg)
+        val visualCenter = Vector3(
+            anchorCenter.x,
+            anchorCenter.y + currentSettings.heightOffsetM,
+            anchorCenter.z
+        )
+        jimmyPanel?.updatePoseFloating(visualCenter, rot, panelW, panelH, appliedRadiusMeters)
+    }
+
     private fun applyPanelPoseOnly(ent: Entity) {
         val pose = composePanelPose(
             anchorCenter,
@@ -1305,6 +1381,9 @@ class SpatialMainActivity : AppSystemActivity(), SpatialDisplayBridge.SpatialLis
         )
         lastWrittenPose = pose
         ent.setComponent(Transform(pose))
+        if (!isJimmysRoomActive()) {
+            updateJimmyFloatingPose()
+        }
     }
 
     private fun applyCurrentPose(ent: Entity) {

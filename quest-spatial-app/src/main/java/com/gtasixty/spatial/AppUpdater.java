@@ -6,15 +6,17 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
+import android.util.TypedValue;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
-
-import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -28,14 +30,22 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Checks GitHub (derallo/GTASiXty) every 3 hours (and on demand via the Update button) for a newer
- * Quest 3 APK, downloads it to cacheDir, and launches Android's package installer.
+ * Checks GitHub (derallo/GTASiXty) every time the app is opened, every 3 hours while open,
+ * and on demand via the Update button for a newer Quest 3 APK, downloads it to cacheDir, and
+ * launches Android's package installer.
  */
 final class AppUpdater {
+    interface Listener {
+        void onUpdateAvailable(String remoteVersionName);
+    }
+
     private static final String TAG = "GTA60Update";
     private static final String VERSION_URL =
             "https://raw.githubusercontent.com/derallo/GTASiXty/main/releases/version.json";
+    private static final String GITHUB_RELEASES_URL =
+            "https://api.github.com/repos/derallo/GTASiXty/releases?per_page=8";
     private static final long CHECK_INTERVAL_MS = 3L * 60L * 60L * 1000L; // 3 hours
+    private static final long OPEN_DEBOUNCE_MS = 15_000L;
     private static final String PREF_LAST_CHECK = "lastUpdateCheckMs";
 
     private final Activity activity;
@@ -44,6 +54,9 @@ final class AppUpdater {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final AtomicBoolean checking = new AtomicBoolean(false);
     private boolean destroyed = false;
+    private long lastOpenCheckMs = 0L;
+    private Listener listener;
+    private AlertDialog activeDialog;
 
     private final Runnable periodicCheck = new Runnable() {
         @Override
@@ -54,22 +67,51 @@ final class AppUpdater {
         }
     };
 
+    private final Runnable openCheckRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!destroyed && !activity.isFinishing()) {
+                checkNow(false);
+            }
+        }
+    };
+
     AppUpdater(Activity activity) {
         this.activity = activity;
         this.prefs = activity.getSharedPreferences("gta60", Context.MODE_PRIVATE);
     }
 
+    void setListener(Listener listener) {
+        this.listener = listener;
+    }
+
+    void checkOnAppOpen() {
+        if (destroyed) return;
+        final long now = android.os.SystemClock.uptimeMillis();
+        if (lastOpenCheckMs > 0L && (now - lastOpenCheckMs) < OPEN_DEBOUNCE_MS) {
+            return;
+        }
+        lastOpenCheckMs = now;
+        handler.removeCallbacks(openCheckRunnable);
+        handler.postDelayed(openCheckRunnable, 1500L);
+    }
+
     void startPeriodicChecks() {
         handler.removeCallbacks(periodicCheck);
-        final long last = prefs.getLong(PREF_LAST_CHECK, 0L);
-        final long elapsed = Math.max(0L, System.currentTimeMillis() - last);
-        final long initialDelay = elapsed >= CHECK_INTERVAL_MS ? 4000L : (CHECK_INTERVAL_MS - elapsed);
-        handler.postDelayed(periodicCheck, initialDelay);
+        handler.postDelayed(periodicCheck, CHECK_INTERVAL_MS);
     }
 
     void destroy() {
         destroyed = true;
         handler.removeCallbacks(periodicCheck);
+        handler.removeCallbacks(openCheckRunnable);
+        if (activeDialog != null) {
+            try {
+                activeDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+            activeDialog = null;
+        }
         io.shutdownNow();
     }
 
@@ -92,62 +134,121 @@ final class AppUpdater {
             Toast.makeText(activity, "Checking GitHub for updates...", Toast.LENGTH_SHORT).show();
         }
         io.execute(() -> {
+            String versionRaw = null;
+            String releasesRaw = null;
+            Exception versionErr = null;
+            Exception releasesErr = null;
             try {
-                final String raw = fetchText(VERSION_URL);
-                final JSONObject j = new JSONObject(raw);
-                final long remoteCode = j.optLong("versionCode", 0L);
-                final String remoteName = j.optString("versionName", "?");
-                final String apkUrl = j.optString("apkUrl", "");
-                final String notes = j.optString("notes", "");
-                final long localCode = localVersionCode();
-                final String localName = localVersionName();
-
-                prefs.edit().putLong(PREF_LAST_CHECK, System.currentTimeMillis()).apply();
-                Log.i(TAG, "Update check: local=" + localCode + " (" + localName + "), remote="
-                        + remoteCode + " (" + remoteName + ")");
-
-                handler.post(() -> {
-                    checking.set(false);
-                    if (destroyed || activity.isFinishing()) return;
-                    if (remoteCode > localCode && !apkUrl.isEmpty()) {
-                        showUpdateDialog(remoteName, remoteCode, apkUrl, notes, localName);
-                    } else if (userInitiated) {
-                        new AlertDialog.Builder(activity)
-                                .setTitle("GTA-Sixty is up to date")
-                                .setMessage("Installed version: v" + localName + " (build " + localCode + ")\n"
-                                        + "Latest on GitHub: v" + remoteName + " (build " + remoteCode + ")")
-                                .setPositiveButton("OK", null)
-                                .show();
-                    }
-                });
+                versionRaw = fetchText(VERSION_URL + "?t=" + System.currentTimeMillis(), 10000, 15000, null);
             } catch (Exception e) {
-                Log.w(TAG, "Update check failed: " + e.getMessage());
+                versionErr = e;
+            }
+            try {
+                releasesRaw = fetchText(GITHUB_RELEASES_URL, 5000, 5000, "application/vnd.github+json");
+            } catch (Exception e) {
+                releasesErr = e;
+            }
+
+            if (versionRaw == null && releasesRaw == null) {
+                final String errMsg = versionErr != null
+                        ? versionErr.getMessage()
+                        : (releasesErr != null ? releasesErr.getMessage() : "Network error");
+                Log.w(TAG, "Update check failed: " + errMsg);
                 handler.post(() -> {
                     checking.set(false);
                     if (userInitiated && !destroyed && !activity.isFinishing()) {
-                        Toast.makeText(activity, "Update check failed: " + e.getMessage(),
+                        Toast.makeText(activity, "Update check failed: " + errMsg,
                                 Toast.LENGTH_LONG).show();
                     }
                 });
+                return;
             }
+
+            final long localCode = localVersionCode();
+            final String localName = localVersionName();
+            final AppUpdateParser.UpdateInfo info = AppUpdateParser.resolve(
+                    versionRaw, releasesRaw, localCode, localName);
+
+            prefs.edit().putLong(PREF_LAST_CHECK, System.currentTimeMillis()).apply();
+            Log.i(TAG, "Update check: local=" + localCode + " (" + localName + "), remote="
+                    + info.versionCode + " (" + info.versionName + "), available=" + info.updateAvailable);
+
+            handler.post(() -> {
+                checking.set(false);
+                if (destroyed || activity.isFinishing()) return;
+                if (info.updateAvailable) {
+                    if (listener != null) {
+                        listener.onUpdateAvailable(info.versionName);
+                    }
+                    showUpdateDialog(info, localName, localCode);
+                } else if (userInitiated) {
+                    showUpToDateDialog(info, localName, localCode);
+                }
+            });
         });
     }
 
-    private void showUpdateDialog(String remoteName, long remoteCode, String apkUrl,
-                                  String notes, String localName) {
-        final StringBuilder msg = new StringBuilder();
-        msg.append("A new version of GTA-Sixty is available on GitHub.\n\n")
-           .append("Installed: v").append(localName).append("\n")
-           .append("Available: v").append(remoteName).append(" (build ").append(remoteCode).append(")");
-        if (!notes.isEmpty()) {
-            msg.append("\n\nWhat's new:\n").append(notes);
+    private void showUpdateDialog(AppUpdateParser.UpdateInfo info, String localName, long localCode) {
+        if (activeDialog != null && activeDialog.isShowing()) {
+            return;
         }
-        new AlertDialog.Builder(activity)
-                .setTitle("Update Available")
-                .setMessage(msg.toString())
-                .setPositiveButton("Download & Install", (d, w) -> downloadAndInstall(apkUrl))
+        final StringBuilder msg = new StringBuilder();
+        msg.append("A newer version of GTA-Sixty is available on GitHub.\n\n")
+           .append("Your version: v").append(localName).append(" (build ").append(localCode).append(")\n")
+           .append("Latest on GitHub: v").append(info.versionName);
+        if (info.versionCode > 0) {
+            msg.append(" (build ").append(info.versionCode).append(")");
+        }
+        if (info.recentNotes != null && !info.recentNotes.isEmpty()) {
+            msg.append("\n\nRecent enhancements:\n\n").append(info.recentNotes);
+        }
+
+        final AlertDialog dlg = new AlertDialog.Builder(activity)
+                .setTitle("Update Available — v" + info.versionName)
+                .setView(makeScrollableMessageView(msg.toString()))
+                .setPositiveButton("Download & Install", (d, w) -> downloadAndInstall(info.apkUrl))
                 .setNegativeButton("Later", null)
-                .show();
+                .create();
+        dlg.setOnDismissListener(d -> {
+            if (activeDialog == dlg) activeDialog = null;
+        });
+        activeDialog = dlg;
+        dlg.show();
+    }
+
+    private void showUpToDateDialog(AppUpdateParser.UpdateInfo info, String localName, long localCode) {
+        final StringBuilder msg = new StringBuilder();
+        msg.append("Your version: v").append(localName).append(" (build ").append(localCode).append(")\n")
+           .append("Latest on GitHub: v").append(info.versionName);
+        if (info.versionCode > 0) {
+            msg.append(" (build ").append(info.versionCode).append(")");
+        }
+        if (info.recentNotes != null && !info.recentNotes.isEmpty()) {
+            msg.append("\n\nRecent enhancements:\n\n").append(info.recentNotes);
+        }
+
+        final AlertDialog dlg = new AlertDialog.Builder(activity)
+                .setTitle("GTA-Sixty is up to date")
+                .setView(makeScrollableMessageView(msg.toString()))
+                .setPositiveButton("OK", null)
+                .create();
+        dlg.setOnDismissListener(d -> {
+            if (activeDialog == dlg) activeDialog = null;
+        });
+        activeDialog = dlg;
+        dlg.show();
+    }
+
+    private ScrollView makeScrollableMessageView(String text) {
+        final ScrollView sv = new ScrollView(activity);
+        final TextView tv = new TextView(activity);
+        tv.setText(text);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        final int p = Math.round(16 * activity.getResources().getDisplayMetrics().density);
+        tv.setPadding(p, p, p, p);
+        sv.addView(tv);
+        return sv;
     }
 
     private void downloadAndInstall(final String apkUrl) {
@@ -215,8 +316,8 @@ final class AppUpdater {
         }
     }
 
-    private static String fetchText(String urlStr) throws Exception {
-        final HttpURLConnection c = openConnection(urlStr);
+    private static String fetchText(String urlStr, int connectMs, int readMs, String accept) throws Exception {
+        final HttpURLConnection c = openConnection(urlStr, connectMs, readMs, accept);
         try (InputStream in = c.getInputStream();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             final byte[] buf = new byte[4096];
@@ -230,7 +331,7 @@ final class AppUpdater {
 
     private static void downloadFile(String urlStr, File dest) throws Exception {
         final File tmp = new File(dest.getParentFile(), dest.getName() + ".tmp");
-        final HttpURLConnection c = openConnection(urlStr);
+        final HttpURLConnection c = openConnection(urlStr, 10000, 20000, null);
         try (InputStream in = c.getInputStream();
              FileOutputStream out = new FileOutputStream(tmp, false)) {
             final byte[] buf = new byte[8192];
@@ -247,14 +348,20 @@ final class AppUpdater {
         }
     }
 
-    private static HttpURLConnection openConnection(String urlStr) throws Exception {
+    private static HttpURLConnection openConnection(String urlStr, int connectMs, int readMs,
+                                                    String accept) throws Exception {
         String cur = urlStr;
         for (int i = 0; i < 5; i++) {
             final HttpURLConnection c = (HttpURLConnection) new URL(cur).openConnection();
-            c.setConnectTimeout(10000);
-            c.setReadTimeout(20000);
+            c.setConnectTimeout(connectMs);
+            c.setReadTimeout(readMs);
             c.setInstanceFollowRedirects(false);
+            c.setUseCaches(false);
+            c.setRequestProperty("Cache-Control", "no-cache");
             c.setRequestProperty("User-Agent", "GTA-Sixty-Quest3");
+            if (accept != null && !accept.isEmpty()) {
+                c.setRequestProperty("Accept", accept);
+            }
             final int code = c.getResponseCode();
             if (code >= 300 && code < 400) {
                 final String loc = c.getHeaderField("Location");

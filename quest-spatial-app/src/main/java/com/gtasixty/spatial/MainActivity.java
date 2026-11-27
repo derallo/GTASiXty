@@ -11,8 +11,10 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.provider.Settings;
 import android.text.InputType;
 import android.media.AudioAttributes;
@@ -35,12 +37,16 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+
+import com.gtasixty.spatial.voice.JimmyVoiceModule;
 
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
@@ -139,13 +145,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile long lastGamepadSendMs = 0;
     private Button holdBtn;
     private TextView statusText;
+    private TextView hoverHintText;
+    private HoverHintHelper hoverHints;
+    private CheckBox autoHideCheck;
+    private Button updateBtn;
+    private boolean syncingAutoHideCheck = false;
+    private boolean wasStopped = false;
+    private static final long AUTO_HIDE_ON_CONTROLLER_MS = 6000L;
+    private static final long AUTO_HIDE_AFTER_MANUAL_OPEN_MS = 8000L;
     private Button modeBtn;
+    private Button platformBtn;
+    private TextView titleText;
     private DirectController direct;
+    private PsRemoteController psRemote;
     private AppUpdater updater;
     private UsbCaptureController usbCapture;
+    private JimmyVoiceModule jimmyVoice;
     private static final int REQ_USB_CAPTURE_PERMS = 4001;
     private static final String PERM_USB_CAMERA = "horizonos.permission.USB_CAMERA";
+    private int consolePlatform = ConsolePlatform.XBOX;
     private boolean directMode = false;
+    private boolean psRemoteMode = false;
     // HDMI capture on the PC (or direct USB-C on Quest when captureUsbMode=true). Mutually exclusive with directMode.
     private volatile boolean captureMode = false;
     private volatile boolean captureUsbMode = false;
@@ -201,9 +221,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int captureLookMode = CaptureGlRenderer.LOOK_NORMAL;
     private int captureRefreshHz = 120;
     private final SpatialDisplayBridge.UiListener spatialUiListener = this::onSpatialSettingsUpdated;
+    private final Runnable autoHideOnControllerRunnable = () -> {
+        if (!SpatialDisplayBridge.isVirtualXboxControllerVisible()) return;
+        if (!SpatialDisplayBridge.getSettings().autoHideMenuOnController) return;
+        if (displayControls != null && displayControls.getVisibility() == View.VISIBLE) {
+            displayControls.setVisibility(View.GONE);
+        }
+        if (directMode) {
+            if (direct != null && direct.isStreaming()) {
+                direct.hideHud();
+            }
+        } else if (psRemoteMode) {
+            if (psRemote != null && psRemote.isStreaming()) {
+                psRemote.hideHud();
+            }
+        } else if ((streaming.get() || isUsbCaptureRunning()) && hudBar != null) {
+            hudBar.setVisibility(View.GONE);
+        }
+    };
+    private final SpatialDisplayBridge.ControllerVisibilityListener controllerVisibilityListener = visible -> {
+        uiHandler.removeCallbacks(autoHideOnControllerRunnable);
+        if (visible && SpatialDisplayBridge.getSettings().autoHideMenuOnController) {
+            uiHandler.postDelayed(autoHideOnControllerRunnable, AUTO_HIDE_ON_CONTROLLER_MS);
+        }
+    };
+
+    void notifyMenuOpenedOrInteracted() {
+        uiHandler.removeCallbacks(autoHideOnControllerRunnable);
+        if (SpatialDisplayBridge.isVirtualXboxControllerVisible()
+                && SpatialDisplayBridge.getSettings().autoHideMenuOnController) {
+            uiHandler.postDelayed(autoHideOnControllerRunnable, AUTO_HIDE_AFTER_MANUAL_OPEN_MS);
+        }
+    }
+
+    private void onDisplayControlsUserInteraction() {
+        notifyMenuOpenedOrInteracted();
+    }
 
     private void onSpatialSettingsUpdated(SpatialDisplayBridge.DisplaySettings settings) {
         if (settings == null) return;
+        if (autoHideCheck != null && !syncingAutoHideCheck) {
+            uiHandler.post(() -> {
+                if (autoHideCheck == null) return;
+                syncingAutoHideCheck = true;
+                try {
+                    if (autoHideCheck.isChecked() != settings.autoHideMenuOnController) {
+                        autoHideCheck.setChecked(settings.autoHideMenuOnController);
+                    }
+                } finally {
+                    syncingAutoHideCheck = false;
+                }
+            });
+        }
+        if (!settings.autoHideMenuOnController) {
+            uiHandler.removeCallbacks(autoHideOnControllerRunnable);
+        } else if (SpatialDisplayBridge.isVirtualXboxControllerVisible()) {
+            uiHandler.removeCallbacks(autoHideOnControllerRunnable);
+            uiHandler.postDelayed(autoHideOnControllerRunnable, AUTO_HIDE_ON_CONTROLLER_MS);
+        }
         final CaptureGlRenderer gl = captureGl;
         if (gl != null) {
             gl.setTaaEnabled(settings.taaEnabled);
@@ -274,18 +349,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Restore the last transport. If the user left the app in Direct mode, opening the panel
         // must not auto-start a PC stream and steal the console's single session (the 2026-11-21
         // "exclusive operation" collision).
-        directMode = prefs.getBoolean("directMode", false);
+        consolePlatform = ConsolePlatform.fromPrefValue(prefs.getString("consolePlatform", "xbox"));
+        directMode = prefs.getBoolean("directMode", true);
         captureMode = prefs.getBoolean("captureMode", false);
+        psRemoteMode = consolePlatform == ConsolePlatform.PLAYSTATION
+                && prefs.getBoolean("psRemoteMode", false);
         captureUsbMode = prefs.getBoolean("captureUsbMode", false);
-        if (captureMode) directMode = false;
-        if (!prefs.contains("prefs_v4")) {
-            captureMode = true;
+        if (captureMode) {
             directMode = false;
+            psRemoteMode = false;
+        } else if (psRemoteMode) {
+            directMode = false;
+        }
+        if (!prefs.contains("prefs_v5")) {
+            directMode = true;
+            captureMode = false;
             prefs.edit()
-                    .putBoolean("prefs_v4", true)
-                    .putBoolean("captureMode", true)
-                    .putBoolean("directMode", false)
-                    .putString("captureHost", DEFAULT_CAPTURE_HOST)
+                    .putBoolean("prefs_v5", true)
+                    .putBoolean("directMode", true)
+                    .putBoolean("captureMode", false)
                     .apply();
         }
         if (!prefs.contains("prefs_v2")) {
@@ -302,8 +384,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         captureCodecChoice = Math.max(0, Math.min(CaptureProtocolHelper.CAPTURE_CODEC_COUNT - 1,
                 prefs.getInt("captureCodecChoice", CaptureProtocolHelper.CAPTURE_CODEC_HEVC_8)));
-        captureEnhanceMode = Math.max(0, Math.min(ENHANCE_LABELS.length - 1,
-                prefs.getInt("captureEnhanceMode", CaptureGlRenderer.MODE_FG60_SR)));
+        captureEnhanceMode = CaptureProtocolHelper.normalizeCaptureEnhanceMode(
+                prefs.getInt("captureEnhanceMode", CaptureGlRenderer.MODE_FG60_SR));
         captureLookMode = Math.max(0, Math.min(LOOK_LABELS.length - 1,
                 prefs.getInt("captureLookMode", CaptureGlRenderer.LOOK_NORMAL)));
         captureRefreshHz = prefs.getInt("captureRefreshHz", 120) == 90 ? 90 : 120;
@@ -333,78 +415,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int pad = dp(8);
         hudBar.setPadding(pad, pad, pad, pad);
 
+        hoverHintText = new TextView(this);
+        hoverHintText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hoverHints = new HoverHintHelper(hoverHintText,
+                "Point at any option to see what it does \u2022 Tap video anytime to show/hide menu");
+
+        // Row 1: Connect & View
         LinearLayout row1 = new LinearLayout(this);
         row1.setOrientation(LinearLayout.HORIZONTAL);
         row1.setGravity(Gravity.CENTER_VERTICAL);
 
-        TextView title = new TextView(this);
-        title.setText("GTA-Sixty");
-        title.setTextColor(Color.parseColor("#22C55E"));
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        title.setPadding(0, 0, dp(10), 0);
-        row1.addView(title);
+        titleText = new TextView(this);
+        titleText.setText("GTA-Sixty");
+        titleText.setTextColor(Color.parseColor(consolePlatform == ConsolePlatform.PLAYSTATION ? "#38BDF8" : "#22C55E"));
+        titleText.setTypeface(Typeface.DEFAULT_BOLD);
+        titleText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        titleText.setPadding(0, 0, dp(10), 0);
+        row1.addView(titleText);
 
-        hostInput = new EditText(this);
-        hostInput.setText(captureMode ? prefs.getString("captureHost", DEFAULT_CAPTURE_HOST) : savedHost);
-        hostInput.setHint("PC IP (auto if blank)");
-        hostInput.setTextColor(Color.WHITE);
-        hostInput.setHintTextColor(Color.GRAY);
-        hostInput.setBackgroundColor(Color.parseColor("#1E293B"));
-        hostInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        hostInput.setPadding(dp(8), dp(5), dp(8), dp(5));
-        hostInput.setSingleLine(true);
-        LinearLayout.LayoutParams ipLp = new LinearLayout.LayoutParams(dp(155), LinearLayout.LayoutParams.WRAP_CONTENT);
-        ipLp.rightMargin = dp(6);
-        row1.addView(hostInput, ipLp);
+        platformBtn = makeButton(ConsolePlatform.toggleButtonLabel(consolePlatform), ConsolePlatform.accentHex(consolePlatform));
+        platformBtn.setOnClickListener(v -> toggleConsolePlatform());
+        hoverHints.attach(platformBtn,
+                "Console: Switch between Xbox (Wi-Fi / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
+        row1.addView(platformBtn);
 
-        lanBtn = makeButton("LAN", "#334155");
-        lanBtn.setOnClickListener(v -> discoverLanHost(false));
-        row1.addView(lanBtn);
-
-        usbBtn = makeButton("USB-C", "#334155");
-        usbBtn.setOnClickListener(v -> hostInput.setText("127.0.0.1"));
-        row1.addView(usbBtn);
-
-        startBtn = makeButton(captureMode && captureUsbMode ? "Start USB" : "Start Stream", "#16A34A");
-        startBtn.setOnClickListener(v -> {
-            if (streaming.get() || isUsbCaptureRunning()) disconnect();
-            else startStreamClicked();
-        });
-        row1.addView(startBtn);
-
-        refreshBtn = makeButton("Refresh", "#475569");
-        refreshBtn.setOnClickListener(v -> sendControlPacket(TYPE_CLIENT_IDR, null));
-        row1.addView(refreshBtn);
-
-        Button hideBtn = makeButton("Hide HUD", "#475569");
-        hideBtn.setOnClickListener(v -> hudBar.setVisibility(View.GONE));
-        row1.addView(hideBtn);
-
-        Button displayBtn = makeButton("Display", "#0284C7");
-        displayBtn.setOnClickListener(v -> toggleDisplayControls());
-        row1.addView(displayBtn);
-
-        Button recenterBtn = makeButton("Recenter", "#2563EB");
-        recenterBtn.setOnClickListener(v -> SpatialDisplayBridge.requestRecenter());
-        row1.addView(recenterBtn);
-
-        Button adbBtn = makeButton("Wi-Fi ADB", "#2563EB");
-        adbBtn.setOnClickListener(v -> openWirelessAdbHelper());
-        row1.addView(adbBtn);
-
-        wakeBtn = makeButton(captureMode ? "Check Update" : "Wake PC", "#7C3AED");
-        wakeBtn.setOnClickListener(v -> wakePc());
-        row1.addView(wakeBtn);
-
-        modeBtn = makeButton(captureMode ? "Mode: Capture" : (directMode ? "Mode: XRemote" : "Mode: PC"), "#0F766E");
-        modeBtn.setOnClickListener(v -> {
-            // PC -> Direct -> Capture -> PC. Direct's own HUD continues the cycle, because this bar
-            // is hidden while Direct is showing.
-            if (captureMode) exitCaptureMode();
-            else if (directMode) enterCaptureMode();
-            else enterDirectMode();
-        });
+        modeBtn = makeButton(captureMode ? "Mode: Capture \u25BE" : (directMode ? "Mode: Xbox Wi-Fi \u25BE" : "Mode: PC \u25BE"), "#0F766E");
+        modeBtn.setOnClickListener(v -> showModePicker());
+        hoverHints.attach(modeBtn,
+                "Mode: Choose Xbox Wi-Fi (Direct, no PC/IP), Capture Card (HDMI via LAN/USB-C), or PC Relay.");
         row1.addView(modeBtn);
 
         captureSourceBtn = makeButton(captureUsbMode ? "Src: USB" : "Src: LAN", "#0369A1");
@@ -418,16 +456,105 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     ? "Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB."
                     : "Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox.");
         });
+        hoverHints.attach(captureSourceBtn,
+                "Source: Switch Capture input between network capture box (LAN) and USB-C capture card plugged into Quest.");
         row1.addView(captureSourceBtn);
 
-        Button updateBtn = makeButton("Update", "#1E293B");
+        hostInput = new EditText(this);
+        hostInput.setText(captureMode ? prefs.getString("captureHost", DEFAULT_CAPTURE_HOST) : savedHost);
+        hostInput.setHint("Server IP (auto if blank)");
+        hostInput.setTextColor(Color.WHITE);
+        hostInput.setHintTextColor(Color.GRAY);
+        hostInput.setBackgroundColor(Color.parseColor("#1E293B"));
+        hostInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        hostInput.setPadding(dp(8), dp(5), dp(8), dp(5));
+        hostInput.setSingleLine(true);
+        LinearLayout.LayoutParams ipLp = new LinearLayout.LayoutParams(dp(145), LinearLayout.LayoutParams.WRAP_CONTENT);
+        ipLp.rightMargin = dp(6);
+        row1.addView(hostInput, ipLp);
+        hoverHints.attach(hostInput,
+                "Server IP: Address of your Capture server or Windows PC streamer (leave blank to auto-scan LAN).");
+
+        lanBtn = makeButton("Scan LAN", "#334155");
+        lanBtn.setOnClickListener(v -> discoverLanHost(false));
+        hoverHints.attach(lanBtn,
+                "Scan LAN: Search your local network for active GTA-Sixty Capture or PC streaming servers.");
+        row1.addView(lanBtn);
+
+        usbBtn = makeButton("USB-C", "#334155");
+        usbBtn.setOnClickListener(v -> hostInput.setText("127.0.0.1"));
+        hoverHints.attach(usbBtn,
+                "USB-C: Set server address to 127.0.0.1 for ADB reverse tethered PC streaming.");
+        row1.addView(usbBtn);
+
+        startBtn = makeButton(captureMode && captureUsbMode ? "Start USB" : "Start Stream", "#16A34A");
+        startBtn.setOnClickListener(v -> {
+            if (streaming.get() || isUsbCaptureRunning()) disconnect();
+            else startStreamClicked();
+        });
+        hoverHints.attach(startBtn,
+                "Start / Stop: Connect and start streaming video, or cleanly disconnect.");
+        row1.addView(startBtn);
+
+        refreshBtn = makeButton("Refresh", "#475569");
+        refreshBtn.setOnClickListener(v -> sendControlPacket(TYPE_CLIENT_IDR, null));
+        hoverHints.attach(refreshBtn,
+                "Refresh: Request an instant keyframe if video shows compression artifacts.");
+        row1.addView(refreshBtn);
+
+        View r1Spacer = new View(this);
+        row1.addView(r1Spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
+
+        Button jimmyBarBtn = JimmyVoiceModule.createTopBarButton(this, null);
+        hoverHints.attach(jimmyBarBtn, JimmyVoiceModule.TOP_BAR_HINT);
+        row1.addView(jimmyBarBtn);
+
+        Button displayBtn = makeButton("Display", "#0284C7");
+        displayBtn.setOnClickListener(v -> toggleDisplayControls());
+        hoverHints.attach(displayBtn,
+                "Display: Adjust Screen Size, Depth, Height, Tilt, Curve, Backdrop (Jimmy's Room), and GTA Hands.");
+        row1.addView(displayBtn);
+
+        Button recenterBtn = makeButton("Recenter", "#2563EB");
+        recenterBtn.setOnClickListener(v -> {
+            setStatus("Look where you want the screen \u2014 recentering in 1.5s...");
+            SpatialDisplayBridge.requestRecenter();
+        });
+        hoverHints.attach(recenterBtn,
+                "Recenter: Snap the screen directly in front of where you are looking (1.5s delay so you can look forward).");
+        row1.addView(recenterBtn);
+
+        Button netCheckBtn = makeButton("Net Check", "#0369A1");
+        netCheckBtn.setOnClickListener(v -> openNetworkDiagnostics());
+        hoverHints.attach(netCheckBtn,
+                "Net Check: Test Quest Wi-Fi, subnet match, LAN discovery, TCP 7660, USB UVC, and Xbox status.");
+        row1.addView(netCheckBtn);
+
+        Button adbBtn = makeButton("Wi-Fi ADB", "#2563EB");
+        adbBtn.setOnClickListener(v -> openWirelessAdbHelper());
+        hoverHints.attach(adbBtn,
+                "Wi-Fi ADB: View Quest Wi-Fi IP and open Android Developer Options for wireless debugging.");
+        row1.addView(adbBtn);
+
+        updateBtn = makeButton("Update", "#1E293B");
         updateBtn.setOnClickListener(v -> checkForUpdates());
+        hoverHints.attach(updateBtn,
+                "Update: Check GitHub for newer GTA-Sixty versions and recent enhancements.");
         row1.addView(updateBtn);
+
+        Button hideBtn = makeButton("Hide Menu", "#475569");
+        hideBtn.setOnClickListener(v -> hudBar.setVisibility(View.GONE));
+        hoverHints.attach(hideBtn,
+                "Hide Menu: Hide this top menu bar (tap anywhere on the video to bring it back).");
+        row1.addView(hideBtn);
 
         Button helpBtn = makeButton("?", "#334155");
         helpBtn.setOnClickListener(v -> showPcHelp());
+        hoverHints.attach(helpBtn,
+                "Help: View setup guide and shortcuts for Capture, PC Relay, and Xbox Wi-Fi modes.");
         row1.addView(helpBtn);
 
+        // Row 2: Enhance, Auto-hide & Tools
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
         row2.setGravity(Gravity.CENTER_VERTICAL);
@@ -436,74 +563,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         r2Lp.topMargin = dp(6);
         row2.setLayoutParams(r2Lp);
 
-        resBtn = makeButton("Res: " + RES_LABELS[resIdx], "#1E293B");
-        resBtn.setOnClickListener(v -> {
-            resIdx = (resIdx + 1) % RES_LABELS.length;
-            resBtn.setText("Res: " + RES_LABELS[resIdx]);
-            saveStreamPrefs();
-            if (captureMode) {
-                setStatus("Capture size follows the card. Res does not resize the HDMI picture.");
-                return;
-            }
-            if (streaming.get()) sendClientConfig();
-        });
-        row2.addView(resBtn);
-
-        fpsBtn = makeButton(cfgFps + " FPS", "#1E293B");
-        fpsBtn.setOnClickListener(v -> {
-            cfgFps = (cfgFps == 60) ? 90 : 60;
-            fpsBtn.setText(cfgFps + " FPS");
-            saveStreamPrefs();
-            if (captureMode) {
-                setStatus("Capture frame rate follows the card.");
-                return;
-            }
-            if (streaming.get()) sendClientConfig();
-        });
-        row2.addView(fpsBtn);
-
-        bitrateBtn = makeButton(BITRATE_OPTIONS[bitrateIdx] + " Mbps", "#1E293B");
-        bitrateBtn.setOnClickListener(v -> {
-            customBitrateMbps = 0;
-            bitrateIdx = (bitrateIdx + 1) % BITRATE_OPTIONS.length;
-            bitrateBtn.setText(BITRATE_OPTIONS[bitrateIdx] + " Mbps");
-            saveStreamPrefs();
-            if (streaming.get()) sendClientConfig();
-        });
-        row2.addView(bitrateBtn);
-
-        captureCodecBtn = makeButton("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice], "#0F766E");
-        captureCodecBtn.setOnClickListener(v -> {
-            captureCodecChoice = (captureCodecChoice + 1) % CaptureProtocolHelper.CAPTURE_CODEC_COUNT;
-            captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
-            getSharedPreferences("gta60", MODE_PRIVATE).edit()
-                    .putInt("captureCodecChoice", captureCodecChoice).apply();
-            if (streaming.get() && captureMode && !captureUsbMode) {
-                sendClientConfig();
-            }
-            setStatus("Capture codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
-        });
-        row2.addView(captureCodecBtn);
-
-        holdBtn = makeButton("Hold: " + (keepAlive ? "On" : "Off"), "#1E293B");
-        holdBtn.setOnClickListener(v -> {
-            keepAlive = !keepAlive;
-            holdBtn.setText("Hold: " + (keepAlive ? "On" : "Off"));
-            getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("keepAlive", keepAlive).apply();
-            if (captureMode) {
-                setStatus("Capture does not hold an Xbox session. The controller stays paired to the console.");
-            } else {
-                setStatus(keepAlive
-                        ? "Session held: the console will not idle us out while you are away"
-                        : "Session hold off: the console may end the stream when idle");
-            }
-        });
-        row2.addView(holdBtn);
-
-        enhanceBtn = makeButton("GPU: " + ENHANCE_LABELS[captureEnhanceMode], "#0284C7");
+        enhanceBtn = makeButton("Enhance: " + CaptureProtocolHelper.simpleCaptureEnhanceLabel(captureEnhanceMode), "#0284C7");
         enhanceBtn.setOnClickListener(v -> {
-            captureEnhanceMode = (captureEnhanceMode + 1) % ENHANCE_LABELS.length;
-            enhanceBtn.setText("GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+            captureEnhanceMode = CaptureProtocolHelper.nextCaptureEnhanceMode(captureEnhanceMode);
+            enhanceBtn.setText("Enhance: " + CaptureProtocolHelper.simpleCaptureEnhanceLabel(captureEnhanceMode));
             getSharedPreferences("gta60", MODE_PRIVATE).edit()
                     .putInt("captureEnhanceMode", captureEnhanceMode).apply();
             CaptureGlRenderer gl = captureGl;
@@ -524,16 +587,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 if (captureHzBtn != null) captureHzBtn.setText("90 Hz");
                 prefs.edit().putInt("captureRefreshHz", 90).apply();
                 applyDisplayRefreshRate(90);
-            } else if ((captureEnhanceMode == CaptureGlRenderer.MODE_FG120
-                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG120_SR) && captureRefreshHz != 120) {
+            } else if ((captureEnhanceMode == CaptureGlRenderer.MODE_OFF
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG60
+                    || captureEnhanceMode == CaptureGlRenderer.MODE_FG60_SR) && captureRefreshHz != 120) {
                 captureRefreshHz = 120;
                 if (captureHzBtn != null) captureHzBtn.setText("120 Hz");
                 prefs.edit().putInt("captureRefreshHz", 120).apply();
                 applyDisplayRefreshRate(120);
             }
             applySurfaceFrameRate(effectiveSurfaceFrameRate(targetFps));
-            setStatus("Capture GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+            setStatus("Enhance: " + CaptureProtocolHelper.simpleCaptureEnhanceLabel(captureEnhanceMode));
         });
+        hoverHints.attach(enhanceBtn,
+                "Enhance: Cycle Off (raw video), 60+ (60 fps frame gen + SuperRes), or 90+ (90 fps frame gen + SuperRes).");
         row2.addView(enhanceBtn);
 
         lookBtn = makeButton("Look: " + LOOK_LABELS[captureLookMode], "#0F766E");
@@ -547,6 +613,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (usbCapture != null) usbCapture.setLookMode(captureLookMode);
             setStatus("Capture Look: " + LOOK_LABELS[captureLookMode]);
         });
+        hoverHints.attach(lookBtn,
+                "Look: Cycle color presets \u2014 Normal, Vivid (punchy contrast), or Night (brighter dark areas).");
         row2.addView(lookBtn);
 
         captureHzBtn = makeButton(captureRefreshHz + " Hz", "#1E293B");
@@ -558,25 +626,142 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             applyDisplayRefreshRate(captureRefreshHz);
             setStatus("Display refresh: " + captureRefreshHz + " Hz");
         });
+        hoverHints.attach(captureHzBtn,
+                "Refresh Rate: Switch headset refresh between 120 Hz (for Off/60+) and 90 Hz (for 90+).");
         row2.addView(captureHzBtn);
 
-        Button netCheckBtn = makeButton("Net Check", "#0369A1");
-        netCheckBtn.setOnClickListener(v -> openNetworkDiagnostics());
-        row2.addView(netCheckBtn);
+        captureCodecBtn = makeButton("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice], "#0F766E");
+        captureCodecBtn.setOnClickListener(v -> {
+            captureCodecChoice = (captureCodecChoice + 1) % CaptureProtocolHelper.CAPTURE_CODEC_COUNT;
+            captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putInt("captureCodecChoice", captureCodecChoice).apply();
+            if (streaming.get() && captureMode && !captureUsbMode) {
+                sendClientConfig();
+            }
+            setStatus("Capture codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
+        });
+        hoverHints.attach(captureCodecBtn,
+                "Codec: Switch Capture LAN video codec (HEVC, HEVC 10-bit, AV1, or H.264).");
+        row2.addView(captureCodecBtn);
 
+        resBtn = makeButton("Res: " + RES_LABELS[resIdx], "#1E293B");
+        resBtn.setOnClickListener(v -> {
+            resIdx = (resIdx + 1) % RES_LABELS.length;
+            resBtn.setText("Res: " + RES_LABELS[resIdx]);
+            saveStreamPrefs();
+            if (captureMode) {
+                setStatus("Capture size follows the card. Res does not resize the HDMI picture.");
+                return;
+            }
+            if (streaming.get()) sendClientConfig();
+        });
+        hoverHints.attach(resBtn,
+                "Resolution: Select PC streamer output resolution (1080p, 1440p, or 4K).");
+        row2.addView(resBtn);
+
+        fpsBtn = makeButton(cfgFps + " FPS", "#1E293B");
+        fpsBtn.setOnClickListener(v -> {
+            cfgFps = (cfgFps == 60) ? 90 : 60;
+            fpsBtn.setText(cfgFps + " FPS");
+            saveStreamPrefs();
+            if (captureMode) {
+                setStatus("Capture frame rate follows the card.");
+                return;
+            }
+            if (streaming.get()) sendClientConfig();
+        });
+        hoverHints.attach(fpsBtn,
+                "FPS: Toggle PC streamer target frame rate between 60 FPS and 90 FPS.");
+        row2.addView(fpsBtn);
+
+        bitrateBtn = makeButton(BITRATE_OPTIONS[bitrateIdx] + " Mbps", "#1E293B");
+        bitrateBtn.setOnClickListener(v -> {
+            customBitrateMbps = 0;
+            bitrateIdx = (bitrateIdx + 1) % BITRATE_OPTIONS.length;
+            bitrateBtn.setText(BITRATE_OPTIONS[bitrateIdx] + " Mbps");
+            saveStreamPrefs();
+            if (streaming.get()) sendClientConfig();
+        });
+        hoverHints.attach(bitrateBtn,
+                "Bitrate: Cycle stream bitrate (higher Mbps gives sharper detail on fast Wi-Fi).");
+        row2.addView(bitrateBtn);
+
+        holdBtn = makeButton("Hold: " + (keepAlive ? "On" : "Off"), "#1E293B");
+        holdBtn.setOnClickListener(v -> {
+            keepAlive = !keepAlive;
+            holdBtn.setText("Hold: " + (keepAlive ? "On" : "Off"));
+            getSharedPreferences("gta60", MODE_PRIVATE).edit().putBoolean("keepAlive", keepAlive).apply();
+            if (captureMode) {
+                setStatus("Capture does not hold an Xbox session. The controller stays paired to the console.");
+            } else {
+                setStatus(keepAlive
+                        ? "Session held: the console will not idle us out while you are away"
+                        : "Session hold off: the console may end the stream when idle");
+            }
+        });
+        hoverHints.attach(holdBtn,
+                "Hold: Keep the PC-relayed Xbox session alive during short breaks so it does not time out.");
+        row2.addView(holdBtn);
+
+        autoHideCheck = new CheckBox(this);
+        autoHideCheck.setText("Auto-hide menu");
+        autoHideCheck.setTextColor(Color.parseColor("#E2E8F0"));
+        autoHideCheck.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        autoHideCheck.setButtonTintList(ColorStateList.valueOf(Color.parseColor("#22D3EE")));
+        LinearLayout.LayoutParams chkLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        chkLp.leftMargin = dp(4);
+        chkLp.rightMargin = dp(6);
+        autoHideCheck.setLayoutParams(chkLp);
+        autoHideCheck.setOnCheckedChangeListener((btn, isChecked) -> {
+            if (syncingAutoHideCheck) return;
+            final SpatialDisplayBridge.DisplaySettings s = SpatialDisplayBridge.getSettings();
+            s.autoHideMenuOnController = isChecked;
+            SpatialDisplayBridge.applyFromUi(this, s);
+        });
+        hoverHints.attach(autoHideCheck,
+                "Auto-hide menu: Automatically hide menus 6 seconds after your virtual Xbox controller appears.");
+        row2.addView(autoHideCheck);
+
+        View r2Spacer = new View(this);
+        row2.addView(r2Spacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
+
+        wakeBtn = makeButton(captureMode ? "Update Box" : "Wake PC", "#7C3AED");
+        wakeBtn.setOnClickListener(v -> wakePc());
+        hoverHints.attach(wakeBtn,
+                "Wake PC / Update Box: Wake & launch the Windows PC streamer, or ask the Linux capture box to pull updates.");
+        row2.addView(wakeBtn);
+
+        // Row 3: Hover hint bar
+        LinearLayout hintBox = new LinearLayout(this);
+        hintBox.setOrientation(LinearLayout.HORIZONTAL);
+        GradientDrawable hintBg = new GradientDrawable();
+        hintBg.setColor(Color.parseColor("#B30B1324"));
+        hintBg.setCornerRadius(dp(6));
+        hintBox.setBackground(hintBg);
+        hintBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintLp.topMargin = dp(6);
+        hintBox.setLayoutParams(hintLp);
+        hintBox.addView(hoverHintText);
+
+        // Row 4: Status / Telemetry
         statusText = new TextView(this);
         statusText.setText(captureMode
                 ? (captureUsbMode
                         ? "Capture (USB): plug Xbox capture card into Quest USB-C, then tap Start USB."
                         : "Capture mode: on the PC run GTA-Sixty.exe --capture. Controller stays on the Xbox.")
-                : "Ready — Tap Start Stream (or LAN to auto-find PC)");
+                : "Ready \u2014 Tap Start Stream (or Scan LAN to auto-find server)");
         statusText.setTextColor(Color.parseColor("#CBD5E1"));
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        statusText.setPadding(dp(8), 0, 0, 0);
-        row2.addView(statusText);
+        statusText.setPadding(0, dp(4), 0, 0);
 
         hudBar.addView(row1);
         hudBar.addView(row2);
+        hudBar.addView(hintBox);
+        hudBar.addView(statusText);
 
         FrameLayout.LayoutParams hudParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -585,12 +770,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         root.addView(hudBar, hudParams);
 
         direct = new DirectController(this, root);
+        psRemote = new PsRemoteController(this, root);
         updater = new AppUpdater(this);
+        updater.setListener(remoteVer -> {
+            if (updateBtn != null && remoteVer != null && !remoteVer.isEmpty()) {
+                updateBtn.setText("Update (v" + remoteVer + ")");
+                updateBtn.setBackgroundColor(Color.parseColor("#D97706"));
+            }
+            if (direct != null) {
+                direct.setAvailableUpdateBadge(remoteVer);
+            }
+            if (psRemote != null) {
+                psRemote.setAvailableUpdateBadge(remoteVer);
+            }
+        });
         SpatialDisplayBridge.load(this);
         SpatialDisplayBridge.addUiListener(spatialUiListener);
+        SpatialDisplayBridge.addControllerVisibilityListener(controllerVisibilityListener);
+        onSpatialSettingsUpdated(SpatialDisplayBridge.getSettings());
         displayControls = new DisplayControlsView(
                 this,
-                null,
+                this::onDisplayControlsUserInteraction,
                 () -> {
                     if (displayControls != null) displayControls.setVisibility(View.GONE);
                 });
@@ -598,6 +798,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         root.addView(displayControls, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
+
+        jimmyVoice = JimmyVoiceModule.attach(this, root, surfaceView);
 
         SpatialDisplayBridge.registerStopStreamSink(this::stopAllStreamsCleanly);
         SpatialDisplayBridge.registerGamepadSink(new SpatialDisplayBridge.GamepadSink() {
@@ -624,6 +826,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateHudForMode();
         scheduleTelemetryTick();
         learnPcMac();
+        updater.checkOnAppOpen();
         updater.startPeriodicChecks();
         // Debug hooks for on-device checks:
         //   --ez direct true        open Direct mode without a controller tap
@@ -633,26 +836,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final Intent launchIntent = getIntent() != null ? new Intent(getIntent()) : new Intent();
         final Bundle spatialExtras = SpatialDisplayBridge.consumePendingLaunchExtras();
         if (spatialExtras != null) launchIntent.putExtras(spatialExtras);
+        if (launchIntent.hasExtra("platform")) {
+            consolePlatform = ConsolePlatform.fromPrefValue(launchIntent.getStringExtra("platform"));
+            getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                    .putString("consolePlatform", ConsolePlatform.prefValue(consolePlatform)).apply();
+            updatePlatformUi();
+        }
         if (launchIntent.hasExtra("captureUsb")) {
             captureUsbMode = launchIntent.getBooleanExtra("captureUsb", false);
             if (captureUsbMode) {
                 captureMode = true;
                 directMode = false;
+                psRemoteMode = false;
             }
             persistTransportMode();
         } else if ("usb".equalsIgnoreCase(launchIntent.getStringExtra("captureSource"))) {
             captureMode = true;
             directMode = false;
+            psRemoteMode = false;
             captureUsbMode = true;
             persistTransportMode();
         } else if ("lan".equalsIgnoreCase(launchIntent.getStringExtra("captureSource"))) {
             captureMode = true;
             directMode = false;
+            psRemoteMode = false;
             captureUsbMode = false;
             persistTransportMode();
         }
-        final boolean wantCapture = launchIntent.getBooleanExtra("capture", false) || captureMode;
-        final boolean wantDirect = !wantCapture && (launchIntent.getBooleanExtra("direct", false) || directMode);
+        final boolean wantCapture;
+        final boolean wantPsRemote;
+        final boolean wantDirect;
+        if (launchIntent.hasExtra("capture")) {
+            wantCapture = launchIntent.getBooleanExtra("capture", false);
+            wantPsRemote = !wantCapture && launchIntent.getBooleanExtra("psRemote", false);
+            wantDirect = !wantCapture && !wantPsRemote && launchIntent.getBooleanExtra("direct", false);
+        } else if (launchIntent.getBooleanExtra("psRemote", false)) {
+            consolePlatform = ConsolePlatform.PLAYSTATION;
+            wantPsRemote = true;
+            wantCapture = false;
+            wantDirect = false;
+        } else if (launchIntent.hasExtra("direct")) {
+            wantDirect = launchIntent.getBooleanExtra("direct", false);
+            wantCapture = false;
+            wantPsRemote = false;
+        } else {
+            wantCapture = captureMode;
+            wantPsRemote = !wantCapture && psRemoteMode;
+            wantDirect = !wantCapture && !wantPsRemote && directMode;
+        }
         final boolean autoDirectStart = launchIntent.getBooleanExtra("directStart", false);
         autoCaptureStart = launchIntent.getBooleanExtra("captureStart", false);
         final int enhanceExtra = launchIntent.getIntExtra("enhance", -1);
@@ -666,6 +897,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (launchIntent.getBooleanExtra("debugEcho", false)) startUdpEcho();
         if (wantCapture) {
             uiHandler.post(this::enterCaptureMode);
+        } else if (wantPsRemote) {
+            uiHandler.post(this::enterPsRemoteMode);
         } else if (wantDirect) {
             uiHandler.post(() -> {
                 enterDirectMode();
@@ -754,18 +987,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ? (captureUsbMode ? "Capture USB" : "Capture LAN")
                 : "PC Mode";
         final String msg =
-                "GTA-Sixty supports Capture (LAN or USB-C), PC Mode, and XRemote Mode:\n\n"
-                + "\u2022 Mode: Cycles Capture \u2192 PC \u2192 XRemote.\n"
-                + "  - Capture (Src: LAN): Streams HDMI from your Linux capture box (192.168.68.90) or PC running GTA-Sixty.exe --capture.\n"
-                + "  - Capture (Src: USB): Plugs an HDMI-to-USB-C capture card straight into Quest 3 (close Meta Quest HDMI Link first, then tap Start USB).\n"
-                + "  - PC: Xbox remote play through your Windows PC (D3D12 optical-flow + NVENC).\n"
-                + "  - XRemote: Quest connects straight to your Xbox via your Microsoft account (no IP needed).\n\n"
-                + "\u2022 LAN / Net Check: LAN scans UDP 7661 to auto-find servers on your network. Net Check tests Quest Wi-Fi, subnet match, UDP 7661 discovery, TCP 7660 reachability, USB-C UVC devices, and XRemote status.\n\n"
-                + "\u2022 Host IP / USB-C: Enter a server IP (blank = auto-scan), or tap USB-C for 127.0.0.1 over ADB reverse.\n\n"
-                + "\u2022 Window Handle & Display: Grab the bottom handle bar with Trigger or Grip/Pinch to move the screen (push thumbstick up/down while holding Trigger to adjust depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Backdrop.\n\n"
-                + "\u2022 Recenter / Hide HUD: Recenter snaps the screen in front of you; Hide HUD hides the bar (tap video to show it again).\n\n"
-                + "\u2022 Wake PC / Check Update: In PC mode, sends Wake-on-LAN + GTA60_START. In Capture LAN mode, triggers GTA60_UPDATE on the capture box.\n\n"
-                + "\u2022 Update: Checks GitHub (derallo/GTASiXty) for a newer Quest APK (also checks every 3 hours).";
+                "GTA-Sixty supports Xbox Wi-Fi (Default), Capture Card (LAN or USB-C), and PC Relay:\n\n"
+                + "\u2022 Mode: Tap Mode to switch between:\n"
+                + "  - Xbox Wi-Fi (Default): Connects straight to your Xbox via your Microsoft account (no PC or IP needed).\n"
+                + "  - Capture Card (Src: LAN / USB): Streams HDMI from your capture box or a USB-C capture card plugged straight into Quest 3.\n"
+                + "  - PC Relay: Xbox remote play through your Windows PC.\n\n"
+                + "\u2022 Enhance (Capture): Cycles Off (raw), 60+ (60 fps frame gen + SuperRes), and 90+ (90 fps frame gen + SuperRes).\n\n"
+                + "\u2022 Auto-hide menu: Automatically hides menus 3 seconds after the 3D Xbox controller appears.\n\n"
+                + "\u2022 Scan LAN / Net Check: Scan LAN finds servers on UDP 7661. Net Check tests Quest Wi-Fi, LAN discovery, TCP 7660, USB UVC, and Xbox status.\n\n"
+                + "\u2022 Display & Handle: Grab the bottom handle bar to move the screen (thumbstick adjusts depth). Tap Display for Curve, Tilt, Size, Depth, Height, and Jimmy's Room.\n\n"
+                + "\u2022 Updates: Checks GitHub automatically every time you open GTA-Sixty and shows what's new.";
 
         final android.widget.ScrollView sv = new android.widget.ScrollView(this);
         final TextView tv = new TextView(this);
@@ -784,6 +1015,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 .show();
     }
 
+    void showModePicker() {
+        if (consolePlatform == ConsolePlatform.PLAYSTATION) {
+            final String[] psOptions = {
+                    "PlayStation Remote Play (Wi-Fi / LAN \u2014 libchiaki)",
+                    "Capture Card (HDMI via LAN or USB-C)"
+            };
+            final int checked = captureMode ? 1 : 0;
+            new AlertDialog.Builder(this)
+                    .setTitle("Select PlayStation Streaming Mode")
+                    .setSingleChoiceItems(psOptions, checked, (dialog, which) -> {
+                        dialog.dismiss();
+                        if (which == 0) {
+                            if (!psRemoteMode) enterPsRemoteMode();
+                        } else {
+                            if (!captureMode) enterCaptureMode();
+                        }
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .show();
+            return;
+        }
+        final String[] options = {
+                "Xbox Wi-Fi (Direct \u2014 Recommended, no PC or IP needed)",
+                "Capture Card (HDMI via LAN or USB-C)",
+                "PC Relay (Windows PC Streamer)"
+        };
+        final int checked = directMode ? 0 : (captureMode ? 1 : 2);
+        new AlertDialog.Builder(this)
+                .setTitle("Select Streaming Mode")
+                .setSingleChoiceItems(options, checked, (dialog, which) -> {
+                    dialog.dismiss();
+                    if (which == 0) {
+                        if (!directMode) enterDirectMode();
+                    } else if (which == 1) {
+                        if (!captureMode) enterCaptureMode();
+                    } else {
+                        if (directMode) exitDirectMode();
+                        else if (captureMode) exitCaptureMode();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     void openNetworkDiagnostics() {
         final SharedPreferences prefs = getSharedPreferences("gta60", MODE_PRIVATE);
         final String capHost = prefs.getString("captureHost", DEFAULT_CAPTURE_HOST);
@@ -791,7 +1066,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final String curField = hostInput != null ? hostInput.getText().toString().trim() : "";
         final String modeLabel = captureMode
                 ? (captureUsbMode ? "Capture USB" : "Capture LAN")
-                : (directMode ? "XRemote" : "PC");
+                : (psRemoteMode ? "PS Remote" : (directMode ? "XRemote" : "PC"));
         final boolean signedIn = direct != null && direct.isSignedIn();
         NetworkDiagnosticsHelper.show(
                 this,
@@ -829,8 +1104,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void toggleHud() {
+        if (psRemoteMode && psRemote != null) {
+            psRemote.toggleHud();
+            return;
+        }
         final boolean show = hudBar.getVisibility() != View.VISIBLE;
         hudBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) {
+            notifyMenuOpenedOrInteracted();
+        }
     }
 
     void toggleDisplayControls() {
@@ -839,6 +1121,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         displayControls.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show) {
             displayControls.bringToFront();
+            notifyMenuOpenedOrInteracted();
         }
     }
 
@@ -905,19 +1188,83 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return "";
     }
 
+    void toggleConsolePlatform() {
+        setConsolePlatform(consolePlatform == ConsolePlatform.XBOX
+                ? ConsolePlatform.PLAYSTATION
+                : ConsolePlatform.XBOX);
+    }
+
+    private void updatePlatformUi() {
+        if (platformBtn != null) {
+            platformBtn.setText(ConsolePlatform.toggleButtonLabel(consolePlatform));
+            platformBtn.setBackgroundColor(Color.parseColor(ConsolePlatform.accentHex(consolePlatform)));
+        }
+        if (titleText != null) {
+            titleText.setTextColor(Color.parseColor(
+                    consolePlatform == ConsolePlatform.PLAYSTATION ? "#38BDF8" : "#22C55E"));
+        }
+    }
+
+    void setConsolePlatform(int nextPlatform) {
+        if (consolePlatform == nextPlatform) return;
+        consolePlatform = nextPlatform;
+        getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                .putString("consolePlatform", ConsolePlatform.prefValue(consolePlatform))
+                .apply();
+        updatePlatformUi();
+
+        if (captureMode) {
+            // Capture Card (LAN or USB-C) is modular and works identically for Xbox and PlayStation.
+            setStatus(consolePlatform == ConsolePlatform.PLAYSTATION
+                    ? (captureUsbMode
+                            ? "PlayStation Capture (USB): plug PS5/PS4 capture card into Quest USB-C, then tap Start USB."
+                            : "PlayStation Capture (LAN): ready. DualSense stays paired to the PlayStation.")
+                    : (captureUsbMode
+                            ? "Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB."
+                            : "Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox."));
+            return;
+        }
+
+        if (consolePlatform == ConsolePlatform.PLAYSTATION) {
+            enterPsRemoteMode();
+        } else {
+            if (psRemote != null) psRemote.hide();
+            psRemoteMode = false;
+            enterDirectMode();
+        }
+    }
+
+    void enterPsRemoteMode() {
+        if (streaming.get() || isUsbCaptureRunning()) disconnect();
+        if (direct != null) direct.hide();
+        consolePlatform = ConsolePlatform.PLAYSTATION;
+        psRemoteMode = true;
+        directMode = false;
+        captureMode = false;
+        persistTransportMode();
+        updatePlatformUi();
+        hudBar.setVisibility(View.GONE);
+        surfaceView.setVisibility(View.VISIBLE);
+        if (psRemote != null) psRemote.show();
+    }
+
     /**
      * Direct mode hides the PC transport entirely: the WebView page owns the video surface and the
      * headset's gamepad is forwarded over the console's own data channel (DirectController).
      */
     private void enterDirectMode() {
-        if (streaming.get()) disconnect();
+        if (streaming.get() || isUsbCaptureRunning()) disconnect();
+        if (psRemote != null) psRemote.hide();
         // A cold start that restored directMode never had a headset TCP client, but a PC streamer
         // can still be holding the console's only session. Tell it to drop that before play().
         releasePcSessionAsync();
+        consolePlatform = ConsolePlatform.XBOX;
         directMode = true;
+        psRemoteMode = false;
         captureMode = false;
         persistTransportMode();
-        modeBtn.setText("Mode: XRemote");
+        updatePlatformUi();
+        modeBtn.setText("Mode: Xbox Wi-Fi \u25BE");
         hudBar.setVisibility(View.GONE);
         surfaceView.setVisibility(View.GONE);
         direct.show();
@@ -946,10 +1293,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             captureCodecBtn.setText("Codec: " + CaptureProtocolHelper.CAPTURE_CODEC_LABELS[captureCodecChoice]);
         }
         if (holdBtn != null) holdBtn.setVisibility(pcVis);
-        if (enhanceBtn != null) enhanceBtn.setVisibility(capVis);
+        if (enhanceBtn != null) {
+            enhanceBtn.setVisibility(capVis);
+            enhanceBtn.setText("Enhance: " + CaptureProtocolHelper.simpleCaptureEnhanceLabel(captureEnhanceMode));
+        }
         if (lookBtn != null) lookBtn.setVisibility(capVis);
         if (captureHzBtn != null) captureHzBtn.setVisibility(capVis);
-        if (wakeBtn != null && !usbCap) wakeBtn.setText(lanCap ? "Check Update" : "Wake PC");
+        if (wakeBtn != null && !usbCap) wakeBtn.setText(lanCap ? "Update Box" : "Wake PC");
         if (startBtn != null && !streaming.get() && !isUsbCaptureRunning()) {
             startBtn.setText(usbCap ? "Start USB" : "Start Stream");
             startBtn.setBackgroundColor(Color.parseColor("#16A34A"));
@@ -960,9 +1310,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     void exitDirectMode() {
         if (direct != null) direct.hide();
         directMode = false;
+        psRemoteMode = false;
         captureMode = false;
         persistTransportMode();
-        modeBtn.setText("Mode: PC");
+        modeBtn.setText("Mode: PC \u25BE");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
         updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
@@ -972,7 +1323,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void persistTransportMode() {
         getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                .putString("consolePlatform", ConsolePlatform.prefValue(consolePlatform))
                 .putBoolean("directMode", directMode)
+                .putBoolean("psRemoteMode", psRemoteMode)
                 .putBoolean("captureMode", captureMode)
                 .putBoolean("captureUsbMode", captureUsbMode)
                 .apply();
@@ -987,18 +1340,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     void enterCaptureMode() {
         if (streaming.get() || isUsbCaptureRunning()) disconnect();
         if (direct != null) direct.hide();
+        if (psRemote != null) psRemote.hide();
         directMode = false;
+        psRemoteMode = false;
         captureMode = true;
         persistTransportMode();
-        modeBtn.setText("Mode: Capture");
+        updatePlatformUi();
+        modeBtn.setText("Mode: Capture \u25BE");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("captureHost", DEFAULT_CAPTURE_HOST));
         updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
         hudBar.setVisibility(View.VISIBLE);
         if (captureUsbMode) {
-            setStatus("Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB.");
+            setStatus(consolePlatform == ConsolePlatform.PLAYSTATION
+                    ? "PlayStation Capture (USB): plug PS5/PS4 capture card into Quest USB-C, then tap Start USB."
+                    : "Capture (USB): plug Xbox capture card into Quest USB-C (close Meta HDMI Link), then tap Start USB.");
         } else {
-            setStatus("Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox.");
+            setStatus(consolePlatform == ConsolePlatform.PLAYSTATION
+                    ? "PlayStation Capture (LAN): ready. DualSense stays paired to the PlayStation."
+                    : "Capture (LAN): ready (mintbook-g11). Controller stays paired to the Xbox.");
             if (!captureUpdateCheckedThisBoot) {
                 captureUpdateCheckedThisBoot = true;
                 requestCaptureUpdateAsync(false);
@@ -1008,10 +1368,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void exitCaptureMode() {
         if (streaming.get() || isUsbCaptureRunning()) disconnect();
+        if (consolePlatform == ConsolePlatform.PLAYSTATION) {
+            enterPsRemoteMode();
+            return;
+        }
         directMode = false;
+        psRemoteMode = false;
         captureMode = false;
         persistTransportMode();
-        modeBtn.setText("Mode: PC");
+        modeBtn.setText("Mode: PC \u25BE");
         hostInput.setText(getSharedPreferences("gta60", MODE_PRIVATE).getString("host", DEFAULT_PC_HOST));
         updateHudForMode();
         surfaceView.setVisibility(View.VISIBLE);
@@ -1077,6 +1442,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (jimmyVoice != null && jimmyVoice.onRequestPermissionsResult(requestCode, permissions, grantResults)) {
+            return;
+        }
         if (requestCode == REQ_USB_CAPTURE_PERMS) {
             if (hasOrUnsupportedUsbCameraPermission()) {
                 startUsbCaptureNow();
@@ -1329,6 +1697,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (direct != null) {
             direct.stop();
         }
+        if (psRemote != null) {
+            psRemote.stop();
+        }
         if (streaming.get() || isUsbCaptureRunning()) {
             disconnect();
         }
@@ -1465,7 +1836,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 captureEnhanceMode = enh;
                 getSharedPreferences("gta60", MODE_PRIVATE).edit()
                         .putInt("captureEnhanceMode", captureEnhanceMode).apply();
-                if (enhanceBtn != null) enhanceBtn.setText("GPU: " + ENHANCE_LABELS[captureEnhanceMode]);
+                if (enhanceBtn != null) {
+                    enhanceBtn.setText("Enhance: " + CaptureProtocolHelper.simpleCaptureEnhanceLabel(captureEnhanceMode));
+                }
                 CaptureGlRenderer gl = captureGl;
                 if (gl != null) gl.setEnhanceMode(captureEnhanceMode);
                 if (usbCapture != null) usbCapture.setEnhanceMode(captureEnhanceMode);
@@ -1840,7 +2213,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return streamFps > 0 ? streamFps : 60;
     }
 
-    private void applySurfaceFrameRate(int fps) {
+    Surface getActiveSurface() {
+        return activeSurface;
+    }
+
+    SurfaceView getSurfaceView() {
+        return surfaceView;
+    }
+
+    String[] getDiscoveryBroadcastStrings() {
+        final List<InetAddress> targets = discoveryTargets();
+        final List<String> out = new ArrayList<>();
+        for (InetAddress addr : targets) {
+            if (addr != null) {
+                final String host = addr.getHostAddress();
+                if (host != null && !host.isEmpty() && !out.contains(host)) {
+                    out.add(host);
+                }
+            }
+        }
+        return out.toArray(new String[0]);
+    }
+
+    void applySurfaceFrameRate(int fps) {
         if (fps <= 0) return;
         Surface s = activeSurface;
         if (s == null || !s.isValid()) return;
@@ -1853,7 +2248,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private void adjustSurfaceAspect(int w, int h) {
+    void adjustSurfaceAspect(int w, int h) {
         if (w <= 0 || h <= 0) return;
         View parent = (View) surfaceView.getParent();
         int pw = parent.getWidth();
@@ -2477,6 +2872,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     boolean handleGamepadKeyEvent(KeyEvent event) {
+        if (psRemoteMode && psRemote != null && psRemote.onGamepadKey(event)) {
+            return true;
+        }
         if ((event.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD) {
             int mask = mapGamepadButton(event.getKeyCode());
             if (mask != 0) {
@@ -2490,6 +2888,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     boolean handleGamepadMotionEvent(MotionEvent ev) {
+        if (psRemoteMode && psRemote != null && psRemote.onGamepadMotion(ev)) {
+            return true;
+        }
         // SOURCE_JOYSTICK alone also matches non-gamepad sticks; require GAMEPAD so a virtual or
         // pointer device cannot look like a controller to the direct-mode presence tracking.
         if ((ev.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD &&
@@ -2640,18 +3041,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             activeSurface = null;
             surfaceLock.notifyAll();
         }
+        if (psRemote != null) psRemote.stop();
         disconnect();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (wasStopped) {
+            wasStopped = false;
+            if (updater != null) updater.checkOnAppOpen();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        wasStopped = true;
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        if (jimmyVoice != null) jimmyVoice.onPause();
         if (directMode && direct != null) direct.onActivityPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        if (jimmyVoice != null) jimmyVoice.onResume();
         if (directMode && direct != null) direct.onActivityResume();
     }
 
@@ -2667,6 +3086,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     protected void onDestroy() {
+        uiHandler.removeCallbacks(autoHideOnControllerRunnable);
+        SpatialDisplayBridge.removeControllerVisibilityListener(controllerVisibilityListener);
         SpatialDisplayBridge.removeUiListener(spatialUiListener);
         SpatialDisplayBridge.registerStopStreamSink(null);
         SpatialDisplayBridge.registerGamepadSink(null);
@@ -2679,7 +3100,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         } catch (Exception ignored) {
         }
         disconnect();
+        if (jimmyVoice != null) {
+            jimmyVoice.destroy();
+            jimmyVoice = null;
+        }
         if (updater != null) updater.destroy();
+        if (psRemote != null) psRemote.destroy();
         if (direct != null) direct.destroy();
         sendExecutor.shutdownNow();
         super.onDestroy();

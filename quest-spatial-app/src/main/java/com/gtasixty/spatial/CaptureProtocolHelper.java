@@ -195,4 +195,59 @@ final class CaptureProtocolHelper {
         // instead of +1.0 stop / -50%) to eliminate the >2x sharp/soft "breathing" oscillation.
         return generated ? (baseStops + 0.10f) : baseStops;
     }
+
+    static int normalizeCaptureEnhanceMode(int rawMode) {
+        if (rawMode <= CaptureCadenceController.MODE_OFF) {
+            return CaptureCadenceController.MODE_OFF;
+        }
+        if (rawMode <= CaptureCadenceController.MODE_FG60_SR) {
+            return CaptureCadenceController.MODE_FG60_SR;
+        }
+        return CaptureCadenceController.MODE_FG90_SR;
+    }
+
+    static int nextCaptureEnhanceMode(int currentMode) {
+        final int norm = normalizeCaptureEnhanceMode(currentMode);
+        if (norm == CaptureCadenceController.MODE_OFF) {
+            return CaptureCadenceController.MODE_FG60_SR;
+        }
+        if (norm == CaptureCadenceController.MODE_FG60_SR) {
+            return CaptureCadenceController.MODE_FG90_SR;
+        }
+        return CaptureCadenceController.MODE_OFF;
+    }
+
+    static String simpleCaptureEnhanceLabel(int mode) {
+        if (mode <= CaptureCadenceController.MODE_OFF) return "Off";
+        if (mode <= CaptureCadenceController.MODE_FG60_SR) return "60+";
+        if (mode <= CaptureCadenceController.MODE_FG90_SR) return "90+";
+        return "120+";
+    }
+
+    static int normalizeDirectEnhanceMode(int rawMode) {
+        if (rawMode <= CaptureCadenceController.MODE_OFF) {
+            return CaptureCadenceController.MODE_OFF;
+        }
+        if (rawMode <= CaptureCadenceController.MODE_FG60_SR) {
+            return CaptureCadenceController.MODE_FG60_SR;
+        }
+        return CaptureCadenceController.MODE_FG90_SR;
+    }
+
+    static int nextDirectEnhanceMode(int currentMode) {
+        final int norm = normalizeDirectEnhanceMode(currentMode);
+        if (norm == CaptureCadenceController.MODE_OFF) {
+            return CaptureCadenceController.MODE_FG60_SR;
+        }
+        if (norm == CaptureCadenceController.MODE_FG60_SR) {
+            return CaptureCadenceController.MODE_FG90_SR;
+        }
+        return CaptureCadenceController.MODE_OFF;
+    }
+
+    static String simpleDirectEnhanceLabel(int mode) {
+        if (mode <= CaptureCadenceController.MODE_OFF) return "Off";
+        if (mode <= CaptureCadenceController.MODE_FG60_SR) return "60+";
+        return "90+";
+    }
 }
