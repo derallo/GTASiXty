@@ -384,7 +384,7 @@ final class PsRemoteController implements PsChiakiNative.SessionCallback {
                     if (activity instanceof MainActivity) ((MainActivity) activity).toggleConsolePlatform();
                 });
         hoverHints.attach(platformBtn,
-                "Console: Switch between PlayStation (PS5/PS4 Remote Play / Capture) and Xbox (Wi-Fi / Capture / PC).");
+                "Console: Switch between PlayStation (PS5/PS4 Remote Play / Capture) and Xbox (Direct / Capture / PC).");
         row1.addView(platformBtn);
 
         modeBtn = button("Mode: PS Remote \u25BE", "#0F766E", v -> {

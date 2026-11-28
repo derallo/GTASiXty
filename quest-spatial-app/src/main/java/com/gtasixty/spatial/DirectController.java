@@ -232,13 +232,13 @@ final class DirectController {
         updateButtons();
         if (xbox.signedIn()) {
             if (selected != null) {
-                setStatus("Xbox Wi-Fi: ready (" + selected.name + ") \u2014 tap Start to play");
+                setStatus("Xbox Direct: ready (" + selected.name + ") \u2014 tap Start to play");
             } else {
-                setStatus("Xbox Wi-Fi: finding your Xbox on your account / local Wi-Fi...");
+                setStatus("Xbox Direct: finding your Xbox on your account / local network...");
                 autoDiscoverConsole();
             }
         } else {
-            setStatus("Xbox Wi-Fi: tap Sign in to find your Xbox automatically (no IP needed)");
+            setStatus("Xbox Direct: tap Sign in to find your Xbox automatically (no IP needed)");
         }
     }
 
@@ -260,7 +260,7 @@ final class DirectController {
                 if (consoles.isEmpty()) {
                     runOnUi(() -> {
                         if (visible && !streaming) {
-                            setStatus("Xbox Wi-Fi: no console found yet \u2014 enable Remote features on Xbox, then tap Xbox");
+                            setStatus("Xbox Direct: no console found yet \u2014 enable Remote features on Xbox, then tap Xbox");
                         }
                     });
                     return;
@@ -278,7 +278,7 @@ final class DirectController {
                     if (selected == null) selected = chosen;
                     updateButtons();
                     if (!streaming) {
-                        setStatus("Xbox Wi-Fi: found " + selected.name + " \u2014 tap Start to play");
+                        setStatus("Xbox Direct: found " + selected.name + " \u2014 tap Start to play");
                     }
                 });
             } catch (Exception e) {
@@ -787,19 +787,19 @@ final class DirectController {
                     if (activity instanceof MainActivity) ((MainActivity) activity).toggleConsolePlatform();
                 });
         hoverHints.attach(platformBtn,
-                "Console: Switch between Xbox (Wi-Fi / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
+                "Console: Switch between Xbox (Direct / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
         row1.addView(platformBtn);
 
-        modeBtn = button("Mode: Xbox Wi-Fi \u25BE", "#0F766E", v -> {
+        modeBtn = button("Mode: Xbox Direct \u25BE", "#0F766E", v -> {
             if (activity instanceof MainActivity) ((MainActivity) activity).showModePicker();
         });
         hoverHints.attach(modeBtn,
-                "Mode: Switch between Xbox Wi-Fi (Direct, recommended), Capture Card (LAN/USB-C), or PC Relay.");
+                "Mode: Switch between Xbox Direct (Remote Play, recommended), Capture Card (LAN/USB-C), or PC Relay.");
         row1.addView(modeBtn);
 
         signInBtn = button("Sign in", "#7C3AED", v -> signIn());
         hoverHints.attach(signInBtn,
-                "Sign in: Link your Microsoft/Xbox account once so Quest finds your Xbox automatically over Wi-Fi.");
+                "Sign in: Link your Microsoft/Xbox account once so Quest finds your Xbox automatically on your network.");
         row1.addView(signInBtn);
 
         consoleBtn = button("Xbox", "#334155", v -> chooseConsole());
@@ -812,7 +812,7 @@ final class DirectController {
             else start();
         });
         hoverHints.attach(startStopBtn,
-                "Start / Stop: Connect directly to your Xbox over Wi-Fi, or cleanly end the stream.");
+                "Start / Stop: Connect directly to your Xbox over your network, or cleanly end the stream.");
         row1.addView(startStopBtn);
 
         padBtn = button("Fix Pad", "#B45309", v -> fixPad());
@@ -877,7 +877,7 @@ final class DirectController {
 
         final Button helpBtn = button("?", "#334155", v -> showHelp());
         hoverHints.attach(helpBtn,
-                "Help: View full setup tips for Xbox Wi-Fi, controllers, and display controls.");
+                "Help: View full setup tips for Xbox Direct, controllers, and display controls.");
         row1.addView(helpBtn);
 
         bar.addView(row1);
@@ -971,9 +971,9 @@ final class DirectController {
 
     private void showHelp() {
         final String msg =
-                "Xbox Wi-Fi mode connects the Quest 3 straight to your Xbox over Wi-Fi (no PC or IP needed).\n\n"
+                "Xbox Direct mode connects the Quest 3 straight to your Xbox over your network (no PC or IP needed).\n\n"
                 + "\u2022 Auto Console Discovery: Sign in once with your Microsoft/Xbox account and GTA-Sixty finds your Xbox automatically.\n\n"
-                + "\u2022 Start / Stop: Starts or cleanly ends your Xbox Wi-Fi stream and releases the console session.\n\n"
+                + "\u2022 Start / Stop: Starts or cleanly ends your Xbox Direct stream and releases the console session.\n\n"
                 + "\u2022 Fix Pad: If your controller stops responding in-game, releases or re-syncs the Quest virtual pad so Player 1 works.\n\n"
                 + "\u2022 Enhance (Quest GPU):\n"
                 + "  - Off: Raw decoded video.\n"
@@ -994,7 +994,7 @@ final class DirectController {
         sv.addView(tv);
 
         new AlertDialog.Builder(activity)
-                .setTitle("Xbox Wi-Fi Mode Help")
+                .setTitle("Xbox Direct Mode Help")
                 .setView(sv)
                 .setNeutralButton("Run Network Check", (d, w) -> {
                     if (activity instanceof MainActivity) {
@@ -1268,7 +1268,7 @@ final class DirectController {
                 handler.removeCallbacks(startWatchdog);
                 runOnUi(() -> {
                     updateButtons();
-                    setStatus("Xbox Wi-Fi: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("Xbox Direct: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     handler.removeCallbacks(keepaliveTick);
                     handler.postDelayed(keepaliveTick, 30000);
                     scheduleAutoHideHud(5000);
@@ -1328,7 +1328,7 @@ final class DirectController {
                 }
             } else if ("streaming".equals(state)) {
                 runOnUi(() -> {
-                    setStatus("Xbox Wi-Fi: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
+                    setStatus("Xbox Direct: streaming (" + CaptureProtocolHelper.simpleDirectEnhanceLabel(enhanceMode) + ", " + LOOK_LABELS[lookMode] + ", " + refreshHz + " Hz)");
                     updateButtons();
                     scheduleAutoHideHud(5000);
                 });

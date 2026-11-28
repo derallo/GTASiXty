@@ -436,13 +436,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         platformBtn = makeButton(ConsolePlatform.toggleButtonLabel(consolePlatform), ConsolePlatform.accentHex(consolePlatform));
         platformBtn.setOnClickListener(v -> toggleConsolePlatform());
         hoverHints.attach(platformBtn,
-                "Console: Switch between Xbox (Wi-Fi / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
+                "Console: Switch between Xbox (Direct / Capture / PC) and PlayStation (PS5/PS4 Remote Play / Capture).");
         row1.addView(platformBtn);
 
-        modeBtn = makeButton(captureMode ? "Mode: Capture \u25BE" : (directMode ? "Mode: Xbox Wi-Fi \u25BE" : "Mode: PC \u25BE"), "#0F766E");
+        modeBtn = makeButton(captureMode ? "Mode: Capture \u25BE" : (directMode ? "Mode: Xbox Direct \u25BE" : "Mode: PC \u25BE"), "#0F766E");
         modeBtn.setOnClickListener(v -> showModePicker());
         hoverHints.attach(modeBtn,
-                "Mode: Choose Xbox Wi-Fi (Direct, no PC/IP), Capture Card (HDMI via LAN/USB-C), or PC Relay.");
+                "Mode: Choose Xbox Direct (Remote Play, no PC/IP), Capture Card (HDMI via LAN/USB-C), or PC Relay.");
         row1.addView(modeBtn);
 
         captureSourceBtn = makeButton(captureUsbMode ? "Src: USB" : "Src: LAN", "#0369A1");
@@ -551,7 +551,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Button helpBtn = makeButton("?", "#334155");
         helpBtn.setOnClickListener(v -> showPcHelp());
         hoverHints.attach(helpBtn,
-                "Help: View setup guide and shortcuts for Capture, PC Relay, and Xbox Wi-Fi modes.");
+                "Help: View setup guide and shortcuts for Capture, PC Relay, and Xbox Direct modes.");
         row1.addView(helpBtn);
 
         // Row 2: Enhance, Auto-hide & Tools
@@ -987,9 +987,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ? (captureUsbMode ? "Capture USB" : "Capture LAN")
                 : "PC Mode";
         final String msg =
-                "GTA-Sixty supports Xbox Wi-Fi (Default), Capture Card (LAN or USB-C), and PC Relay:\n\n"
+                "GTA-Sixty supports Xbox Direct (Default), Capture Card (LAN or USB-C), and PC Relay:\n\n"
                 + "\u2022 Mode: Tap Mode to switch between:\n"
-                + "  - Xbox Wi-Fi (Default): Connects straight to your Xbox via your Microsoft account (no PC or IP needed).\n"
+                + "  - Xbox Direct (Default): Connects straight to your Xbox via your Microsoft account (no PC or IP needed).\n"
                 + "  - Capture Card (Src: LAN / USB): Streams HDMI from your capture box or a USB-C capture card plugged straight into Quest 3.\n"
                 + "  - PC Relay: Xbox remote play through your Windows PC.\n\n"
                 + "\u2022 Enhance (Capture): Cycles Off (raw), 60+ (60 fps frame gen + SuperRes), and 90+ (90 fps frame gen + SuperRes).\n\n"
@@ -1037,7 +1037,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         final String[] options = {
-                "Xbox Wi-Fi (Direct \u2014 Recommended, no PC or IP needed)",
+                "Xbox Direct (Remote Play \u2014 Recommended, no PC or IP needed)",
                 "Capture Card (HDMI via LAN or USB-C)",
                 "PC Relay (Windows PC Streamer)"
         };
@@ -1264,7 +1264,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         captureMode = false;
         persistTransportMode();
         updatePlatformUi();
-        modeBtn.setText("Mode: Xbox Wi-Fi \u25BE");
+        modeBtn.setText("Mode: Xbox Direct \u25BE");
         hudBar.setVisibility(View.GONE);
         surfaceView.setVisibility(View.GONE);
         direct.show();
@@ -1937,7 +1937,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     if (System.currentTimeMillis() > connectDeadline) throw ce;
                     setStatus(captureMode ? "Starting MintBook capture server..." : "Starting the PC streamer...");
-                    Thread.sleep(1500);
+                    // Also probe LAN discovery during the retry window so if the server's IP changed
+                    // (e.g. Ethernet -> Wi-Fi or DHCP lease), we switch to the answering host immediately.
+                    String discoveredIp = probeDiscoverHost(1500);
+                    if (discoveredIp != null && !discoveredIp.isEmpty() && !discoveredIp.equals(host)) {
+                        Log.i(TAG, "discovered server at " + discoveredIp + " (replacing stale " + host + ")");
+                        host = discoveredIp;
+                        final String found = discoveredIp;
+                        getSharedPreferences("gta60", MODE_PRIVATE).edit()
+                                .putString(captureMode ? "captureHost" : "host", found).apply();
+                        uiHandler.post(() -> {
+                            if (hostInput != null) hostInput.setText(found);
+                        });
+                    }
                 }
             }
             if (s == null) return;
@@ -2584,6 +2596,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * Fire-and-forget: ask the PC agent on UDP 7662 to launch the streamer. The agent is the only
      * thing expected to be running on the PC when nothing is streaming.
      */
+    private String probeDiscoverHost(int timeoutMs) {
+        try (DatagramSocket ds = new DatagramSocket()) {
+            ds.setBroadcast(true);
+            ds.setSoTimeout(timeoutMs);
+            final byte[] discover = "GTA60_DISCOVER".getBytes(StandardCharsets.US_ASCII);
+            for (InetAddress t : discoveryTargets()) {
+                try { ds.send(new DatagramPacket(discover, discover.length, t, DISCOVERY_UDP_PORT)); } catch (Exception ignored) {}
+            }
+            final byte[] buf = new byte[256];
+            final DatagramPacket resp = new DatagramPacket(buf, buf.length);
+            ds.receive(resp);
+            final String msg = new String(resp.getData(), 0, resp.getLength(), StandardCharsets.US_ASCII);
+            if (msg.startsWith("GTA60_OFFER")) {
+                return resp.getAddress().getHostAddress();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
     private void sendStartRequest(final String targetHost) {
         new Thread(() -> {
             try (DatagramSocket ds = new DatagramSocket()) {
