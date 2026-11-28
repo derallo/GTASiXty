@@ -1130,46 +1130,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
-     * Android forbids normal apps from running 'adb tcpip 5555' directly, so this opens the
-     * headset's Developer Options / Wireless Debugging screen and shows the Quest's current Wi-Fi IP.
+     * Horizon OS hides Android's Wireless Debugging screen, so this shows the Quest's current
+     * Wi-Fi IP and the one-time USB-C command to enable wireless ADB until next reboot.
      */
     void openWirelessAdbHelper() {
         final String ip = getLocalIpv4Address();
         final String ipLine = ip.isEmpty() ? "(not connected to Wi-Fi)" : ip;
+        final String connectCmd = ip.isEmpty() ? "adb connect <quest-ip>:5555" : ("adb connect " + ip + ":5555");
         new AlertDialog.Builder(this)
-                .setTitle("Wireless ADB Helper")
+                .setTitle("Wi-Fi ADB Info")
                 .setMessage("Quest Wi-Fi IP: " + ipLine
-                        + "\n\nAndroid requires enabling Wireless Debugging in system Developer Options "
-                        + "(or running 'adb tcpip 5555' once over USB-C after a reboot).\n\n"
-                        + "Tap 'Developer Options' to open Android Developer Settings -> Wireless debugging.")
-                .setPositiveButton("Developer Options", (d, w) -> {
-                    try {
-                        // Bypass Horizon OS's VrShell settings relay so we land directly in Android Developer Options.
-                        Intent dev = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
-                        dev.setClassName("com.android.settings",
-                                "com.android.settings.Settings$DevelopmentSettingsDashboardActivity");
-                        dev.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(dev);
-                    } catch (Exception e) {
-                        try {
-                            Intent devPkg = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
-                            devPkg.setPackage("com.android.settings");
-                            devPkg.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                            startActivity(devPkg);
-                        } catch (Exception e2) {
-                            try {
-                                startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
-                            } catch (Exception e3) {
-                                try {
-                                    startActivity(new Intent(Settings.ACTION_SETTINGS));
-                                } catch (Exception ignored) {
-                                    setStatus("Could not open Android Settings: " + e.getMessage());
-                                }
-                            }
-                        }
-                    }
-                })
-                .setNegativeButton("Close", null)
+                        + "\n\nHorizon OS does not expose Android's Wireless Debugging menu in Settings.\n\n"
+                        + "To enable wireless ADB (stays on until reboot):\n"
+                        + "1. Plug Quest into PC via USB-C and run:\n   adb tcpip 5555\n"
+                        + "2. Unplug USB-C and run:\n   " + connectCmd
+                        + "\n\n(Or toggle Wireless ADB in Meta Quest Developer Hub on PC.)")
+                .setPositiveButton("OK", null)
                 .show();
     }
 
